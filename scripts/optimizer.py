@@ -18,8 +18,9 @@
 
 命令行自测::
 
-    python optimizer.py             # 跑内置样例，输出 3 个方案
-    python optimizer.py --selftest  # 只跑断言自检
+    python optimizer.py                            # 跑内置样例，输出 3 个方案
+    python optimizer.py "我们4个人，预算100，一个减脂，一个不吃辣"   # 自定义输入
+    python optimizer.py --selftest                 # 只跑断言自检
 """
 
 from __future__ import annotations
@@ -980,11 +981,14 @@ def main(argv: Sequence[str]) -> int:
         _selftest()
         return 0
 
+    # 支持命令行传入自定义需求；不传则用内置样例
+    user_input = next((a for a in argv if not a.startswith("-")), DEMO_INPUT)
+
     print("=" * 68)
-    print("用户输入：", DEMO_INPUT)
+    print("用户输入：", user_input)
     print("=" * 68)
 
-    constraints = parse_constraints(DEMO_INPUT)
+    constraints = parse_constraints(user_input)
     print("\n[解析结果]")
     print(json.dumps({k: v for k, v in constraints.items() if k != "raw"}, ensure_ascii=False, indent=2))
 
@@ -995,7 +999,6 @@ def main(argv: Sequence[str]) -> int:
     print("\n[Top-3 方案]")
     print(render_plans(plans))
 
-    _selftest()
     return 0
 
 
