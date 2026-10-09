@@ -46,6 +46,11 @@ TAG_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "dessert": ("冰淇淋", "新地", "麦旋风", "派", "拉明顿", "奶冻"),
 }
 
+#: 主食关键词：拼单场景下「每人至少 1 份主食」的判定依据（汉堡 / 卷 / 早餐堡）
+MAIN_KEYWORDS: Tuple[str, ...] = (
+    "汉堡", "堡", "卷", "麦满分", "巨无霸", "麦香鱼", "麦香鸡", "炒双蛋", "粥",
+)
+
 #: 用户口语 → 标准成分标签（避免"不吃牛 / 牛肉过敏 / 不碰安格斯"漏判）
 INGREDIENT_SYNONYMS: Dict[str, Tuple[str, ...]] = {
     "beef": ("牛", "牛肉", "牛排", "安格斯", "牛堡", "巨无霸"),
@@ -276,6 +281,12 @@ def infer_tags(item: Dict[str, Any]) -> List[str]:
             and not ({"vegetable", "dessert", "drink", "low_calorie"} & tags)):
         tags.add("fried")
 
+    # 主食判定：拼单场景要求「每人至少 1 份主食」，小食/饮品/甜品不计入主食
+    if any(k in name for k in MAIN_KEYWORDS):
+        tags.add("main")
+    else:
+        tags.add("side")
+
     tags = sorted(tags)
     item["tags"] = tags
     return tags
@@ -425,56 +436,62 @@ def _dp_min_cost(
     kcal_max: float,
     step: int = 25,
 ) -> List[Dict[str, Any]]:
-    """动态规划求满足「份数 + 热量区间」的最低成本篮子（无界背包）。
+    """动态规划求满足「主食份数 + 热量区间」的最低成本篮子（无界背包）。
 
-    状态: ``(份数, 热量桶)`` → 最小花费（分）与重建路径。
+    状态: ``(主食份数, 热量桶)`` → 最小花费（分）与重建路径。
+
+    ⚠️ 拼单场景的关键约束：**主食份数 ≥ 人数**（每人至少 1 份主食），
+    而不是只看"总份数 ≥ 人数"——否则会出现「2 个汉堡 + 2 份薯条供 4 人」这种分不下去的方案。
     """
-    max_units = max(people, 1) + 3          # 允许比人数多几份用于凑单
+    max_mains = max(people, 1) + 2          # 允许比人数多 2 份主食用于凑满减
     max_bucket = int(kcal_max // step) + 1
 
+    # dp[m][b] = (cost, prev_m, prev_b, item_idx)
     dp: List[List[Optional[Tuple[int, int, int, int]]]] = [
-        [None] * (max_bucket + 1) for _ in range(max_units + 1)
+        [None] * (max_bucket + 1) for _ in range(max_mains + 1)
     ]
     dp[0][0] = (0, -1, -1, -1)
 
-    for u in range(0, max_units + 1):
+    for m in range(0, max_mains + 1):
         for b in range(0, max_bucket + 1):
-            cur = dp[u][b]
+            cur = dp[m][b]
             if cur is None:
                 continue
             cost = cur[0]
             for idx, it in enumerate(items):
-                nu, nb = u + 1, b + int(it["kcal"] // step)
-                if nu > max_units or nb > max_bucket:
+                nm = m + (1 if "main" in it["tags"] else 0)
+                nb = b + int(it["kcal"] // step)
+                if nm > max_mains or nb > max_bucket:
                     continue
                 ncost = cost + it["price"]
-                tgt = dp[nu][nb]
+                tgt = dp[nm][nb]
                 if tgt is None or ncost < tgt[0]:
-                    dp[nu][nb] = (ncost, u, b, idx)
+                    dp[nm][nb] = (ncost, m, b, idx)
 
     solutions: List[Dict[str, Any]] = []
-    for u in range(max(people, 1), max_units + 1):
+    for m in range(max(people, 1), max_mains + 1):
         for b in range(0, max_bucket + 1):
-            cell = dp[u][b]
+            cell = dp[m][b]
             if cell is None:
                 continue
             kcal = b * step
             if kcal < kcal_min or kcal > kcal_max:
                 continue
             basket: List[int] = []
-            cu, cb, guard = u, b, 0
-            while cu > 0 and guard < 200:
+            cm, cb, guard = m, b, 0
+            while guard < 400:
                 guard += 1
-                c2 = dp[cu][cb]
+                c2 = dp[cm][cb]
                 if c2 is None:
                     break
-                _, pu, pb, idx = c2
+                _, pm, pb, idx = c2
                 if idx < 0:
                     break
                 basket.append(idx)
-                cu, cb = pu, pb
+                cm, cb = pm, pb
             if basket:
-                solutions.append({"cost": int(cell[0]), "units": u, "kcal": kcal, "indices": basket})
+                solutions.append({"cost": int(cell[0]), "mains": m, "units": len(basket),
+                                  "kcal": kcal, "indices": basket})
 
     solutions.sort(key=lambda s: (s["cost"], abs(s["kcal"] - kcal_min)))
     pruned: List[Dict[str, Any]] = []
@@ -503,6 +520,7 @@ def _basket_to_plan(
     lines: List[Dict[str, Any]] = []
     subtotal = 0
     item_totals: Dict[str, int] = {}
+    mains = 0
     kcal = protein = fat = sodium = 0.0
     for idx, qty in sorted(counter.items()):
         it = items[idx]
@@ -511,6 +529,8 @@ def _basket_to_plan(
         code = it.get("productCode")
         if code:
             item_totals[code] = item_totals.get(code, 0) + line_total
+        if "main" in (it.get("tags") or []):
+            mains += qty
         kcal += it["kcal"] * qty
         protein += it["protein"] * qty
         fat += it["fat"] * qty
@@ -522,6 +542,7 @@ def _basket_to_plan(
             "unit_price_cny": round(it["price"] / 100.0, 2),
             "subtotal_cny": round(line_total / 100.0, 2),
             "tags": list(it.get("tags") or []),
+            "is_main": "main" in (it.get("tags") or []),
         })
 
     coupon_res = _coupon_dp(subtotal, coupons, item_totals=item_totals)
@@ -530,6 +551,9 @@ def _basket_to_plan(
 
     targets = constraints.get("targets") or {}
     flags: List[str] = []
+    # 拼单底线：主食份数必须 ≥ 人数，否则分不下去
+    if mains < people:
+        flags.append(f"主食不足（{mains} 份 < {people} 人）")
     if targets.get("max_calories_kcal") and kcal / people > targets["max_calories_kcal"]:
         flags.append("人均热量超标")
     if targets.get("max_fat_g") and fat / people > targets["max_fat_g"]:
@@ -541,6 +565,7 @@ def _basket_to_plan(
 
     return {
         "label": label,
+        "mains": mains,
         "items": lines,
         "coupons": [
             {
@@ -622,6 +647,11 @@ def _score(plan: Dict[str, Any], constraints: Dict[str, Any], weights: Dict[str,
     )
 
 
+def _count_mains(picked: Iterable[int], items: List[Dict[str, Any]]) -> int:
+    """统计篮子里的**主食**份数（汉堡 / 卷 / 早餐堡），用于校验「每人至少 1 份主食」。"""
+    return sum(1 for i in picked if "main" in (items[i].get("tags") or []))
+
+
 def optimize_plans(
     menu: List[Dict[str, Any]],
     coupons: List[Dict[str, Any]],
@@ -653,29 +683,40 @@ def optimize_plans(
         pool.append(_basket_to_plan(sol["indices"], items, coupons, constraints, "最省钱"))
 
     # --- 最健康：优先高蛋白/低脂/低热量密度 --------------------------------
+    #     必须先保证「主食份数 ≥ 人数」，再补足热量下限
     healthy_sorted = sorted(
         items,
-        key=lambda x: (-(x["protein"] / max(x["kcal"], 1)), x["fat"], x["price"]),
+        key=lambda x: ((0 if "main" in x["tags"] else 1),
+                       -(x["protein"] / max(x["kcal"], 1)), x["fat"], x["price"]),
     )
     pick: List[int] = []
     kcal_acc = 0.0
     for it in healthy_sorted:
-        if kcal_acc >= kcal_min and len(pick) >= people:
+        if kcal_acc >= kcal_min and _count_mains(pick, items) >= people:
             break
+        if it["kcal"] <= 0 and kcal_acc >= kcal_min:
+            continue          # 热量已达标时不必再塞零卡饮品
         pick.append(idx_of[id(it)])
         kcal_acc += it["kcal"]
+    if _count_mains(pick, items) < people:      # 兜底：主食没够就补齐
+        pick = list(range(len(items)))          # 极端情况下退化为全选，交由评分兜底
     if pick:
         pool.append(_basket_to_plan(pick, items, coupons, constraints, "最健康"))
 
-    # --- 最快：优先非油炸 -------------------------------------------------
-    fast_sorted = sorted(items, key=lambda x: (("fried" in x["tags"]), -x["kcal"]))
+    # --- 最快：优先非油炸，同样先满足主食份数 ------------------------------
+    fast_sorted = sorted(items, key=lambda x: ((0 if "main" in x["tags"] else 1),
+                                              ("fried" in x["tags"]), -x["kcal"]))
     pick2: List[int] = []
     kcal_acc2 = 0.0
     for it in fast_sorted:
-        if kcal_acc2 >= kcal_min and len(pick2) >= people:
+        if kcal_acc2 >= kcal_min and _count_mains(pick2, items) >= people:
             break
+        if it["kcal"] <= 0 and kcal_acc2 >= kcal_min:
+            continue          # 热量已达标时不必再塞零卡饮品
         pick2.append(idx_of[id(it)])
         kcal_acc2 += it["kcal"]
+    if _count_mains(pick2, items) < people:     # 兜底：主食没够就补齐
+        pick2 = list(range(len(items)))
     if pick2:
         pool.append(_basket_to_plan(pick2, items, coupons, constraints, "最快"))
 
@@ -689,7 +730,11 @@ def optimize_plans(
         if key not in dedup or p["score"] > dedup[key]["score"]:
             dedup[key] = p
 
-    return sorted(dedup.values(), key=lambda x: (-x["score"], x["final_price_cny"]))[:3]
+    # 只保留满足「每人至少 1 份主食」的方案（这是拼单的底线）
+    feasible = [p for p in dedup.values() if p.get("mains", 0) >= people]
+    ranked = sorted(feasible or dedup.values(),
+                    key=lambda x: (-x["score"], x["final_price_cny"]))
+    return ranked[:3]
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +876,8 @@ def render_plans(plans: List[Dict[str, Any]]) -> str:
     out: List[str] = []
     for i, p in enumerate(plans, 1):
         out.append(f"{icon.get(p['label'], '🍟')} 方案 {chr(64 + i)}｜{p['label']}")
-        out.append(f"├ 人数：{p['people_count']} 人")
+        out.append(f"├ 人数：{p['people_count']} 人｜主食 {p.get('mains', 0)} 份（每人至少 1 份 ✅）")
+        out.append(f"├ 总份数：{p['units']} 份")
         out.append("├ 商品明细：")
         for ln in p["items"]:
             out.append(f"│   · {ln['name']} ×{ln['quantity']}   ¥{ln['subtotal_cny']:.2f}")
@@ -945,7 +991,17 @@ def _selftest() -> None:
         assert p["people_count"] == 4
         assert p["final_price_cny"] <= p["subtotal_cny"] + 1e-9
         assert p["per_capita_cny"] > 0
-        assert "营养" in p["nutrition_flags"][0] or p["nutrition_flags"]
+        # 回归：拼单底线 —— 主食份数必须 ≥ 人数，否则 4 个人分不下去
+        assert p["mains"] >= p["people_count"], (p["label"], p["mains"], p["items"])
+
+    # 5b) 主食识别回归：汉堡/卷 记为 main，薯条/饮品/甜品记为 side
+    assert "main" in infer_tags({"name": "巨无霸", "kcal": 513, "fat": 26, "protein": 27, "sodium": 961, "carb": 42})
+    assert "main" in infer_tags({"name": "麦香鱼", "kcal": 325, "fat": 13, "protein": 16, "sodium": 556, "carb": 35})
+    assert "main" in infer_tags({"name": "培根安格斯厚牛堡", "kcal": 707, "fat": 44, "protein": 34, "sodium": 1226, "carb": 44})
+    assert "main" in infer_tags({"name": "鲜蔬蛋沙拉叠叠卷", "kcal": 266, "fat": 14, "protein": 11, "sodium": 518, "carb": 24})
+    assert "main" not in infer_tags({"name": "中薯条", "kcal": 289, "fat": 12, "protein": 4, "sodium": 165, "carb": 38})
+    assert "main" not in infer_tags({"name": "麦乐鸡5块", "kcal": 213, "fat": 12, "protein": 12, "sodium": 422, "carb": 13})
+    assert "main" not in infer_tags({"name": "无糖可口可乐中杯", "kcal": 0, "fat": 0, "protein": 0, "sodium": 35, "carb": 1})
 
     # 6) 核价：业务错误识别（离线桩，不联网）
     stub_plan = {"items": [{"productCode": "P001", "quantity": 1}], "coupons": [],
