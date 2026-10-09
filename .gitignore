@@ -1,0 +1,27 @@
+# 环境变量与凭证
+.env
+.env.*
+*.env
+
+# 日志
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 本地实测数据（可能含敏感信息）
+local-test/
+*.local.json
