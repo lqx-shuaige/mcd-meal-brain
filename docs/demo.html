@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>麦麦拼单大脑 · 演示报告</title>
+<style>
+:root{--red:#da291c;--yellow:#ffc72c;--ink:#1f2329;--muted:#6b7280;--line:#e5e7eb;
+--card:#ffffff;--bg:#f7f8fa}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",
+"Hiragino Sans GB","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink);
+line-height:1.65;padding:32px 16px 64px}
+.wrap{max-width:980px;margin:0 auto}
+header.hd{text-align:center;margin-bottom:28px}
+.hd .logo{display:inline-flex;align-items:center;gap:10px;font-weight:800;font-size:22px}
+.hd .logo .b{background:var(--yellow);color:#3b2c00;border-radius:8px;padding:2px 10px}
+.hd .sub{color:var(--muted);font-size:14px;margin-top:6px}
+.hd .meta{color:var(--muted);font-size:12px;margin-top:8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+padding:24px 28px;margin-bottom:24px;box-shadow:0 1px 3px rgba(31,35,41,.05)}
+h2{font-size:18px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+h2 .no{background:var(--ink);color:#fff;border-radius:6px;font-size:12px;
+padding:2px 8px;font-weight:600}
+.scene-quote{background:#fffbeb;border:1px solid #fde68a;border-radius:10px;
+padding:12px 16px;font-size:15px;margin-bottom:14px}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+.kv .it{background:#fafbfc;border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+.kv .it b{display:block;font-size:12px;color:var(--muted);font-weight:500;margin-bottom:2px}
+.rej{display:inline-block;background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;
+border-radius:6px;padding:2px 10px;font-size:13px;margin:4px 6px 0 0}
+/* ---- 省钱大字卡 ---- */
+.hero{background:linear-gradient(135deg,#fff 0%,#fff7f6 100%);
+border:2px solid #fbd3cf;border-radius:16px;padding:30px 28px;text-align:center;
+margin-bottom:24px}
+.hero .flow{display:flex;justify-content:center;align-items:center;gap:22px;flex-wrap:wrap}
+.hero .node .lab{font-size:13px;color:var(--muted)}
+.hero .node .val{font-size:34px;font-weight:800}
+.hero .arrow{font-size:26px;color:var(--muted)}
+.hero .save{margin-top:14px}
+.hero .save .big{color:var(--red);font-size:56px;font-weight:900;letter-spacing:1px;
+text-shadow:0 1px 0 #fff}
+.hero .save .pct{display:inline-block;background:var(--red);color:#fff;border-radius:10px;
+font-size:24px;font-weight:800;padding:4px 18px;margin-left:12px;vertical-align:middle}
+.hero .note{color:var(--muted);font-size:13px;margin-top:10px}
+/* ---- 图表 ---- */
+.chart-box svg{width:100%;height:auto;display:block}
+.axis{font-size:12px;fill:#9ca3af}
+.bar-val{font-size:16px;font-weight:700;fill:#374151}
+.bar-val.hot{fill:var(--red);font-size:19px;font-weight:800}
+.bar-lab{font-size:14px;font-weight:600;fill:#374151}
+.bar-sub{font-size:11px;fill:#9ca3af}
+.radar-axis{font-size:15px;font-weight:700;fill:#374151}
+.radar-unit{font-size:11px;fill:#9ca3af}
+.radar-val{font-size:11.5px;font-weight:700}
+.legend{display:flex;gap:18px;justify-content:center;margin-top:6px;flex-wrap:wrap}
+.lg{display:inline-flex;align-items:center;gap:7px;font-size:13px;color:#374151}
+.lg i{width:14px;height:14px;border-radius:4px;display:inline-block}
+/* ---- 表格 ---- */
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{background:#f3f4f6;font-size:12.5px;color:#4b5563;font-weight:600;
+padding:9px 10px;border-bottom:2px solid var(--line);text-align:center}
+td{padding:9px 10px;border-bottom:1px solid #eef0f2;text-align:center;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+td.plan-name{font-weight:800;text-align:left;white-space:nowrap}
+td.strong{font-weight:800}
+td.neg{color:#b91c1c;font-weight:700}
+td.muted{color:var(--muted)}
+td.small{font-size:12px}
+td.bill-cell{font-weight:600}
+td.bill-total{font-weight:800;background:rgba(0,0,0,.025)}
+.foods{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-start}
+.food{background:#f8f9fa;border:1px solid var(--line);border-radius:6px;
+padding:2px 8px;font-size:12.5px;white-space:nowrap}
+.food i{font-style:normal;color:var(--muted);margin-left:5px}
+.pill{color:#fff;font-size:11px;border-radius:99px;padding:1px 8px;margin-left:6px;
+font-weight:600;vertical-align:2px}
+.tbl-note{color:var(--muted);font-size:12.5px;margin-top:10px}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+@media(max-width:860px){.split{grid-template-columns:1fr}.hero .save .big{font-size:42px}}
+footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:8px}
+footer code{background:#eef0f2;border-radius:4px;padding:1px 6px;font-size:12px}
+.rawdata{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hd">
+  <div class="logo"><span class="b">麦麦拼单大脑</span> 演示报告</div>
+  <div class="sub">4 人拼单 · 三套方案对比 · 券组合优化 · 营养达标</div>
+  <div class="meta">数据来源：optimizer.py 真实运行输出（未核价，价格为估算）｜生成时间 2026-10-10 09:23:49</div>
+</header>
+
+<section class="card">
+  <h2><span class="no">场景</span>需求解析</h2>
+  <div class="scene-quote">🗣️ 「我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜」</div>
+  <div class="kv">
+    <div class="it"><b>人数</b>4 人</div>
+    <div class="it"><b>预算</b>总额 ¥100.00</div>
+    <div class="it"><b>硬约束</b>排除标签 spicy</div>
+    <div class="it"><b>营养目标</b>单餐 ≤600 kcal；脂肪 ≤25 g；蛋白 ≥20 g</div>
+    <div class="it"><b>命中画像</b>减脂、忌口、要赠品、预算控</div>
+    <div class="it"><b>聚合权重</b>cheap 0.50 · healthy 0.15 · speed 0.10 · pref 0.25</div>
+  </div>
+  <div class="tbl-note">菜单候选 15 项 → 硬约束过滤后保留 <b>13</b> 项：
+  <span class='rej'>✕ 麦辣鸡腿汉堡（命中排除标签[spicy]）</span><span class='rej'>✕ 麦辣鸡翅-2块（命中排除标签[spicy]）</span></div>
+</section>
+
+<section class="hero">
+  <div class="flow">
+    <div class="node">
+      <div class="lab">基线 · 朴素点法（板烧鸡腿堡 ×4，不用券）</div>
+      <div class="val">¥86.00</div>
+      <div class="lab">人均 ¥21.50</div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="node">
+      <div class="lab">最省钱方案（券后到手）</div>
+      <div class="val" style="color:#1f2329">¥64.80</div>
+      <div class="lab">主食 4 份 · 每人至少 1 份 ✅</div>
+    </div>
+  </div>
+  <div class="save">
+    <span class="big">省 ¥21.20</span><span class="pct">↓ 24.7%</span>
+  </div>
+  <div class="note">降幅按基线总价计算：¥21.20 ÷ 基线总价。三套方案最终价均低于基线。</div>
+</section>
+
+<section class="card chart-box">
+  <h2><span class="no">图表 1</span>价格对比（含基线）</h2>
+  <svg viewBox="0 0 680 420" role="img" aria-label="价格对比柱状图" xmlns="http://www.w3.org/2000/svg"><line x1="70" y1="350.0" x2="650" y2="350.0" stroke="#ececec" stroke-width="1"/><text x="60" y="354.0" text-anchor="end" class="axis">¥0</text><line x1="70" y1="290.0" x2="650" y2="290.0" stroke="#ececec" stroke-width="1"/><text x="60" y="294.0" text-anchor="end" class="axis">¥20</text><line x1="70" y1="230.0" x2="650" y2="230.0" stroke="#ececec" stroke-width="1"/><text x="60" y="234.0" text-anchor="end" class="axis">¥40</text><line x1="70" y1="170.0" x2="650" y2="170.0" stroke="#ececec" stroke-width="1"/><text x="60" y="174.0" text-anchor="end" class="axis">¥60</text><line x1="70" y1="110.0" x2="650" y2="110.0" stroke="#ececec" stroke-width="1"/><text x="60" y="114.0" text-anchor="end" class="axis">¥80</text><line x1="70" y1="50.0" x2="650" y2="50.0" stroke="#ececec" stroke-width="1"/><text x="60" y="54.0" text-anchor="end" class="axis">¥100</text><line x1="70" y1="350" x2="650" y2="350" stroke="#c9c9c9" stroke-width="1.5"/><rect x="102.6" y="92.0" width="79.8" height="258.0" rx="6" fill="#8a8f98" fill-opacity="0.88"/><text x="142.5" y="66.0" text-anchor="middle" class="bar-val">¥86.00</text><text x="142.5" y="380" text-anchor="middle" class="bar-lab">基线</text><text x="142.5" y="400" text-anchor="middle" class="bar-sub">不用券</text><rect x="247.6" y="155.6" width="79.8" height="194.4" rx="6" fill="#da291c" fill-opacity="1.0"/><text x="287.5" y="129.6" text-anchor="middle" class="bar-val hot">¥64.80</text><text x="287.5" y="380" text-anchor="middle" class="bar-lab">最省钱</text><text x="287.5" y="400" text-anchor="middle" class="bar-sub">券后到手</text><rect x="392.6" y="125.9" width="79.8" height="224.1" rx="6" fill="#00a651" fill-opacity="0.88"/><text x="432.5" y="99.9" text-anchor="middle" class="bar-val">¥74.70</text><text x="432.5" y="380" text-anchor="middle" class="bar-lab">最健康</text><text x="432.5" y="400" text-anchor="middle" class="bar-sub">券后到手</text><rect x="537.6" y="98.0" width="79.8" height="252.0" rx="6" fill="#f59e0b" fill-opacity="0.88"/><text x="577.5" y="72.0" text-anchor="middle" class="bar-val">¥84.00</text><text x="577.5" y="380" text-anchor="middle" class="bar-lab">最快</text><text x="577.5" y="400" text-anchor="middle" class="bar-sub">券后到手</text><line x1="70" y1="92.0" x2="650" y2="92.0" stroke="#8a8f98" stroke-width="1.5" stroke-dasharray="6 5" stroke-opacity="0.65"/></svg>
+  <div class="tbl-note">灰色虚线为基线参考线（朴素点法总价）。柱值为券后到手价；
+  主食份数均满足「每人至少 1 份」的拼单底线。</div>
+</section>
+
+<div class="split">
+  <section class="card chart-box">
+    <h2><span class="no">图表 2</span>营养雷达图（人均）</h2>
+    <svg viewBox="0 0 680 540" role="img" aria-label="营养雷达图" xmlns="http://www.w3.org/2000/svg"><polygon points="340.0,232.5 387.5,280.0 340.0,327.5 292.5,280.0" fill="none" stroke="#e3e6ea" stroke-width="1"/><polygon points="340.0,185.0 435.0,280.0 340.0,375.0 245.0,280.0" fill="none" stroke="#e3e6ea" stroke-width="1"/><polygon points="340.0,137.5 482.5,280.0 340.0,422.5 197.5,280.0" fill="none" stroke="#e3e6ea" stroke-width="1"/><polygon points="340.0,90.0 530.0,280.0 340.0,470.0 150.0,280.0" fill="none" stroke="#e3e6ea" stroke-width="1"/><line x1="340" y1="280" x2="340.0" y2="90.0" stroke="#d5d9de" stroke-width="1"/><text x="340.0" y="42.0" text-anchor="middle" class="radar-axis">热量</text><text x="340.0" y="60.0" text-anchor="middle" class="radar-unit">kcal/人</text><line x1="340" y1="280" x2="530.0" y2="280.0" stroke="#d5d9de" stroke-width="1"/><text x="572.0" y="280.0" text-anchor="middle" class="radar-axis">蛋白质</text><text x="572.0" y="298.0" text-anchor="middle" class="radar-unit">g/人</text><line x1="340" y1="280" x2="340.0" y2="470.0" stroke="#d5d9de" stroke-width="1"/><text x="340.0" y="506.0" text-anchor="middle" class="radar-axis">脂肪</text><text x="340.0" y="524.0" text-anchor="middle" class="radar-unit">g/人</text><line x1="340" y1="280" x2="150.0" y2="280.0" stroke="#d5d9de" stroke-width="1"/><text x="108.0" y="280.0" text-anchor="middle" class="radar-axis">钠</text><text x="108.0" y="298.0" text-anchor="middle" class="radar-unit">mg/人</text><polygon points="340.0,149.2 467.6,280.0 340.0,386.2 219.8,280.0" fill="#da291c" fill-opacity="0.16" stroke="#da291c" stroke-width="2.5" stroke-linejoin="round"/><circle cx="340.0" cy="149.2" r="4" fill="#da291c"/><text x="340.0" y="146.0" text-anchor="middle" class="radar-val" fill="#da291c">87.8</text><circle cx="467.6" cy="280.0" r="4" fill="#da291c"/><text x="474.6" y="284.0" text-anchor="middle" class="radar-val" fill="#da291c">4.7</text><circle cx="340.0" cy="386.2" r="4" fill="#da291c"/><text x="340.0" y="396.0" text-anchor="middle" class="radar-val" fill="#da291c">3.8</text><circle cx="219.8" cy="280.0" r="4" fill="#da291c"/><text x="213.2" y="284.0" text-anchor="middle" class="radar-val" fill="#da291c">671</text><polygon points="340.0,125.6 497.4,280.0 340.0,416.9 179.9,280.0" fill="#00a651" fill-opacity="0.16" stroke="#00a651" stroke-width="2.5" stroke-linejoin="round"/><circle cx="340.0" cy="125.6" r="4" fill="#00a651"/><text x="340.0" y="121.1" text-anchor="middle" class="radar-val" fill="#00a651">103.6</text><circle cx="497.4" cy="280.0" r="4" fill="#00a651"/><text x="506.1" y="284.0" text-anchor="middle" class="radar-val" fill="#00a651">5.8</text><circle cx="340.0" cy="416.9" r="4" fill="#00a651"/><text x="340.0" y="428.4" text-anchor="middle" class="radar-val" fill="#00a651">4.9</text><circle cx="179.9" cy="280.0" r="4" fill="#00a651"/><text x="171.1" y="284.0" text-anchor="middle" class="radar-val" fill="#00a651">894</text><polygon points="340.0,90.0 530.0,280.0 340.0,470.0 150.0,280.0" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="2.5" stroke-linejoin="round"/><circle cx="340.0" cy="90.0" r="4" fill="#f59e0b"/><text x="340.0" y="83.5" text-anchor="middle" class="radar-val" fill="#f59e0b">127.5</text><circle cx="530.0" cy="280.0" r="4" fill="#f59e0b"/><text x="540.5" y="284.0" text-anchor="middle" class="radar-val" fill="#f59e0b">7</text><circle cx="340.0" cy="470.0" r="4" fill="#f59e0b"/><text x="340.0" y="484.4" text-anchor="middle" class="radar-val" fill="#f59e0b">6.8</text><circle cx="150.0" cy="280.0" r="4" fill="#f59e0b"/><text x="139.6" y="284.0" text-anchor="middle" class="radar-val" fill="#f59e0b">1061</text></svg>
+    <div class="legend"><span class='lg'><i style='background:#da291c'></i>最省钱</span><span class='lg'><i style='background:#00a651'></i>最健康</span><span class='lg'><i style='background:#f59e0b'></i>最快</span></div>
+  </section>
+  <section class="card">
+    <h2><span class="no">图表 2</span>营养数值明细（人均）</h2>
+    <table>
+      <thead><tr><th style="text-align:left">方案</th><th>热量 kcal</th>
+      <th>蛋白 g</th><th>脂肪 g</th><th>钠 mg</th></tr></thead>
+      <tbody><tr><td class='plan-name' style='color:#da291c'>最省钱</td><td>87.8</td><td>4.7</td><td>3.8</td><td>671</td></tr><tr><td class='plan-name' style='color:#00a651'>最健康</td><td>103.6</td><td>5.8</td><td>4.9</td><td>894</td></tr><tr><td class='plan-name' style='color:#f59e0b'>最快</td><td>127.5</td><td>7</td><td>6.8</td><td>1061</td></tr></tbody>
+    </table>
+    <div class="tbl-note">雷达图各维度以三方案中的最大值为外圈（100%）。
+    减脂目标（标准档）：单餐 ≤600 kcal、脂肪 ≤25 g、蛋白 ≥20 g。</div>
+  </section>
+</div>
+
+<section class="card">
+  <h2><span class="no">表格 1</span>券组合明细</h2>
+  <table>
+    <thead><tr><th style="text-align:left">方案</th><th>券名称</th><th>券 ID</th>
+    <th>券规则</th><th>优惠金额</th></tr></thead>
+    <tbody><tr><td>最省钱</td><td>9折券</td><td><code>C004</code></td><td>满 ¥50 享 9 折</td><td class='neg'>−7.20</td></tr><tr><td>最健康</td><td>9折券</td><td><code>C004</code></td><td>满 ¥50 享 9 折</td><td class='neg'>−8.30</td></tr><tr><td>最快</td><td>满99减15</td><td><code>C001</code></td><td>满 ¥99 减 ¥15</td><td class='neg'>−15.00</td></tr></tbody>
+  </table>
+  <div class="tbl-note">券组合由动态规划求解：按 <code>exclusiveGroup</code> 互斥、
+  按 <code>minSpend</code> 校验门槛、按 <code>appliesToProductCodes</code> 校验适用范围，
+  最多叠加 2 张，优惠额不超过商品小计。</div>
+</section>
+
+<section class="card">
+  <h2><span class="no">表格 2</span>分摊账单（每人应付）</h2>
+  <table>
+    <thead><tr><th style="text-align:left">方案</th><th>减脂成员</th><th>忌辣成员</th><th>要赠品成员</th><th>预算控成员</th><th>合计</th></tr></thead>
+    <tbody><tr style='background:#fdecea'><td class='plan-name' style='color:#da291c'>最省钱<span class='pill' style='background:#da291c'>最便宜</span></td><td class='bill-cell'>¥16.20</td><td class='bill-cell'>¥16.20</td><td class='bill-cell'>¥16.20</td><td class='bill-cell'>¥16.20</td><td class='bill-total'>¥64.80</td></tr><tr style='background:#e8f7ef'><td class='plan-name' style='color:#00a651'>最健康</td><td class='bill-cell'>¥18.68</td><td class='bill-cell'>¥18.68</td><td class='bill-cell'>¥18.68</td><td class='bill-cell'>¥18.68</td><td class='bill-total'>¥74.70</td></tr><tr style='background:#fef5e7'><td class='plan-name' style='color:#f59e0b'>最快</td><td class='bill-cell'>¥21.00</td><td class='bill-cell'>¥21.00</td><td class='bill-cell'>¥21.00</td><td class='bill-cell'>¥21.00</td><td class='bill-total'>¥84.00</td></tr></tbody>
+  </table>
+  <div class="tbl-note">均摊口径：每人应付 = 券后总价 ÷ 4（与 README 口径一致）。
+  三套方案人均均在预算（总额 ¥100 ÷ 4 = ¥25/人）之内。</div>
+</section>
+
+<section class="card">
+  <h2><span class="no">表格 3</span>三方案商品明细对比</h2>
+  <table>
+    <thead><tr><th style="text-align:left">方案</th><th style="text-align:left">商品清单</th>
+    <th>原价</th><th>券优惠</th><th>券后价</th><th>人均</th><th>用券 / 体检</th></tr></thead>
+    <tbody><tr><td class='plan-name' style='color:#da291c'>最省钱</td><td><div class='foods'><span class='food'>麦香鱼×3<i>¥52.50</i></span><span class='food'>双层吉士汉堡×1<i>¥19.50</i></span></div></td><td>¥72.00</td><td class='neg'>−7.20</td><td class='strong'>¥64.80</td><td>¥16.20</td><td class='muted small'>9折券 −¥7.20<br>人均蛋白不足</td></tr><tr><td class='plan-name' style='color:#00a651'>最健康</td><td><div class='foods'><span class='food'>板烧鸡腿堡×1<i>¥21.50</i></span><span class='food'>巨无霸×1<i>¥24.50</i></span><span class='food'>麦香鱼×1<i>¥17.50</i></span><span class='food'>双层吉士汉堡×1<i>¥19.50</i></span></div></td><td>¥83.00</td><td class='neg'>−8.30</td><td class='strong'>¥74.70</td><td>¥18.68</td><td class='muted small'>9折券 −¥8.30<br>营养达标</td></tr><tr><td class='plan-name' style='color:#f59e0b'>最快</td><td><div class='foods'><span class='food'>板烧鸡腿堡×1<i>¥21.50</i></span><span class='food'>巨无霸×1<i>¥24.50</i></span><span class='food'>双层吉士汉堡×1<i>¥19.50</i></span><span class='food'>培根安格斯厚牛堡×1<i>¥33.50</i></span></div></td><td>¥99.00</td><td class='neg'>−15.00</td><td class='strong'>¥84.00</td><td>¥21.00</td><td class='muted small'>满99减15 −¥15.00<br>人均脂肪超标</td></tr></tbody>
+  </table>
+</section>
+
+<footer>
+  本页所有数字由 <code>optimizer.py</code> 完整链路（解析 → 过滤 → 优化）实时产出，非手编数据。<br>
+  复现命令：<code>python scripts/optimizer.py "我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"</code>　｜
+  重新生成本页：<code>python scripts/gen_demo.py</code>　｜
+  价格未过官方核价（<code>calculate-price</code>），以实际下单为准。
+</footer>
+
+</div>
+<script type="application/json" id="plan-data">{
+  &quot;user_input&quot;: &quot;我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜&quot;,
+  &quot;baseline&quot;: {
+    &quot;product_name&quot;: &quot;板烧鸡腿堡&quot;,
+    &quot;unit_price_cny&quot;: 21.5,
+    &quot;people_count&quot;: 4,
+    &quot;total_cny&quot;: 86.0,
+    &quot;per_capita_cny&quot;: 21.5
+  },
+  &quot;plans&quot;: [
+    {
+      &quot;label&quot;: &quot;最省钱&quot;,
+      &quot;mains&quot;: 4,
+      &quot;items&quot;: [
+        {
+          &quot;productCode&quot;: &quot;P004&quot;,
+          &quot;name&quot;: &quot;麦香鱼&quot;,
+          &quot;quantity&quot;: 3,
+          &quot;unit_price_cny&quot;: 17.5,
+          &quot;subtotal_cny&quot;: 52.5,
+          &quot;tags&quot;: [
+            &quot;high_carb&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        },
+        {
+          &quot;productCode&quot;: &quot;P005&quot;,
+          &quot;name&quot;: &quot;双层吉士汉堡&quot;,
+          &quot;quantity&quot;: 1,
+          &quot;unit_price_cny&quot;: 19.5,
+          &quot;subtotal_cny&quot;: 19.5,
+          &quot;tags&quot;: [
+            &quot;high_protein&quot;,
+            &quot;high_sodium&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        }
+      ],
+      &quot;coupons&quot;: [
+        {
+          &quot;couponId&quot;: &quot;C004&quot;,
+          &quot;couponCode&quot;: &quot;CC004&quot;,
+          &quot;name&quot;: &quot;9折券&quot;,
+          &quot;discount_cny&quot;: 7.2
+        }
+      ],
+      &quot;subtotal_cny&quot;: 72.0,
+      &quot;discount_cny&quot;: 7.2,
+      &quot;final_price_cny&quot;: 64.8,
+      &quot;per_capita_cny&quot;: 16.2,
+      &quot;people_count&quot;: 4,
+      &quot;nutrition&quot;: {
+        &quot;total_kcal&quot;: 1404.0,
+        &quot;per_capita_kcal&quot;: 351.0,
+        &quot;total_protein_g&quot;: 75.0,
+        &quot;per_capita_protein_g&quot;: 18.8,
+        &quot;total_fat_g&quot;: 61.0,
+        &quot;per_capita_fat_g&quot;: 15.2,
+        &quot;total_sodium_mg&quot;: 2685.0
+      },
+      &quot;nutrition_flags&quot;: [
+        &quot;人均蛋白不足&quot;
+      ],
+      &quot;units&quot;: 4,
+      &quot;score&quot;: 0.501
+    },
+    {
+      &quot;label&quot;: &quot;最健康&quot;,
+      &quot;mains&quot;: 4,
+      &quot;items&quot;: [
+        {
+          &quot;productCode&quot;: &quot;P001&quot;,
+          &quot;name&quot;: &quot;板烧鸡腿堡&quot;,
+          &quot;quantity&quot;: 1,
+          &quot;unit_price_cny&quot;: 21.5,
+          &quot;subtotal_cny&quot;: 21.5,
+          &quot;tags&quot;: [
+            &quot;high_carb&quot;,
+            &quot;high_protein&quot;,
+            &quot;high_sodium&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        },
+        {
+          &quot;productCode&quot;: &quot;P002&quot;,
+          &quot;name&quot;: &quot;巨无霸&quot;,
+          &quot;quantity&quot;: 1,
+          &quot;unit_price_cny&quot;: 24.5,
+          &quot;subtotal_cny&quot;: 24.5,
+          &quot;tags&quot;: [
+            &quot;high_carb&quot;,
+            &quot;high_fat&quot;,
+            &quot;high_protein&quot;,
+            &quot;high_sodium&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        },
+        {
+          &quot;productCode&quot;: &quot;P004&quot;,
+          &quot;name&quot;: &quot;麦香鱼&quot;,
+          &quot;quantity&quot;: 1,
+          &quot;unit_price_cny&quot;: 17.5,
+          &quot;subtotal_cny&quot;: 17.5,
+          &quot;tags&quot;: [
+            &quot;high_carb&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        },
+        {
+          &quot;productCode&quot;: &quot;P005&quot;,
+          &quot;name&quot;: &quot;双层吉士汉堡&quot;,
+          &quot;quantity&quot;: 1,
+          &quot;unit_price_cny&quot;: 19.5,
+          &quot;subtotal_cny&quot;: 19.5,
+          &quot;tags&quot;: [
+            &quot;high_protein&quot;,
+            &quot;high_sodium&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        }
+      ],
+      &quot;coupons&quot;: [
+        {
+          &quot;couponId&quot;: &quot;C004&quot;,
+          &quot;couponCode&quot;: &quot;CC004&quot;,
+          &quot;name&quot;: &quot;9折券&quot;,
+          &quot;discount_cny&quot;: 8.3
+        }
+      ],
+      &quot;subtotal_cny&quot;: 83.0,
+      &quot;discount_cny&quot;: 8.3,
+      &quot;final_price_cny&quot;: 74.7,
+      &quot;per_capita_cny&quot;: 18.68,
+      &quot;people_count&quot;: 4,
+      &quot;nutrition&quot;: {
+        &quot;total_kcal&quot;: 1658.0,
+        &quot;per_capita_kcal&quot;: 414.5,
+        &quot;total_protein_g&quot;: 93.0,
+        &quot;per_capita_protein_g&quot;: 23.2,
+        &quot;total_fat_g&quot;: 78.0,
+        &quot;per_capita_fat_g&quot;: 19.5,
+        &quot;total_sodium_mg&quot;: 3575.0
+      },
+      &quot;nutrition_flags&quot;: [
+        &quot;营养达标&quot;
+      ],
+      &quot;units&quot;: 4,
+      &quot;score&quot;: 0.5015
+    },
+    {
+      &quot;label&quot;: &quot;最快&quot;,
+      &quot;mains&quot;: 4,
+      &quot;items&quot;: [
+        {
+          &quot;productCode&quot;: &quot;P001&quot;,
+          &quot;name&quot;: &quot;板烧鸡腿堡&quot;,
+          &quot;quantity&quot;: 1,
+          &quot;unit_price_cny&quot;: 21.5,
+          &quot;subtotal_cny&quot;: 21.5,
+          &quot;tags&quot;: [
+            &quot;high_carb&quot;,
+            &quot;high_protein&quot;,
+            &quot;high_sodium&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        },
+        {
+          &quot;productCode&quot;: &quot;P002&quot;,
+          &quot;name&quot;: &quot;巨无霸&quot;,
+          &quot;quantity&quot;: 1,
+          &quot;unit_price_cny&quot;: 24.5,
+          &quot;subtotal_cny&quot;: 24.5,
+          &quot;tags&quot;: [
+            &quot;high_carb&quot;,
+            &quot;high_fat&quot;,
+            &quot;high_protein&quot;,
+            &quot;high_sodium&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        },
+        {
+          &quot;productCode&quot;: &quot;P005&quot;,
+          &quot;name&quot;: &quot;双层吉士汉堡&quot;,
+          &quot;quantity&quot;: 1,
+          &quot;unit_price_cny&quot;: 19.5,
+          &quot;subtotal_cny&quot;: 19.5,
+          &quot;tags&quot;: [
+            &quot;high_protein&quot;,
+            &quot;high_sodium&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        },
+        {
+          &quot;productCode&quot;: &quot;P013&quot;,
+          &quot;name&quot;: &quot;培根安格斯厚牛堡&quot;,
+          &quot;quantity&quot;: 1,
+          &quot;unit_price_cny&quot;: 33.5,
+          &quot;subtotal_cny&quot;: 33.5,
+          &quot;tags&quot;: [
+            &quot;high_carb&quot;,
+            &quot;high_fat&quot;,
+            &quot;high_protein&quot;,
+            &quot;high_sodium&quot;,
+            &quot;main&quot;
+          ],
+          &quot;is_main&quot;: true
+        }
+      ],
+      &quot;coupons&quot;: [
+        {
+          &quot;couponId&quot;: &quot;C001&quot;,
+          &quot;couponCode&quot;: &quot;CC001&quot;,
+          &quot;name&quot;: &quot;满99减15&quot;,
+          &quot;discount_cny&quot;: 15.0
+        }
+      ],
+      &quot;subtotal_cny&quot;: 99.0,
+      &quot;discount_cny&quot;: 15.0,
+      &quot;final_price_cny&quot;: 84.0,
+      &quot;per_capita_cny&quot;: 21.0,
+      &quot;people_count&quot;: 4,
+      &quot;nutrition&quot;: {
+        &quot;total_kcal&quot;: 2040.0,
+        &quot;per_capita_kcal&quot;: 510.0,
+        &quot;total_protein_g&quot;: 111.0,
+        &quot;per_capita_protein_g&quot;: 27.8,
+        &quot;total_fat_g&quot;: 109.0,
+        &quot;per_capita_fat_g&quot;: 27.2,
+        &quot;total_sodium_mg&quot;: 4245.0
+      },
+      &quot;nutrition_flags&quot;: [
+        &quot;人均脂肪超标&quot;
+      ],
+      &quot;units&quot;: 4,
+      &quot;score&quot;: 0.405
+    }
+  ],
+  &quot;nutrition_per_capita&quot;: [
+    {
+      &quot;label&quot;: &quot;最省钱&quot;,
+      &quot;kcal&quot;: 87.8,
+      &quot;protein&quot;: 4.7,
+      &quot;fat&quot;: 3.8,
+      &quot;sodium&quot;: 671.0
+    },
+    {
+      &quot;label&quot;: &quot;最健康&quot;,
+      &quot;kcal&quot;: 103.6,
+      &quot;protein&quot;: 5.8,
+      &quot;fat&quot;: 4.9,
+      &quot;sodium&quot;: 894.0
+    },
+    {
+      &quot;label&quot;: &quot;最快&quot;,
+      &quot;kcal&quot;: 127.5,
+      &quot;protein&quot;: 7.0,
+      &quot;fat&quot;: 6.8,
+      &quot;sodium&quot;: 1061.0
+    }
+  ]
+}</script>
+</body>
+</html>
