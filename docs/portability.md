@@ -27,7 +27,7 @@ python scripts/validate_skill.py --json # 机器可读
 |---|---|---|---|
 | 1 | frontmatter `name` | ✅ | `mcd-meal-brain`，小写字母+连字符，≤64 字符，与目录名一致 |
 | 2 | frontmatter `description` | ✅ | 77 字符（≤1024），说明 what + when |
-| 3 | SKILL.md 篇幅 | ✅ | 303 行（≤500 行建议上限），元数据→正文→引用文件三层渐进加载 |
+| 3 | SKILL.md 篇幅 | ✅ | 304 行（≤500 行建议上限），元数据→正文→引用文件三层渐进加载 |
 | 4 | `references/` 引用完整性 | ✅ | 正文引用的 4 个文件（workflow / schema / tools / strategy）全部存在 |
 | 5 | 渐进式披露结构 | ✅ | `references/` 目录存在，按需加载、不进初始上下文 |
 | 6 | `optimizer.py` 零依赖 | ✅ | 仅标准库：hashlib / json / os / re / sys / time / typing / urllib |
