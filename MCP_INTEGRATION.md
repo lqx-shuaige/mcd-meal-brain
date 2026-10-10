@@ -49,6 +49,22 @@ curl -s -X POST "https://mcp.mcd.cn/mcp-servers/mcd-mcp" \
 | 2026-10-09 23:52 | `tools/call` → `calculate-price` | `storeCode=195****, orderType=1, beType=1, items=[…]` | ⚠️ 业务错误 `60003`：门店暂停营业，请重新选择门店 | `a7d8c2…bf6ca3` |
 | 2026-10-09 23:57 | `tools/call` → `now-time-info` | 无 | ✅ `success:true` | `431171…5cbaf35` |
 
+### 2026-10-10 得来速与渠道比价专项核实（上午营业时段）
+
+| 时间（GMT+8） | JSON-RPC 方法 / 工具 | 关键入参 | 结果 | traceId |
+|---|---|---|---|---|
+| 08:21 | `query-nearby-stores` | `beType=5, searchType=2, city=北京市, keyword=国贸` | ✅ 返回 **5 家得来速餐厅**（storeCode + beCode 齐全，如 1950936/195093641） | `5c93b6…4343b` |
+| 08:21 | `query-meals` | `beType=3`（负向测试） | ❌ **参数校验拒绝**：`beType must be one of [1,2,5,6]` —— **beType=3 不存在** | —（客户端校验拦截） |
+| 08:21 | `query-meals` | `storeCode=1950936, orderType=1, beType=1` | ✅ 返回早餐菜单（分类+映射表两级结构） | `9bd48f…cf8360` |
+| 08:21 | `query-meals` | `storeCode=1950936, orderType=1, beType=5, beCode=195093641` | ✅ 菜单与 beType=1 **完全一致** | `a7e27…1e234f` |
+| 08:21 | `delivery-query-addresses` | 无 | ✅ `addresses: []` —— 当前账户**无配送地址**，麦乐送核价受阻 | `e31e6f…63f38` |
+| 08:21 | `calculate-price` | `beType=1, items=[5022×2, 4825×1]` | ✅ **¥47.00**；takeWayList 三种：`eat-in`/`locker-in`/`take-dt-quick` | `03e3b4…87907` |
+| 08:21 | `calculate-price` | `beType=5, beCode=195093641, items=[同上]` | ✅ **¥47.00**（与到店自取一致）；takeWayList 仅 `take-dt-quick` | `5afb5f…ec98da` |
+| 08:22 | `query-store-coupons` | `beType=1` / `beType=5`（各一次） | ✅ 两渠道均返回空券池（该账户无券，接口正常） | `6b7784…2255e` / `eb359d…7629a` |
+
+**本轮结论**：9 次调用全部按预期返回（1 次负向测试被正确拒绝）。得来速链路端到端跑通；
+渠道比价可做内部三渠道，外部平台接口不存在。
+
 **成功率**：8 次调用中 5 次成功、3 次因**门店非营业时段**返回业务错误。服务端本身连通性正常。
 
 **客户端侧连接日志（WorkBuddy 应用）**
@@ -141,6 +157,49 @@ curl -s -X POST "https://mcp.mcd.cn/mcp-servers/mcd-mcp" \
   其中 `reservationOptionText` 含完整时段（如"早餐(07:14至10:15)，午餐(10:44至14:15)…"）。
 - **处理**：逐条完整展示，`today=true` 的日期加 `*` 标记，严禁省略或概括。
 
+### 偏差 11 ★ beType=3 不存在，得来速是 beType=5（2026-10-10 实测）
+
+- **背景**：部分二手资料把得来速写作 `beType=3`。
+- **实测**：`query-meals` 传 `beType=3` 被参数校验直接拒绝——
+  `beType: must be equal to one of the allowed values`，合法枚举 `[1, 2, 5, 6]`。
+  而传 `beType=5` 全链路（门店→菜单→券→核价→可下单参数）畅通。
+- **后果**：按 beType=3 实现得来速会直接调用失败。
+- **处理**：全部文档与代码统一 `得来速=beType=5, orderType=1, beCode 必传`；
+  SKILL.md 场景表加「常见误区」警示。
+
+### 偏差 12 同门店渠道间菜单与价格完全一致，差异在 takeWayList
+
+- **实测**（门店 1950936，同一篮子）：`beType=1` 与 `beType=5` 的
+  `query-meals` 菜单、标价、`calculate-price` 核价**逐字段一致**（均 ¥47.00）。
+- **差异点**：`takeWayList` —— beType=1 返回 `eat-in`(堂食)/`locker-in`(外带)/
+  `take-dt-quick`(得来速) 三种；beType=5 **锁定** `take-dt-quick`（车道自提）。
+- **处理**：渠道比价中两渠道价格并列最低时，按取餐便利性给建议，而非硬造价格差。
+
+### 偏差 13 calculate-price 含完整到手成本结构（新发现字段）
+
+- **实测**：`calculate-price` 除商品价外还返回 `deliveryOriginalPrice`/`deliveryPrice`（运费）、
+  `packingOriginalPrice`/`packingPrice`（打包费）、`tablewarePrice`（餐具费）、
+  `originalPrice`/`discount`/`price`，以及 `enjoyed`/`enjoyable`
+  （含 `realDiscount` 实际优惠值与 `balance` 距下一档优惠的门槛差额，单位分）。
+- **恒等式**：`productPrice + deliveryPrice + packingPrice + tablewarePrice − discount = price`
+  （实测到店两渠道：4700+0+0+0−0=4700 ✅）。
+- **处理**：`optimizer.py::fetch_channel_quote()` 提取全结构并做恒等式校验，
+  不一致时以官方现价 `price` 为准并显式标注 `sum_consistent=False`。
+
+### 偏差 14 麦乐送核价强依赖配送地址
+
+- **实测**：`delivery-query-addresses` 返回空列表时，无法经 `delivery-query-stores`
+  取得 beCode，`calculate-price(beType=2)` 无法发起。
+- **处理**：渠道比价中麦乐送缺 beCode → 如实标注「无法核价：缺少 beCode」，
+  **不编造运费**；引导用户创建地址后可补齐该渠道。
+
+### 偏差 15 无第三方平台比价接口
+
+- **实测**：35 个工具全部为麦当劳官方体系（点餐/券/商城/积分/派对），
+  检索无美团、饿了么等外部平台相关工具。
+- **处理**：渠道比价仅限内部渠道（到店自取/麦乐送/得来速）；
+  被问及外部平台价格时如实说明能力边界，不引用记忆价格。
+
 ---
 
 ## 4. 复现方式
@@ -163,4 +222,6 @@ python scripts/optimizer.py --selftest
 
 - 服务端**连通性与鉴权正常**，35 个工具可全部发现并调用。
 - 主要接入风险集中在 **错误判定方式（偏差 1、2）** 与 **价格单位（偏差 4）**，二者均已代码化处理并附回归断言。
+- 得来速（beType=5）与渠道比价链路已于 2026-10-10 端到端实测通过（偏差 11–15）；
+  渠道比价仅限内部渠道，外部平台接口不存在。
 - 全部偏差均可在 `scripts/optimizer.py` 与 `SKILL.md` 中找到对应处理逻辑。

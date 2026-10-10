@@ -9,6 +9,9 @@
 3. ``optimize_plans``     多目标寻优：动态规划求最省钱方案，加权评分求最健康 / 最快方案，
                           帕累托剪枝后输出 Top-3。
 4. ``verify_price``       调用 MCP 的 ``calculate-price`` 做官方核价（单位：分 → 元）。
+5. ``compare_channels``   渠道比价：同一篮子在 到店自取 / 麦乐送 / 得来速 三个**内部渠道**的
+                          「到手成本」对比（商品 + 运费 + 打包费 + 餐具费 − 优惠）。
+                          ⚠️ MCP 不提供美团/饿了么等第三方平台接口，外部渠道不做、不编造。
 
 约定
 ----
@@ -21,6 +24,7 @@
     python optimizer.py                            # 跑内置样例，输出 3 个方案
     python optimizer.py "我们4个人，预算100，一个减脂，一个不吃辣"   # 自定义输入
     python optimizer.py --selftest                 # 只跑断言自检
+    python optimizer.py --compare-channels         # 渠道比价演示（回放 2026-10-10 实测数据）
 """
 
 from __future__ import annotations
@@ -1259,6 +1263,209 @@ def fetch_group_meal_context(
 
 
 # ---------------------------------------------------------------------------
+# 5.6 渠道比价（到手成本：到店自取 vs 麦乐送 vs 得来速）
+#
+#     ⚠️ 能力边界（2026-10-10 实测，详见 MCP_INTEGRATION.md）：
+#     * MCP 的 35 个工具**不提供**美团 / 饿了么等第三方平台比价接口，
+#       本模块只对比麦当劳内部渠道，外部平台价格不做、不估、不编造。
+#     * beType 枚举仅 [1, 2, 5, 6]，**不存在 beType=3**（参数校验直接拒绝）；
+#       得来速的正确编码是 **beType=5**，orderType=1，beCode 必传。
+#     * calculate-price 返回完整到手成本结构（单位均为「分」）：
+#       productPrice(商品) + deliveryPrice(运费) + packingPrice(打包费)
+#       + tablewarePrice(餐具费) − discount(优惠) = price(现价)。
+#     * 实测同一门店 beType=1 与 beType=5 菜单与核价完全一致（¥47.00=¥47.00），
+#       差异在 takeWayList：beType=1 返回 堂食/外带/得来速 三种取餐方式，
+#       beType=5 锁定「得来速-车道自提」（code=take-dt-quick）。
+#     * 麦乐送(beType=2)的 beCode 必须来自 delivery-query-stores（前置：
+#       账户存在配送地址）。无地址 → 无法核价，如实标注，不编造运费。
+# ---------------------------------------------------------------------------
+
+#: 渠道规格：名称 → beType / orderType / beCode 要求 / beCode 来源
+CHANNEL_SPECS: Dict[str, Dict[str, Any]] = {
+    "到店自取": {"beType": 1, "orderType": 1, "needs_be_code": False,
+                 "be_code_source": "无需 beCode（传了会报错）"},
+    "麦乐送": {"beType": 2, "orderType": 2, "needs_be_code": True,
+               "be_code_source": "delivery-query-stores（前置：账户需有配送地址，"
+                                 "经 delivery-query-addresses 获取 addressId）"},
+    "得来速": {"beType": 5, "orderType": 1, "needs_be_code": True,
+               "be_code_source": "query-nearby-stores(beType=5)"},
+}
+
+#: 到店类渠道实测取餐方式 code（来自 calculate-price 的 takeWayList）
+TAKE_WAY_CODES: Dict[str, str] = {
+    "eat-in": "堂食",
+    "locker-in": "外带（店内取餐柜）",
+    "take-dt-quick": "得来速（车道自提）",
+}
+
+
+def fetch_channel_quote(
+    items: Sequence[Tuple[str, int]],
+    store_code: str,
+    channel: str,
+    be_code: Optional[str] = None,
+    token: Optional[str] = None,
+    need_tableware: Optional[bool] = None,
+    reservation_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """对单一渠道调 ``calculate-price``，提取完整「到手成本」结构。
+
+    到手成本（内部单位：分；返回值已转「元」）::
+
+        商品 productPrice + 运费 deliveryPrice + 打包费 packingPrice
+        + 餐具费 tablewarePrice − 优惠 discount = 现价 price
+
+    * ``items``: ``(productCode, quantity)`` 序列 —— **同一篮子**在各渠道间对比才公平。
+    * 得来速 / 麦乐送必须传 ``be_code``；缺失时如实返回「无法核价」，不猜测、不编造。
+    * 分项之和若与官方现价 ``price`` 不一致，**以现价为准**并置 ``sum_consistent=False``。
+
+    Returns
+    -------
+    dict
+        ``{channel, ok, error, beType, orderType, product_cny, delivery_cny,
+        packing_cny, tableware_cny, discount_cny, original_cny, final_cny,
+        sum_consistent, take_ways, enjoyed, enjoyable, trace_id, raw}``
+    """
+    spec = CHANNEL_SPECS.get(channel)
+    if spec is None:
+        return {"channel": channel, "ok": False,
+                "error": f"未知渠道 {channel!r}（支持：{'、'.join(CHANNEL_SPECS)}；"
+                         f"美团/饿了么等外部平台不在 MCP 能力范围内）"}
+
+    if spec["needs_be_code"] and not be_code:
+        return {"channel": channel, "ok": False,
+                "beType": spec["beType"], "orderType": spec["orderType"],
+                "error": f"无法核价：缺少 beCode（来源：{spec['be_code_source']}）"}
+
+    arguments: Dict[str, Any] = {
+        "storeCode": str(store_code),
+        "orderType": spec["orderType"],
+        "beType": spec["beType"],
+        "items": [{"productCode": str(c), "quantity": int(q)} for c, q in items],
+    }
+    if be_code:
+        arguments["beCode"] = str(be_code)
+    if need_tableware is not None:
+        arguments["needTableware"] = bool(need_tableware)
+    if reservation_date:
+        arguments["reservationDate"] = reservation_date
+
+    try:
+        resp = _mcp_call("calculate-price", arguments, token=token)
+    except Exception as exc:  # noqa: BLE001 —— 网络/鉴权异常统一兜住
+        return {"channel": channel, "ok": False,
+                "beType": spec["beType"], "orderType": spec["orderType"],
+                "error": f"{type(exc).__name__}: {exc}"}
+
+    result = resp.get("result") or {}
+    if result.get("isError"):
+        return {"channel": channel, "ok": False,
+                "error": "MCP 返回 isError=True", "raw": result}
+    sc = result.get("structuredContent") or {}
+    # 与 verify_price 同源的偏差 1：业务错误不置 isError，藏在 structuredContent
+    if sc.get("success") is False:
+        return {"channel": channel, "ok": False,
+                "business_code": sc.get("code"),
+                "error": f"服务端业务错误 {sc.get('code')}: {sc.get('message')}",
+                "raw": sc}
+
+    data = sc.get("data") or {}
+
+    def _cents(key: str) -> int:
+        v = data.get(key)
+        return int(v) if isinstance(v, (int, float)) else 0
+
+    product = _cents("productPrice")
+    delivery = _cents("deliveryPrice")
+    packing = _cents("packingPrice")
+    tableware = _cents("tablewarePrice")
+    discount = _cents("discount")
+    final = _cents("price")
+    original = _cents("originalPrice")
+    sum_consistent = (product + delivery + packing + tableware - discount) == final
+
+    take_ways = [
+        {"code": t.get("code"), "title": t.get("title"), "subtitle": t.get("subtitle")}
+        for t in (data.get("takeWayList") or []) if isinstance(t, dict)
+    ]
+
+    def _yuan(c: int) -> float:
+        return round(c / 100.0, 2)
+
+    return {
+        "channel": channel, "ok": True, "error": None,
+        "beType": spec["beType"], "orderType": spec["orderType"],
+        "product_cny": _yuan(product),
+        "delivery_cny": _yuan(delivery),
+        "packing_cny": _yuan(packing),
+        "tableware_cny": _yuan(tableware),
+        "discount_cny": _yuan(discount),
+        "original_cny": _yuan(original),
+        "final_cny": _yuan(final),
+        "sum_consistent": sum_consistent,
+        "take_ways": take_ways,
+        "enjoyed": data.get("enjoyed") or None,
+        "enjoyable": data.get("enjoyable") or None,
+        "trace_id": sc.get("traceId"),
+        "raw": data,
+    }
+
+
+def compare_channels(
+    items: Sequence[Tuple[str, int]],
+    store_code: str,
+    be_codes: Optional[Dict[str, str]] = None,
+    token: Optional[str] = None,
+    need_tableware: Optional[bool] = None,
+    channels: Optional[Sequence[str]] = None,
+    reservation_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """**同一篮子 × 多渠道「到手成本」对比**（仅麦当劳 MCP 内部渠道）。
+
+    ⚠️ MCP 的 35 个工具**不提供**美团 / 饿了么等第三方平台比价接口，
+       本函数只对比：到店自取(beType=1) / 麦乐送(beType=2) / 得来速(beType=5)。
+       外部平台价格一律不做、不估、不编造。
+
+    Parameters
+    ----------
+    items : (productCode, quantity) 序列
+        待对比的**同一篮子**。productCode 必须来自 ``query-meals`` 真实返回。
+    be_codes : dict, 可选
+        渠道名 → beCode。得来速 / 麦乐送必填（缺失的渠道会如实标「无法核价」）。
+    need_tableware : bool, 可选
+        是否需要餐具（各渠道统一传同一值，保证对比公平）。
+
+    Returns
+    -------
+    dict
+        ``{store_code, items, quotes, priced_count, cheapest, scope_note}``，
+        其中 ``cheapest`` 为到手成本最低的渠道列表（可能并列，如到店自取与得来速同价）。
+    """
+    be_codes = be_codes or {}
+    names = [c for c in (channels or CHANNEL_SPECS) if c in CHANNEL_SPECS]
+    quotes = [
+        fetch_channel_quote(items, store_code, ch, be_code=be_codes.get(ch),
+                            token=token, need_tableware=need_tableware,
+                            reservation_date=reservation_date)
+        for ch in names
+    ]
+    priced = [q for q in quotes if q.get("ok")]
+    cheapest: List[str] = []
+    if priced:
+        low = min(q["final_cny"] for q in priced)
+        cheapest = [q["channel"] for q in priced if q["final_cny"] == low]
+    return {
+        "store_code": str(store_code),
+        "items": [{"productCode": c, "quantity": q} for c, q in items],
+        "quotes": quotes,
+        "priced_count": len(priced),
+        "cheapest": cheapest,
+        "scope_note": "仅对比麦当劳 MCP 内部渠道（到店自取/麦乐送/得来速）；"
+                      "MCP 不提供美团、饿了么等第三方平台比价数据",
+    }
+
+
+# ---------------------------------------------------------------------------
 # 6. 输出
 # ---------------------------------------------------------------------------
 
@@ -1327,6 +1534,54 @@ def render_pareto(plans: List[Dict[str, Any]],
                        f"{p['per_capita_cny']:>10.2f} {p.get('mains', 0):>5}  {delta}")
         out.append("")
         out.append("说明：本表为「给定热量下的最低价」，可直接回答「多吃 X 千卡要多花多少钱」。")
+    return "\n".join(out)
+
+
+def render_channel_comparison(result: Dict[str, Any]) -> str:
+    """渲染「渠道比价 · 到手成本」对比表（金额一律「元」，2 位小数）。"""
+    out: List[str] = []
+    out.append("【渠道比价 · 到手成本】同一篮子 × 麦当劳内部渠道")
+    out.append("范围说明：MCP 不提供美团/饿了么等第三方平台比价接口，"
+               "外部渠道不做对比、不编造数据。")
+    out.append("")
+    out.append(f"{'渠道':<6} {'商品':>8} {'运费':>8} {'打包费':>8} {'餐具费':>8} "
+               f"{'优惠':>8} {'到手成本':>10}  取餐方式 / 状态")
+    out.append("-" * 92)
+
+    cheapest = set(result.get("cheapest") or [])
+    priced = [q for q in result.get("quotes", []) if q.get("ok")]
+    low = min((q["final_cny"] for q in priced), default=None)
+
+    for q in result.get("quotes", []):
+        mark = "  💰最低" if q["channel"] in cheapest else ""
+        if not q.get("ok"):
+            out.append(f"{q['channel']:<6} {'—':>8} {'—':>8} {'—':>8} {'—':>8} "
+                       f"{'—':>8} {'无法核价':>10}  ❌ {q.get('error')}")
+            continue
+        ways = "、".join((t.get("title") or t.get("code") or "?") for t in q["take_ways"]) or "—"
+        flag = "" if q["sum_consistent"] else "  ⚠️分项和≠现价，以官方现价为准"
+        out.append(f"{q['channel']:<6} {q['product_cny']:>8.2f} {q['delivery_cny']:>8.2f} "
+                   f"{q['packing_cny']:>8.2f} {q['tableware_cny']:>8.2f} "
+                   f"{q['discount_cny']:>8.2f} {q['final_cny']:>10.2f}  {ways}{flag}{mark}")
+
+    out.append("-" * 92)
+    if cheapest:
+        out.append(f"结论：{'、'.join(cheapest)} 到手成本最低（¥{low:.2f}）。")
+        if len(cheapest) > 1:
+            out.append("同价时的取舍：开车/赶时间选得来速（免下车），顺路/堂食选到店自取"
+                       "（取餐方式更灵活）；价格本身无差异。")
+    elif priced:
+        out.append("结论：仅一个渠道可核价，无横向对比意义。")
+    else:
+        out.append("结论：所有渠道均无法核价（详见各行原因），不编造任何数字。")
+
+    # 凑单提示：enjoyable.balance = 距离下一档优惠的门槛差额（分）
+    for q in priced:
+        en = q.get("enjoyable") or {}
+        balance = en.get("balance")
+        if isinstance(balance, (int, float)) and balance > 0:
+            out.append(f"凑单提示（{q['channel']}）：再买 ¥{balance / 100:.2f} "
+                       f"可享下一档优惠（{en.get('realDiscount')}）。")
     return "\n".join(out)
 
 
@@ -1494,12 +1749,172 @@ def _selftest() -> None:
     finally:
         globals()["_mcp_call"] = orig_call
 
+    # 10) 渠道比价（离线桩，不联网）
+    #     a) 得来速缺 beCode → 必须如实失败，不得编造价格
+    q = fetch_channel_quote([("5022", 1)], "1950936", "得来速", be_code=None)
+    assert q["ok"] is False and "beCode" in (q.get("error") or ""), q
+
+    #     b) 美团等外部平台不在 MCP 能力范围 → 直接拒绝
+    q_ext = fetch_channel_quote([("5022", 1)], "1950936", "美团")
+    assert q_ext["ok"] is False and "美团" in q_ext["error"], q_ext
+
+    def _qstub(data: Dict[str, Any]) -> Dict[str, Any]:
+        return {"result": {"isError": False,
+                           "structuredContent": {"success": True, "code": 200,
+                                                 "traceId": "stub", "data": data}}}
+
+    try:
+        #     c) beCode 传递约定：得来速必传 beCode；到店自取绝不携带 beCode
+        captured: Dict[str, Any] = {}
+
+        def _capture(tool: str, args: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+            captured.clear()
+            captured.update(args)
+            return _qstub({"productPrice": 4700, "price": 4700})
+
+        globals()["_mcp_call"] = _capture
+        fetch_channel_quote([("5022", 1)], "1950936", "得来速", be_code="195093641")
+        assert captured.get("beCode") == "195093641", captured
+        assert captured.get("beType") == 5 and captured.get("orderType") == 1, captured
+        fetch_channel_quote([("5022", 1)], "1950936", "到店自取")
+        assert "beCode" not in captured, captured
+        assert captured.get("beType") == 1 and captured.get("orderType") == 1, captured
+
+        #     d) 实测回放：同门店 beType=1 与 beType=5 同价，takeWayList 不同；
+        #        be_codes 缺麦乐送 → 它必须如实标「无法核价」
+        def _replay(_tool: str, args: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+            if args.get("beType") == 1:
+                ways = [{"code": "eat-in", "title": "堂食"},
+                        {"code": "locker-in", "title": "外带"},
+                        {"code": "take-dt-quick", "title": "得来速"}]
+            else:
+                ways = [{"code": "take-dt-quick", "title": "得来速"}]
+            return _qstub({"productPrice": 4700, "price": 4700, "discount": 0,
+                           "takeWayList": ways})
+
+        globals()["_mcp_call"] = _replay
+        r = compare_channels([("5022", 2), ("4825", 1)], "1950936",
+                             be_codes={"得来速": "195093641"})
+        ml = next(x for x in r["quotes"] if x["channel"] == "麦乐送")
+        assert ml["ok"] is False and "beCode" in ml["error"], ml
+        dn = next(x for x in r["quotes"] if x["channel"] == "到店自取")
+        dt = next(x for x in r["quotes"] if x["channel"] == "得来速")
+        assert dn["ok"] and dt["ok"]
+        assert dn["final_cny"] == 47.00 and dt["final_cny"] == 47.00
+        assert len(dn["take_ways"]) == 3 and len(dt["take_ways"]) == 1
+        assert dt["take_ways"][0]["code"] == "take-dt-quick"
+        assert set(r["cheapest"]) == {"到店自取", "得来速"}, r["cheapest"]
+
+        #     e) 外送渠道含运费/打包费：4700+900+200+0-500 = 5300 分 = ¥53.00
+        globals()["_mcp_call"] = lambda _t, _a, **_k: _qstub(
+            {"productPrice": 4700, "deliveryPrice": 900, "packingPrice": 200,
+             "tablewarePrice": 0, "discount": 500, "price": 5300})
+        q2 = fetch_channel_quote([("5022", 1)], "1950936", "麦乐送", be_code="X1")
+        assert q2["ok"] and q2["final_cny"] == 53.00, q2
+        assert q2["sum_consistent"] is True, q2
+        assert q2["delivery_cny"] == 9.00 and q2["packing_cny"] == 2.00, q2
+
+        #     f) 分项和与现价不一致 → 以官方现价为准并显式标注
+        globals()["_mcp_call"] = lambda _t, _a, **_k: _qstub(
+            {"productPrice": 4700, "deliveryPrice": 900, "price": 5000})
+        q3 = fetch_channel_quote([("5022", 1)], "1950936", "麦乐送", be_code="X1")
+        assert q3["ok"] and q3["final_cny"] == 50.00 and q3["sum_consistent"] is False, q3
+
+        #     g) 渲染不炸且包含关键信息
+        txt = render_channel_comparison(r)
+        assert "到手成本" in txt and "无法核价" in txt and "得来速" in txt, txt[:200]
+    finally:
+        globals()["_mcp_call"] = orig_call
+
     print("[selftest] 全部断言通过 ✅")
+
+
+def _demo_channel_comparison() -> None:
+    """渠道比价演示：**回放 2026-10-10 真实实测数据**（不联网、不编造）。
+
+    实测环境：门店 1950936（北京朝阳公园南路得来速餐厅），营业时段内。
+    篮子：猪柳蛋麦满分(5022) ×2 + 脆薯饼(4825) ×1。
+
+    * 到店自取(beType=1)：核价 ¥47.00，traceId=03e3b4…，取餐方式 堂食/外带/得来速；
+    * 得来速(beType=5, beCode=195093641)：核价 ¥47.00，traceId=5afb5f…，
+      取餐方式锁定「得来速-车道自提」；
+    * 麦乐送(beType=2)：当前账户无配送地址（delivery-query-addresses 返回空），
+      无法取得 beCode → 如实标注「无法核价」，**不编造运费**。
+    """
+    real_replay: Dict[Tuple[int, int], Dict[str, Any]] = {
+        (1, 1): {
+            "success": True, "code": 200, "traceId": "03e3b4b361c04b5c2c1c952a78790c7",
+            "data": {
+                "productOriginalPrice": 4700, "productPrice": 4700,
+                "originalPrice": 4700, "discount": 0, "price": 4700,
+                "productList": [
+                    {"productCode": "5022", "productName": "猪柳蛋麦满分",
+                     "quantity": 2, "originalSubtotal": 3800, "subtotal": 3800},
+                    {"productCode": "4825", "productName": "脆薯饼",
+                     "quantity": 1, "originalSubtotal": 900, "subtotal": 900},
+                ],
+                "takeWayList": [
+                    {"code": "eat-in", "title": "堂食", "subtitle": "店内用餐"},
+                    {"code": "locker-in", "title": "外带", "subtitle": "店内取餐柜"},
+                    {"code": "take-dt-quick", "title": "得来速", "subtitle": "车道自提"},
+                ],
+            },
+        },
+        (1, 5): {
+            "success": True, "code": 200, "traceId": "5afb5ff94fd59262ccd36e47a4ec98da",
+            "data": {
+                "productOriginalPrice": 4700, "productPrice": 4700,
+                "originalPrice": 4700, "discount": 0, "price": 4700,
+                "productList": [
+                    {"productCode": "5022", "productName": "猪柳蛋麦满分",
+                     "quantity": 2, "originalSubtotal": 3800, "subtotal": 3800},
+                    {"productCode": "4825", "productName": "脆薯饼",
+                     "quantity": 1, "originalSubtotal": 900, "subtotal": 900},
+                ],
+                "takeWayList": [
+                    {"code": "take-dt-quick", "title": "得来速", "subtitle": "车道自提"},
+                ],
+            },
+        },
+    }
+
+    orig_call = globals()["_mcp_call"]
+
+    def _replay(tool: str, arguments: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+        key = (int(arguments.get("orderType") or 0), int(arguments.get("beType") or 0))
+        sc = real_replay.get(key)
+        if sc is None:            # 麦乐送无实测数据 → 也不会走到这里（缺 beCode 提前返回）
+            return {"result": {"isError": False, "structuredContent": {
+                "success": False, "code": -1, "message": f"无回放数据: {key}"}}}
+        return {"result": {"isError": False, "structuredContent": sc}}
+
+    print("=" * 68)
+    print("渠道比价演示（回放 2026-10-10 实测数据，门店 1950936）")
+    print("篮子：猪柳蛋麦满分 ×2 + 脆薯饼 ×1")
+    print("=" * 68)
+    try:
+        globals()["_mcp_call"] = _replay
+        result = compare_channels(
+            [("5022", 2), ("4825", 1)], "1950936",
+            be_codes={"得来速": "195093641"},   # 麦乐送无 beCode → 如实标「无法核价」
+        )
+    finally:
+        globals()["_mcp_call"] = orig_call
+    print()
+    print(render_channel_comparison(result))
+    print()
+    print("注：到店自取/得来速为官方核价实测值；麦乐送因当前账户无配送地址无法核价，")
+    print("    实际使用时先经 delivery-query-addresses → delivery-query-stores 取得")
+    print("    beCode 后即可补齐该渠道（到手成本将包含运费与打包费）。")
 
 
 def main(argv: Sequence[str]) -> int:
     if argv and argv[0] == "--selftest":
         _selftest()
+        return 0
+
+    if argv and argv[0] == "--compare-channels":
+        _demo_channel_comparison()
         return 0
 
     # 支持命令行传入自定义需求；不传则用内置样例

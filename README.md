@@ -30,6 +30,10 @@
 - **组合优化**：动态规划（无界背包 + 券组合 DP）+ 帕累托剪枝求最省钱；加权评分求最健康 / 最快。
 - **券来源严格区分**：只用 `query-store-coupons`（门店真实可用）算价，绝不混用「账户可领券」。
 - **官方核价**：每个方案都过 `calculate-price` 核价，偏差超 5% 以官方价为准。
+- **得来速（DT）场景**：`beType=5` 全链路实测跑通（beType=3 不存在，传入会被直接拒绝）；同门店与到店自取价格一致，差异仅在取餐方式。
+- **渠道比价（到手成本）**：同一篮子在 到店自取 / 麦乐送 / 得来速 三个**内部渠道**间对比
+  「商品 + 运费 + 打包 + 餐具 − 优惠」完整成本结构；无法核价的渠道如实标注，**不编造**；
+  美团 / 饿了么等外部平台不在 MCP 能力范围内，明确不做。
 - **写操作强确认**：下单、取消、领券、建地址、抽奖一律先展示、后确认，绝不擅自执行。
 - **营养化输出**：热量 / 蛋白 / 脂肪 / 钠全部给数值，不给「较健康」这种空话。
 
@@ -48,6 +52,7 @@ export MCD_MCP_TOKEN="<从 https://open.mcd.cn/mcp 获取>"
 # 3. 本地跑优化引擎（纯离线，不联网）
 python scripts/optimizer.py            # 输出 Top-3 方案
 python scripts/optimizer.py --selftest # 断言自检
+python scripts/optimizer.py --compare-channels  # 渠道比价演示（回放 2026-10-10 实测数据）
 
 # 4. 核价联调（需在门店营业时段 07:00–22:00）
 #    见 scripts/optimizer.py::verify_price(plan, store_code, token=...)
@@ -66,7 +71,7 @@ mcd-meal-brain/
 ├── scripts/
 │   └── optimizer.py              约束解析 · 硬约束过滤 · 组合优化 · 核价校验
 ├── mcp-config.example.json       MCP 配置示例（Token 用 ${MCD_MCP_TOKEN} 占位）
-├── MCP_INTEGRATION.md            MCP 接入记录（脱敏日志 + 10 项实测 schema 偏差）
+├── MCP_INTEGRATION.md            MCP 接入记录（脱敏日志 + 15 项实测 schema 偏差）
 ├── CONTEST_DECLARATION.md        参赛声明
 └── README.md
 ```
@@ -155,10 +160,12 @@ mcd-meal-brain/
 | 多目标收敛 | **帕累托剪枝**（成本↓ + 热量接近目标）后按加权评分排序 |
 | 加权评分 | `cheap / healthy / speed / pref` 四维，权重由画像决定 |
 | 核价校验 | 极简 MCP Streamable HTTP 客户端；**分 → 元**换算；偏差 >5% 以官方为准 |
+| 渠道比价 | 同一篮子 × 内部渠道（到店自取/麦乐送/得来速）到手成本对比；恒等式校验（商品+运费+打包+餐具−优惠=现价）；缺前置条件（如无配送地址）如实标「无法核价」 |
 | 错误处理 | 识别「业务错误不置 `isError`」的服务端行为，读 `structuredContent.success/code` |
 
-**内建质量保障**：`--selftest` 覆盖 6 组断言，含 4 个已修 bug 的回归用例
-（油炸误标、折扣券语义、浮点截断、券跨商品误用）与业务错误识别。
+**内建质量保障**：`--selftest` 覆盖 10 组断言，含 4 个已修 bug 的回归用例
+（油炸误标、折扣券语义、浮点截断、券跨商品误用）、业务错误识别与渠道比价
+（beCode 传递约定、到手成本恒等式、外部平台拒绝、无法核价兜底）。
 
 ---
 
@@ -179,4 +186,4 @@ mcd-meal-brain/
 - 工作流与核心规则 → [`SKILL.md`](./SKILL.md)
 - 工具参数速查 → [`references/tools.md`](./references/tools.md)
 - 标签字典与约束逻辑 → [`references/strategy.md`](./references/strategy.md)
-- MCP 接入踩坑记录（10 项实测偏差）→ [`MCP_INTEGRATION.md`](./MCP_INTEGRATION.md)
+- MCP 接入踩坑记录（15 项实测偏差）→ [`MCP_INTEGRATION.md`](./MCP_INTEGRATION.md)

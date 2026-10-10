@@ -14,6 +14,8 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 - 用户提到「多人」「拼单」「一起点」「宿舍」「同事」等多人点餐场景
 - 用户提出预算限制、口味偏好、饮食禁忌、减脂等约束
 - 用户询问「怎么点最省」「有什么活动」「怎么凑满减」
+- 用户提到「得来速」「车道取餐」「开车去取」「DT」「Drive Through」等驾车取餐场景
+- 用户询问「哪个渠道便宜」「到手多少钱」「自取和外卖差多少」等渠道比价场景
 
 **不触发**：单人单品简单点餐；纯查询（「我有什么券」「订单到哪了」）；用户直接指定了订单内容。
 
@@ -30,13 +32,18 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 | 场景 | beType | orderType | beCode |
 |---|---|---|---|
 | 到店自取 | 1 | 1 | 不传（传了会报错） |
-| 得来速 DT | 5 | 1 | 必传 |
+| 得来速 DT | **5** | 1 | 必传 |
 | 麦乐送 | 2 | 2 | 必传 |
 | 企业团餐 | 6 | 2 | 必传 |
 
+> ⚠️ **常见误区（实测纠偏）**：得来速**不是 beType=3**。beType 合法枚举仅 `[1, 2, 5, 6]`，
+> 传 3 会被参数校验直接拒绝。得来速的正确编码是 **beType=5**（详见下文「得来速场景要点」）。
+
 ### 第 2 步 · 环境准备
 - `now-time-info` 取服务器时间，作为「今天 / 可预约范围」基准。
-- 到店 → `query-nearby-stores`；外送或团餐 → `delivery-query-addresses`（无地址先引导 `delivery-create-address`）→ `delivery-query-stores`。
+- 到店自取 → `query-nearby-stores(beType=1)`；**得来速 → `query-nearby-stores(beType=5)`**
+  （返回的门店带 `beCode`，后续必传）；外送或团餐 → `delivery-query-addresses`（无地址先引导
+  `delivery-create-address`）→ `delivery-query-stores`。
 - 锁定 `storeCode`、`beCode`（如适用）、`orderType`。
 
 ### 第 3 步 · 菜单与偏好采集
@@ -71,6 +78,75 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 
 ---
 
+## 得来速（DT）场景要点（2026-10-10 实测）
+
+**结论：得来速真实可用，正确编码是 `beType=5`；`beType=3` 不存在**（传入会被参数校验直接拒绝，
+合法枚举仅 `[1, 2, 5, 6]`）。
+
+### 调用链路（全部实测通过）
+
+```
+query-nearby-stores(beType=5, searchType=2, city+keyword)
+    → 返回得来速门店（storeCode + beCode 必带）
+query-meals(storeCode, orderType=1, beType=5, beCode)     → 菜单与 productCode
+query-store-coupons(storeCode, orderType=1, beType=5, beCode) → 渠道可用券
+calculate-price(storeCode, orderType=1, beType=5, beCode, items) → 核价 + takeWayList
+create-order(..., takeWayCode)                             → 下单（需用户确认）
+```
+
+### 与到店自取的关键差异（同门店实测对比）
+
+| 维度 | 到店自取（beType=1） | 得来速（beType=5） |
+|---|---|---|
+| beCode | 不传（传了会报错） | **必传**（来自 `query-nearby-stores(beType=5)`） |
+| 菜单与标价 | 与得来速**完全一致**（同门店实测） | 同左 |
+| 官方核价 | ¥47.00（实测篮子） | ¥47.00（同一篮子，价格无差异） |
+| `takeWayList` | `eat-in`(堂食) / `locker-in`(外带) / `take-dt-quick`(得来速) 三种 | **锁定 `take-dt-quick`（车道自提）** |
+| 下单 `takeWayCode` | 从三种取餐方式中选 | 固定取 `take-dt-quick` |
+
+**给用户的建议**：同门店两渠道**到手价格无差异**，按取餐便利性选择即可
+（开车 / 赶时间 → 得来速；顺路 / 堂食 → 到店自取，取餐方式更灵活）。
+
+---
+
+## 渠道比价（到手成本）
+
+### 能力边界（先说清楚，不越界）
+
+- ✅ **可对比**：麦当劳 MCP 内部渠道 —— 到店自取（beType=1）/ 麦乐送（beType=2）/ 得来速（beType=5）。
+- ❌ **不可对比**：美团、饿了么等第三方平台 —— MCP 的 35 个工具**不提供**任何外部平台
+  比价接口。**不预估、不引用记忆中的价格、不编造外部数据**；用户问外部平台价格时如实说明
+  该能力不在 MCP 范围内。
+
+### 对比方法：同一篮子 × 各渠道核价
+
+「到手成本」= **商品现价 + 运费 + 打包费 + 餐具费 − 优惠**（`calculate-price` 返回的
+`productPrice / deliveryPrice / packingPrice / tablewarePrice / discount / price`，单位均为分）。
+
+1. **同一篮子**（相同 productCode × 数量）在各渠道间对比才公平；
+2. 各渠道前置条件：
+
+| 渠道 | 前置条件 | 缺失时 |
+|---|---|---|
+| 到店自取 | `query-nearby-stores(beType=1)` 拿 storeCode | — |
+| 得来速 | `query-nearby-stores(beType=5)` 拿 storeCode + beCode | 无法核价，如实标注 |
+| 麦乐送 | 配送地址 → `delivery-query-stores(beType=2)` 拿 storeCode + beCode | 无法核价，如实标注 |
+
+3. 实现：`scripts/optimizer.py::compare_channels()` —— 各渠道分别调 `calculate-price`，
+   提取完整成本结构，返回最低价渠道（可并列）；
+4. **无法核价的渠道如实标注原因，绝不编造数字**（如「麦乐送：账户无配送地址，无法核价」）；
+5. 券池差异：各渠道可用券需**分别**调 `query-store-coupons`（orderType/beType 不同，券池可能不同）；
+6. 输出用 `render_channel_comparison()`：对比表 + 最低价结论 + 同价取舍建议 + 凑单提示
+   （`enjoyable.balance` = 距下一档优惠的门槛差额）。
+
+### 实测锚点（2026-10-10，门店 1950936）
+
+同一篮子（猪柳蛋麦满分 ×2 + 脆薯饼 ×1）：到店自取 **¥47.00** = 得来速 **¥47.00**
+（运费 / 打包费 / 餐具费均为 0）；麦乐送因当前账户无配送地址无法核价。
+可运行 `python scripts/optimizer.py --compare-channels` 复现（离线回放实测数据）。
+
+---
+
 ## 核心规则
 
 ### 规则 1 · 参数来源强制约束
@@ -81,7 +157,7 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 | `storeCode` / `beCode` | `query-nearby-stores` 或 `delivery-query-stores` |
 | `productCode` | `query-meals` |
 | `couponId` / `couponCode` | `query-store-coupons` |
-| `takeWayCode` | `calculate-price` 的 `data.takeWayList[].code` |
+| `takeWayCode` | `calculate-price` 的 `data.takeWayList[].code`（实测值：`eat-in` 堂食 / `locker-in` 外带 / `take-dt-quick` 得来速） |
 | `gmServiceCode` | `query-meal-assistance` |
 | `addressId` | `delivery-query-addresses` / `delivery-create-address` |
 | `spuId` / `skuId` | `mall-points-products` 或 `mall-product-detail` |
@@ -91,9 +167,12 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 拿不到就回到对应步骤重新获取，**不许编**。
 
 ### 规则 2 · 价格单位
-- `calculate-price` 返回的价格字段单位是「**分**」，展示前**必须 ÷100 转「元」**。
+- `calculate-price` 返回的价格字段单位是「**分**」，展示前**必须 ÷100 转「元」**——
+  包括到手成本全结构：`productPrice`（商品）/ `deliveryPrice`（运费）/ `packingPrice`（打包费）/
+  `tablewarePrice`（餐具费）/ `discount`（优惠）/ `price`（现价）。
 - `query-meals` / `create-order` 返回的价格是**「元」字符串**（如 `currentPrice`、`originalPrice`，实测 `type=string`），直接展示，**不要再除 100**。
 - 两个来源对同一商品可能不一致 —— **一切以 `calculate-price` 核价为准**。
+- 到手成本恒等式：`商品 + 运费 + 打包 + 餐具 − 优惠 = 现价`；分项之和与现价不符时**以现价为准**并标注。
 
 > 内部计算统一用「分」（避免浮点误差），只在最终展示层转「元」。
 
@@ -257,4 +336,4 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 
 - `references/tools.md` —— 35 个 MCP 工具的参数与返回值注意事项
 - `references/strategy.md` —— 菜品标签字典、营养约束映射、软硬约束处理逻辑
-- `scripts/optimizer.py` —— 约束解析、硬约束过滤、组合优化、核价校验
+- `scripts/optimizer.py` —— 约束解析、硬约束过滤、组合优化、核价校验、渠道比价

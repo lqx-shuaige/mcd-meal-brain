@@ -11,13 +11,17 @@
 | 场景 | beType | orderType | beCode |
 |---|---|---|---|
 | 到店自取 | 1 | 1 | **不传**（传了会报错） |
-| 得来速 DT | 5 | 1 | **必传**（来自 `query-nearby-stores`） |
+| 得来速 DT | **5** | 1 | **必传**（来自 `query-nearby-stores`） |
 | 麦乐送 | 2 | 2 | **必传**（来自 `delivery-query-stores`） |
 | 企业团餐 | **6** | **2** | **必传**（来自 `delivery-query-stores`） |
+
+> ⚠️ **beType 合法枚举仅 `[1, 2, 5, 6]`，不存在 beType=3**（2026-10-10 实测：传 3 被参数校验
+> 直接拒绝）。得来速 = **beType=5**，不是 3。
 
 - `reservationDate`：仅预约场景传，格式 `yyyy-MM-dd HH:mm`；非预约不传。
 - `storeCode`：门店编码，绝大多数业务工具的必填项。
 - 团餐场景（beType=6）额外链路：`delivery-query-stores` → `query-meals` →（可选 `query-promotions` / `query-meal-assistance`）→ `calculate-price` → `create-order`。
+- 得来速场景（beType=5）链路：`query-nearby-stores(beType=5)` → `query-meals` / `query-store-coupons` / `calculate-price`（均 orderType=1 + beCode）→ `create-order`（`takeWayCode=take-dt-quick`）。
 
 ## 1. 门店与地址
 
@@ -34,7 +38,7 @@
 |---|---|---|---|
 | `query-meals` | 查餐品列表（搭单基础） | `storeCode`+`orderType`+`beType`；`beCode` 按上表；`reservationDate` | 返回商品 `productCode`，下单/核价前**必须先查**。描述内含团餐搭单价位规则（见下） |
 | `query-meal-detail` | 查餐品详情/套餐组成/特调 | `storeCode`+`orderType`+`beType`+`code` | `data.supportModify=true` → 商品名后标【可特调】；`choice.supportModify=true` 同样标注。**不主动展开特调列表**，用户问才展示；末尾总结 `isDefault=1` 的默认搭配并提示「回复'查看特调'」 |
-| `calculate-price` | 计算含优惠价格 | `storeCode`+`orderType`+`beType`；`items[]`(productCode/quantity/couponId/couponCode/modification)、`gmServiceCode`(团餐助餐码)、`withOrder`、`needTableware` | **⚠️ 返回价格单位是「分」，展示前必须 ÷100 转元**。返回 `data.takeWayList[].code`，到店下单时 `takeWayCode` 取自这里 |
+| `calculate-price` | 计算含优惠价格 | `storeCode`+`orderType`+`beType`；`items[]`(productCode/quantity/couponId/couponCode/modification)、`gmServiceCode`(团餐助餐码)、`withOrder`、`needTableware` | **⚠️ 返回价格单位是「分」，展示前必须 ÷100 转元**。返回**到手成本全结构**（2026-10-10 实测新增）：`productPrice`(商品)/`deliveryPrice`(运费)/`packingPrice`(打包费)/`tablewarePrice`(餐具费)/`discount`(优惠)/`price`(现价)，恒等式 `商品+运费+打包+餐具−优惠=现价`。`takeWayList[].code` 实测值：`eat-in`(堂食)/`locker-in`(外带)/`take-dt-quick`(得来速)。`enjoyed`/`enjoyable` 含 `realDiscount`(实际优惠值)与 `balance`(距下一档优惠门槛差额，分——凑单提示用) |
 | `list-nutrition-foods` | 查餐品营养成分 | 无 | 含能量/蛋白质/脂肪/碳水/钠/钙 —— 减脂与健康评分的**数据源** |
 
 **团餐搭单价位规则**（来自 `query-meals` 描述，用于生成方案时参考）
@@ -110,6 +114,26 @@ create-order                    →  下单（需用户确认）
 | `query-meal-assistance` | 查团餐可用助餐服务 | `storeCode`；**beType 固定 6**；orderType=2 | 用户选中后把 `gmServiceCode` 传给 `calculate-price` / `create-order` |
 
 > `query-meal-assistance`、`query-promotions` **仅团餐(beType=6)可用**，其他场景调用会失败。
+
+## 8. 渠道比价（到手成本对比）
+
+**能力边界（2026-10-10 实测确认）**：35 个工具全部为麦当劳官方体系（点餐 / 券 / 商城 / 积分 / 派对），
+**不提供美团、饿了么等第三方平台比价接口**。渠道比价只能在内部渠道间进行：
+
+| 渠道 | beType | orderType | beCode 来源 | 到手成本特有项 |
+|---|---|---|---|---|
+| 到店自取 | 1 | 1 | 无需 beCode | 运费/打包费/餐具费为 0（实测） |
+| 麦乐送 | 2 | 2 | `delivery-query-stores`（前置：账户有配送地址） | **运费 + 打包费** |
+| 得来速 | 5 | 1 | `query-nearby-stores(beType=5)` | 运费/打包费/餐具费为 0（实测） |
+
+**实现**：`scripts/optimizer.py::compare_channels(items, store_code, be_codes)` —— 同一篮子
+逐渠道调 `calculate-price`，提取 `商品+运费+打包+餐具−优惠=现价` 完整结构，
+`render_channel_comparison()` 输出对比表与最低价结论。
+
+**实测锚点（门店 1950936，2026-10-10）**：
+- 同一门店 beType=1 与 beType=5 的**菜单、标价、核价完全一致**（篮子核价均为 ¥47.00）；
+- 差异在 `takeWayList`：beType=1 返回堂食/外带/得来速三种，beType=5 锁定 `take-dt-quick`；
+- 麦乐送核价依赖配送地址（`delivery-query-addresses` 为空则取不到 beCode）→ 如实标「无法核价」。
 
 ---
 
