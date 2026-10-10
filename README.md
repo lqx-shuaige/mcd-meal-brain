@@ -181,6 +181,7 @@ mcd-meal-brain/
 ├── .github/workflows/test.yml    CI：push/PR 自动跑 selftest + pytest + CLI 冒烟（Python 3.10/3.12）
 ├── mcp-config.example.json       MCP 配置示例（Token 用 ${MCD_MCP_TOKEN} 占位）
 ├── MCP_INTEGRATION.md            MCP 接入记录（脱敏日志 + 16 项实测 schema 偏差）
+├── CHANGELOG.md                  版本更新日志（v1.1.0 · 方案席位自适应）
 ├── CONTEST_DECLARATION.md        参赛声明
 ├── workbuddy.md                  WorkBuddy 开发时间线（阶段与 commit 对应表，联动专项材料）
 └── README.md
@@ -390,6 +391,7 @@ GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
 ## 九、延伸阅读
 
 - 工作流概览与核心规则 → [`SKILL.md`](./SKILL.md)（含子代理编排设计）
+- 版本更新日志 → [`CHANGELOG.md`](./CHANGELOG.md)（v1.1.0 · 方案席位自适应）
 - 详细工作流与输出字段细则 → [`references/workflow.md`](./references/workflow.md)
 - 结构化输出契约 → [`references/schema.json`](./references/schema.json)
 - 工具参数速查 → [`references/tools.md`](./references/tools.md)
