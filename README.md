@@ -1,6 +1,29 @@
 # 麦麦拼单大脑（mcd-meal-brain）
 
-> 面向多人场景的麦当劳智能点餐决策引擎 —— 一个把「一群人吃什么、怎么点最划算」算成可执行方案的 Agent Skill。
+> 面向多人场景的麦当劳智能点餐决策引擎 —— 一句话进、三套可执行方案出、**确认后才下单**的 Agent Skill。
+
+**核心数据**：4 人拼单（不辣 + 每人 1 份主食 + 预算 ¥100），最省钱方案 **¥64.80 vs 基线 ¥86.00，省 24.7%**（人均 ¥16.20）；本地估算与官方核价**偏差 0%**（见 [docs/pricing-verification.md](./docs/pricing-verification.md)）。
+
+**三步跑起来**（Python 3.10+，零第三方依赖，纯离线）：
+
+```bash
+git clone https://github.com/lqx-shuaige/mcd-meal-brain.git && cd mcd-meal-brain
+python scripts/optimizer.py --selftest     # ① 断言自检
+python scripts/optimizer.py "我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"   # ② 复现三套方案
+python scripts/gen_demo.py                 # ③ 生成 docs/demo.html 可视化报告（浏览器打开）
+```
+
+**仓库结构**：
+
+```
+mcd-meal-brain/
+├── SKILL.md               技能主文档（八步工作流 / 子代理编排 / 核心规则）
+├── scripts/optimizer.py   核心引擎：解析 → 过滤 → 优化 → 核价（零依赖）
+├── references/            workflow · schema · tools · strategy
+├── docs/                  demo.html 可视化 · 真实核价记录 · 跨框架指南
+├── tests/                 pytest 回归（43 用例全绿）+ GitHub Actions CI
+└── MCP_INTEGRATION.md     MCP 接入记录（15 项实测 schema 偏差）
+```
 
 **参赛作品**：麦当劳 MCP 程序员创意开发大赛 · 作品形态：Agent Skill
 **依赖**：Python 3.10+（纯标准库） · 麦当劳 MCP 服务（35 个工具）
@@ -59,25 +82,21 @@
 
 ---
 
-## 三、快速开始
+## 三、更多运行入口
+
+> 基础三步（clone → selftest → 跑场景）见文首；以下为进阶入口。
 
 ```bash
-# 1. 环境（Python 3.10+ 即可，无第三方依赖）
-python --version
-
-# 2. 配置 MCP（把示例复制到本机配置，并填入自己的 Token）
+# 配置 MCP（把示例复制到本机配置，并填入自己的 Token）
 cp mcp-config.example.json ~/.workbuddy/mcp.json
 export MCD_MCP_TOKEN="<从 https://open.mcd.cn/mcp 获取>"
 
-# 3. 本地跑优化引擎（纯离线，不联网）
-python scripts/optimizer.py            # 输出 Top-3 方案
-python scripts/optimizer.py --selftest # 断言自检
 python scripts/optimizer.py --compare-channels  # 渠道比价演示（回放 2026-10-10 实测数据）
 python scripts/optimizer.py --json     # 结构化输出（references/schema.json 契约）
 python scripts/optimizer.py --clarify "随便"     # 模糊输入三层询问演示
 python scripts/optimizer.py --group    # 群体决策演示（一半要辣一半不要辣 → 双方案）
 
-# 4. 核价联调（需在门店营业时段 07:00–22:00）
+# 核价联调（需在门店营业时段 07:00–22:00）
 #    见 scripts/optimizer.py::verify_price(plan, store_code, token=...)
 #    ✅ 已于 2026-10-10 完成端到端实测（¥44.00 = ¥44.00，偏差 0%），见 docs/pricing-verification.md
 ```
