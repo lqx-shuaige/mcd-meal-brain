@@ -81,6 +81,27 @@ optimizer 本地估算与官方核价**分毫不差**（¥44.00 = ¥44.00）。
 完整脱敏记录与可执行复现见 `docs/pricing-verification.md` 与
 `scripts/verify_pricing.py`（快照固化 + 一键重放）。
 
+### 2026-10-10 10:27–10:29 方向 5.5 全链路真实化验证（任意输入 → 实时 MCP）
+
+改造前隐患：`optimizer.py` 主链路使用内置 `SAMPLE_MENU` / `SAMPLE_COUPONS` 固化数据，
+任意用户输入不会触发 MCP 调用。改造后：**任意输入默认走实时 MCP 数据**
+（`query-nearby-stores` 选址 → `query-meals` 菜单 → `query-store-coupons` 券 →
+`list-nutrition-foods` 营养），输出附 traceId 与获取时间自证。
+
+| 时间（GMT+8） | 场景（随机，非 README 演示） | 菜单 | 核价 | 结论 |
+|---|---|---|---|---|
+| 10:27 | 6 人团餐，总预算 300，忌猪肉 ×2，减脂 ×1 | 77 品（1950936） | **¥75.00 = ¥75.00（0.00%）** | ✅ 真实链路 |
+| 10:27 | 2 人，人均 25，都要辣，不要饮料，赶时间 | 96 品（1950564 自动选址） | **¥22.00 = ¥22.00（0.00%）** | ✅ 真实链路 |
+| 10:27 | 3 人拼单，预算 80，鸡肉过敏 + 乳糖不耐 | 77 品（1950936） | —（--json 契约输出含 data_source/traceId） | ✅ 真实链路 |
+
+* 全部 MCP 调用留痕于 `logs/mcp_calls.log`（JSONL，含 trace_id 字段，Token 脱敏）；
+* 降级验证：无 Token 默认模式 → 兜底数据 + 强制横幅「兜底数据，非实时」；
+  `--strict` 模式 → 报错退出（exit 1），绝不静默降级；
+* `list-nutrition-foods` 实测 `data` 为 **CSV 文本**（`[N]{列名}:
+  ` 表头 + 每行一条），非 JSON 数组——已按偏差记录并在 `parse_nutrition_csv` 兼容；
+* `query-meals` 的 `meals` 映射表实测字段：
+  `name / image / currentPrice / originalPrice / discountType / canWithOrder / withOrder`。
+
 **成功率**：8 次调用中 5 次成功、3 次因**门店非营业时段**返回业务错误。服务端本身连通性正常。
 
 **客户端侧连接日志（WorkBuddy 应用）**
@@ -215,6 +236,16 @@ optimizer 本地估算与官方核价**分毫不差**（¥44.00 = ¥44.00）。
   检索无美团、饿了么等外部平台相关工具。
 - **处理**：渠道比价仅限内部渠道（到店自取/麦乐送/得来速）；
   被问及外部平台价格时如实说明能力边界，不引用记忆价格。
+
+### 偏差 16 `list-nutrition-foods` 的 data 为 CSV 文本（2026-10-10 实测）
+
+- **预期**：`structuredContent.data` 为 JSON 数组。
+- **实测**：`data` 是**字符串**，格式为
+  `[160]{productName,nutritionDescription,energyKj,energyKcal,protein,fat,carbohydrate,sodium,calcium}:`
+  表头 + 每行一个餐品的 CSV（160 品）。
+- **处理**：`optimizer.py::parse_nutrition_csv()` 按表头列名解析；
+  与 `query-meals` 菜单按「名称归一化（去空格/™/括号及内容/引号）精确匹配」
+  关联，未命中（套餐/组合/周边）营养置 0，不估算、不编造。
 
 ---
 

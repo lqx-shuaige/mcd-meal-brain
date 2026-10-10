@@ -21,12 +21,22 @@
 
 命令行自测::
 
-    python optimizer.py                            # 跑内置样例，输出 3 个方案
-    python optimizer.py "我们4个人，预算100，一个减脂，一个不吃辣"   # 自定义输入
+    python optimizer.py                            # 任意输入默认走【实时 MCP 数据】
+    python optimizer.py "我们4个人，人均40，一个减脂，一个不吃辣"   # 自定义输入（真实数据）
+    python optimizer.py --demo [需求]              # 强制内置样例（显式标注演示数据）
+    python optimizer.py --strict [需求]            # MCP 不可用即报错，绝不兜底
+    python optimizer.py --verify [需求]            # 最省钱方案加 calculate-price 官方核价
+    python optimizer.py --store 1950936 [需求]     # 指定门店（缺省自动选址）
     python optimizer.py --selftest                 # 只跑断言自检
     python optimizer.py --compare-channels         # 渠道比价演示（回放 2026-10-10 实测数据）
     python optimizer.py --json [需求]              # 结构化输出（references/schema.json 契约）
     python optimizer.py --dump-schema              # 输出契约镜像（重定向到 references/schema.json）
+
+数据真实性契约（方向 5.5 全链路真实化）::
+
+    任意用户输入默认触发真实 MCP 调用（query-meals 菜单 / query-store-coupons 券 /
+    list-nutrition-foods 营养 / query-nearby-stores 选址）。MCP 不可用时如实报告
+    原因；非 --strict 模式才允许回退到内置样例，且输出中强制标注「兜底数据，非实时」。
 """
 
 from __future__ import annotations
@@ -1948,8 +1958,12 @@ def log_mcp_call(
     retries: int = 0,
     arguments: Optional[Dict[str, Any]] = None,
     detail: str = "",
+    trace_id: Optional[str] = None,
 ) -> None:
-    """追加一条 JSON Lines 日志（失败时静默跳过，不影响主流程）。"""
+    """追加一条 JSON Lines 日志（失败时静默跳过，不影响主流程）。
+
+    ``trace_id`` 为服务端返回的 traceId（成功路径才有），用于证明数据实时性。
+    """
     rec = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
         "tool": tool,
@@ -1959,6 +1973,8 @@ def log_mcp_call(
         "args": _redact_obj(arguments or {}),
         "detail": redact_text(detail)[:500],
     }
+    if trace_id:
+        rec["trace_id"] = trace_id
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as fh:
@@ -2048,8 +2064,11 @@ def _mcp_call(tool: str, arguments: Dict[str, Any], token: Optional[str] = None,
         try:
             resp = _mcp_call_once(tool, arguments, token, timeout)
             if log:
+                _sc = (resp.get("result") or {}).get("structuredContent")
+                _tid = _sc.get("traceId") if isinstance(_sc, dict) else None
                 log_mcp_call(tool, int((time.monotonic() - t0) * 1000), "success",
-                             retries=attempt - 1, arguments=arguments)
+                             retries=attempt - 1, arguments=arguments,
+                             trace_id=_tid if isinstance(_tid, str) else None)
             return resp
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
@@ -2569,6 +2588,558 @@ def fetch_group_meal_context(
 
 
 # ---------------------------------------------------------------------------
+# 5.7 全链路真实化（方向 5.5）：任意输入 → 真实 MCP 数据
+#
+#     主链路数据来源契约（评审输入任意场景时，以下数据必须来自实时 MCP）：
+#     * 营养表 ← list-nutrition-foods（实测 data 为 CSV 文本，160 品）
+#     * 菜单   ← query-meals（两级结构：categories[].meals[].code + meals 映射表；
+#                价格为「元」字符串（偏差 4）；discountType 含「随单购」按
+#                originalPrice 计价、其余按 currentPrice —— 与 docs/pricing-verification.md
+#                口径一致；营养按「名称归一化精确匹配」关联，未命中置 0、不估算）
+#     * 券     ← query-store-coupons（唯一权威；券池可能为空 —— 空即无券，
+#                属真实结果，不造券；最终价以 calculate-price 核价为准）
+#     * 门店   ← MCD_STORE_CODE / --store 参数 > query-nearby-stores 自动选址
+#                > 默认演示门店（仅此步允许默认，且如实标注来源）
+#
+#     降级契约（不偷偷用假数据）：
+#     * MCP 调用失败（网络/超时/Token 失效/非营业时段业务错误）→ 明确输出
+#       失败原因与营业时段提示；
+#     * 兜底数据（SAMPLE_MENU / SAMPLE_COUPONS）仅在用户未加 ``--strict`` 时
+#       使用，且输出中**强制标注**「兜底数据，非实时」横幅；
+#     * ``--strict`` 模式下 MCP 不可用直接报错退出，绝不降级。
+# ---------------------------------------------------------------------------
+
+#: 数据来源与降级横幅（输出中必须原样展示，不得省略）
+LIVE_SOURCE_NOTE = "数据来源：实时 MCP"
+FALLBACK_BANNER = ("⚠️ 兜底数据，非实时：MCP 获取失败，以下结果基于内置样例菜单/券，"
+                   "可能与实际有偏差（营业时段一般为 07:00–22:00，请稍后用真实数据重跑）")
+DEMO_BANNER = "⚠️ 演示模式：以下结果基于内置样例数据（非实时 MCP），仅用于展示算法能力"
+
+#: 自动选址兜底门店（北京国贸附近，营业 07:00–22:00，实测可下单）
+DEFAULT_STORE_CODE = "1950936"
+
+#: 名称归一化：去空格/™/®/【】及内容/中英文圆括号及内容/引号
+_NAME_BRACKETS_RE = re.compile(r"[（(【\[]([^（(【\[]*?)[）)】\]]")
+
+
+def normalize_food_name(name: Any) -> str:
+    """餐品名称归一化（用于 query-meals ↔ list-nutrition-foods 精确匹配）。
+
+    例：``纯牛奶(盒装)`` → ``纯牛奶``；``【美汁源】"黄金橙橙"`` → ``美汁源黄金橙橙``。
+    """
+    s = str(name or "")
+    s = s.replace(" ", "").replace("™", "").replace("®", "")
+    s = _NAME_BRACKETS_RE.sub("", s)
+    for q in ("\"", "'", "“", "”", "‘", "’"):
+        s = s.replace(q, "")
+    return s
+
+
+def parse_nutrition_csv(text: str) -> List[Dict[str, Any]]:
+    """解析 ``list-nutrition-foods`` 的 data 字段（实测为 CSV 文本，非 JSON 数组）。
+
+    格式（首行表头 + 每行一条）::
+
+        [160]{productName,nutritionDescription,energyKj,energyKcal,protein,fat,carbohydrate,sodium,calcium}:
+          猪柳麦满分,null,1288,308,16,16,24,781,213
+
+    返回 ``[{name, kcal, protein, fat, carb, sodium}]``；无法解析的行跳过，不编造。
+    """
+    columns: Optional[List[str]] = None
+    items: List[Dict[str, Any]] = []
+    for ln in str(text or "").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        m = re.match(r"^\[\d+\]\{([^}]*)\}:?$", ln)
+        if m:
+            columns = [c.strip() for c in m.group(1).split(",")]
+            continue
+        if not columns or "productName" not in columns:
+            continue
+        parts = [p.strip() for p in ln.split(",")]
+        if len(parts) < len(columns):
+            continue
+        row = dict(zip(columns, parts))
+
+        def _num(key: str) -> float:
+            try:
+                return float(row.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        items.append({
+            "name": row.get("productName") or "",
+            "kcal": _num("energyKcal"),
+            "protein": _num("protein"),
+            "fat": _num("fat"),
+            "carb": _num("carbohydrate"),
+            "sodium": _num("sodium"),
+        })
+    return items
+
+
+def _yuan_str_to_cents(v: Any) -> Optional[int]:
+    """query-meals 价格字段（「元」字符串，偏差 4）→ 内部「分」。失败返回 None。"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(round(float(v) * 100))
+    if isinstance(v, str):
+        try:
+            return int(round(float(v.strip()) * 100))
+        except ValueError:
+            return None
+    return None
+
+
+def fetch_nutrition_table(token: Optional[str] = None) -> Dict[str, Any]:
+    """调 ``list-nutrition-foods`` 拉取全量营养表（真实数据）。
+
+    Returns: ``{"ok", "items", "by_name"(归一化名称→营养), "count", "error", "trace_id"}``
+    """
+    try:
+        resp = _mcp_call("list-nutrition-foods", {}, token=token)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "items": [], "by_name": {}, "count": 0,
+                "error": f"{type(exc).__name__}: {exc}", "trace_id": None}
+    sc = (resp.get("result") or {}).get("structuredContent") or {}
+    if sc.get("success") is False:
+        return {"ok": False, "items": [], "by_name": {}, "count": 0,
+                "error": f"业务错误 {sc.get('code')}: {sc.get('message')}",
+                "trace_id": sc.get("traceId")}
+    data = sc.get("data")
+    items: List[Dict[str, Any]] = []
+    if isinstance(data, str):
+        items = parse_nutrition_csv(data)
+    elif isinstance(data, list):        # schema 若改为 JSON 数组的兼容路径
+        for d in data:
+            if isinstance(d, dict):
+                items.append({
+                    "name": str(d.get("productName") or d.get("name") or ""),
+                    "kcal": float(d.get("energyKcal") or 0),
+                    "protein": float(d.get("protein") or 0),
+                    "fat": float(d.get("fat") or 0),
+                    "carb": float(d.get("carbohydrate") or 0),
+                    "sodium": float(d.get("sodium") or 0),
+                })
+    by_name = {normalize_food_name(i["name"]): i for i in items if i["name"]}
+    return {"ok": True, "items": items, "by_name": by_name, "count": len(items),
+            "error": None, "trace_id": sc.get("traceId")}
+
+
+def fetch_real_menu(
+    store_code: str,
+    be_type: int = 1,
+    order_type: int = 1,
+    be_code: Optional[str] = None,
+    token: Optional[str] = None,
+    nutrition_by_name: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """调 ``query-meals`` 拉取**实时菜单**并转成内部结构（价格为分）。
+
+    * 两级结构（偏差 8）：``data.categories[].meals[].code`` + ``data.meals`` 映射表；
+    * 计价口径：``discountType`` 含「随单购」→ ``originalPrice``，否则 ``currentPrice``；
+    * 营养：与营养表按归一化名称**精确匹配**，未命中置 0（不估算、不编造）。
+
+    Returns: ``{"ok", "menu", "count", "nutrition_matched", "nutrition_unmatched",
+    "error", "business_error", "trace_id"}``
+    """
+    args: Dict[str, Any] = {
+        "storeCode": str(store_code),
+        "orderType": int(order_type or 1),
+        "beType": int(be_type or 1),
+    }
+    if be_code:
+        args["beCode"] = str(be_code)
+    try:
+        resp = _mcp_call("query-meals", args, token=token)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "menu": [], "count": 0, "nutrition_matched": 0,
+                "nutrition_unmatched": 0, "error": f"{type(exc).__name__}: {exc}",
+                "business_error": False, "trace_id": None}
+    sc = (resp.get("result") or {}).get("structuredContent") or {}
+    if sc.get("success") is False:
+        return {"ok": False, "menu": [], "count": 0, "nutrition_matched": 0,
+                "nutrition_unmatched": 0,
+                "error": f"业务错误 {sc.get('code')}: {sc.get('message')}",
+                "business_error": True, "trace_id": sc.get("traceId")}
+    data = sc.get("data")
+    meals_map: Dict[str, Any] = {}
+    if isinstance(data, dict) and isinstance(data.get("meals"), dict):
+        meals_map = data["meals"]
+    elif isinstance(data, list):       # 扁平结构兼容
+        for i, m in enumerate(data):
+            if isinstance(m, dict):
+                meals_map[str(m.get("code") or m.get("productCode") or i)] = m
+    menu: List[Dict[str, Any]] = []
+    matched = 0
+    for code, m in meals_map.items():
+        if not isinstance(m, dict):
+            continue
+        name = str(m.get("name") or "").strip()
+        if not name:
+            continue
+        current = _yuan_str_to_cents(m.get("currentPrice"))
+        original = _yuan_str_to_cents(m.get("originalPrice"))
+        discount_type = str(m.get("discountType") or "")
+        price = original if "随单购" in discount_type else current
+        if price is None:
+            price = original if original is not None else current
+        if price is None:
+            continue                   # 无价格信息：不入菜单，不编造
+        nut = (nutrition_by_name or {}).get(normalize_food_name(name))
+        if nut:
+            matched += 1
+        menu.append({
+            "productCode": str(code),
+            "name": name,
+            "price": price,           # 分
+            "kcal": float(nut["kcal"]) if nut else 0.0,
+            "protein": float(nut["protein"]) if nut else 0.0,
+            "fat": float(nut["fat"]) if nut else 0.0,
+            "sodium": float(nut["sodium"]) if nut else 0.0,
+            "carb": float(nut["carb"]) if nut else 0.0,
+            "discountType": discount_type,
+            "nutrition_matched": bool(nut),
+        })
+    return {"ok": True, "menu": menu, "count": len(menu),
+            "nutrition_matched": matched,
+            "nutrition_unmatched": len(menu) - matched,
+            "error": None, "business_error": False, "trace_id": sc.get("traceId")}
+
+
+def _normalize_mcp_coupon(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """把 ``query-store-coupons`` 返回的券转成内部券结构；字段缺失返回 None（不猜）。
+
+    ⚠️ 实测该账户券池为空，以下字段映射按官方文档命名做**容错取值**；
+    金额单位（元/分）歧义时按「优惠额 < 100 视为元」启发式处理并在
+    ``note`` 中标注，**最终优惠价以 calculate-price 核价为准**。
+    """
+    name = c.get("name") or c.get("title") or c.get("couponName") or ""
+    cid = c.get("couponId") or c.get("id") or c.get("couponCode") or ""
+    if not str(name).strip() or not str(cid).strip():
+        return None
+
+    def _cents(v: Any, *, is_discount: bool = False) -> Optional[int]:
+        """元/分歧义消解：优惠额 < 100 几乎不可能是「分」（<1 元券不现实）→ 视为元。"""
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            if v >= 100 or (not is_discount and v >= 100):
+                return int(v)
+            return int(round(v * 100))
+        if isinstance(v, str):
+            try:
+                return _cents(float(v.strip()), is_discount=is_discount)
+            except ValueError:
+                return None
+        return None
+
+    def _pick(*keys: str) -> Any:
+        for k in keys:
+            if c.get(k) is not None:
+                return c.get(k)
+        return None
+
+    min_spend = _cents(_pick("minSpend", "thresholdAmount", "useThreshold",
+                              "minPrice", "threshold"))
+    discount = _cents(_pick("discount", "discountAmount", "reduceAmount",
+                            "amount", "value"), is_discount=True)
+    rate = _pick("rate", "discountRate")
+    try:
+        rate = float(rate) if rate is not None else None
+        if rate is not None and rate > 1:
+            rate = rate / 10.0
+    except (TypeError, ValueError):
+        rate = None
+
+    out: Dict[str, Any] = {
+        "couponId": str(cid),
+        "couponCode": str(c.get("couponCode") or "") or None,
+        "name": str(name),
+        "source": "query-store-coupons",
+        "raw": c,
+    }
+    if rate is not None and 0 < rate < 1:
+        out.update({"type": "percent", "minSpend": min_spend or 0, "rate": rate,
+                    "exclusiveGroup": "order"})
+    elif min_spend is not None and discount is not None:
+        out.update({"type": "threshold", "minSpend": min_spend,
+                    "discount": discount, "exclusiveGroup": "order"})
+    else:
+        return None               # 结构不认识：宁可不加这张券，也不算错优惠
+    return out
+
+
+def fetch_real_coupons(
+    store_code: str,
+    be_type: int = 1,
+    order_type: int = 1,
+    be_code: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """调 ``query-store-coupons`` 拉取**门店真实可用券**。
+
+    券池为空是**真实结果**（该门店/渠道当前无券），``ok=True, coupons=[]``。
+
+    Returns: ``{"ok", "coupons", "skipped"(无法解析的原始券), "error",
+    "business_error", "trace_id"}``
+    """
+    args: Dict[str, Any] = {
+        "storeCode": str(store_code),
+        "orderType": int(order_type or 1),
+        "beType": int(be_type or 1),
+    }
+    if be_code:
+        args["beCode"] = str(be_code)
+    try:
+        resp = _mcp_call("query-store-coupons", args, token=token)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "coupons": [], "skipped": [],
+                "error": f"{type(exc).__name__}: {exc}",
+                "business_error": False, "trace_id": None}
+    sc = (resp.get("result") or {}).get("structuredContent") or {}
+    if sc.get("success") is False:
+        return {"ok": False, "coupons": [], "skipped": [],
+                "error": f"业务错误 {sc.get('code')}: {sc.get('message')}",
+                "business_error": True, "trace_id": sc.get("traceId")}
+    data = sc.get("data")
+    raw: List[Any] = []
+    if isinstance(data, list):
+        raw = data
+    elif isinstance(data, dict):
+        raw = data.get("coupons") or data.get("list") or []
+    coupons: List[Dict[str, Any]] = []
+    skipped: List[Any] = []
+    for c in raw:
+        if isinstance(c, dict):
+            nc = _normalize_mcp_coupon(c)
+            (coupons if nc else skipped).append(nc if nc else c)
+    return {"ok": True, "coupons": coupons, "skipped": skipped,
+            "error": None, "business_error": False, "trace_id": sc.get("traceId")}
+
+
+def resolve_store(
+    token: Optional[str] = None,
+    be_type: int = 1,
+    city: Optional[str] = None,
+    keyword: Optional[str] = None,
+) -> Dict[str, Any]:
+    """选址：``MCD_STORE_CODE`` 环境变量 > ``query-nearby-stores`` 自动选址 >
+    默认演示门店（仅此步允许默认值，且 ``source`` 如实标注）。
+
+    Returns: ``{"ok", "store_code", "store_name", "be_code", "source", "error"}``
+    """
+    env = os.environ.get("MCD_STORE_CODE")
+    if env:
+        return {"ok": True, "store_code": str(env), "store_name": None,
+                "be_code": None, "source": "MCD_STORE_CODE 环境变量", "error": None}
+    city = city or os.environ.get("MCD_STORE_CITY", "北京市")
+    keyword = keyword or os.environ.get("MCD_STORE_KEYWORD", "国贸")
+    # query-nearby-stores 合法 beType 仅 [1, 5]（得来速场景才有 beCode 可取）
+    search_be_type = 5 if int(be_type or 1) == 5 else 1
+    try:
+        resp = _mcp_call("query-nearby-stores",
+                         {"beType": search_be_type, "searchType": 2,
+                          "city": city, "keyword": keyword},
+                         token=token)
+        sc = (resp.get("result") or {}).get("structuredContent") or {}
+        if sc.get("success") is False:
+            raise RuntimeError(f"业务错误 {sc.get('code')}: {sc.get('message')}")
+        data = sc.get("data")
+        stores = data if isinstance(data, list) else (
+            (data or {}).get("stores") or (data or {}).get("list") or [])
+        for s in stores:
+            if not isinstance(s, dict):
+                continue
+            if s.get("businessStatus") is False:
+                continue               # 打烊门店跳过
+            code = s.get("storeCode") or s.get("code")
+            if not code:
+                continue
+            return {"ok": True, "store_code": str(code),
+                    "store_name": s.get("storeName") or s.get("name"),
+                    "be_code": (str(s["beCode"]) if s.get("beCode") else None),
+                    "source": f"query-nearby-stores（{city}·{keyword} 自动选址）",
+                    "error": None}
+        raise RuntimeError("返回门店列表为空或无营业中门店")
+    except Exception as exc:  # noqa: BLE001 —— 自动选址失败 → 默认门店 + 如实标注
+        return {"ok": False, "store_code": DEFAULT_STORE_CODE, "store_name": None,
+                "be_code": None, "source": "默认演示门店（自动选址失败）",
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+def fetch_live_context(
+    store_code: str,
+    constraints: Optional[Dict[str, Any]] = None,
+    be_type: Optional[int] = None,
+    order_type: Optional[int] = None,
+    be_code: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """一次取齐规划所需**真实数据**：营养表 + 菜单 + 门店券（+ 团餐促销）。
+
+    ``ok=False`` 表示菜单拿不到（真实链路无法进行，调用方须走降级/报错）；
+    营养/券单项失败不阻断，但会写入 ``notes`` 供输出层显式提示。
+
+    Returns: ``{"ok", "menu", "coupons", "store_code", "be_type", "order_type",
+    "traces"[(tool, trace_id)], "notes"[str], "errors"{tool: err}, "fetched_at"}``
+    """
+    notes: List[str] = []
+    errors: Dict[str, str] = {}
+    traces: List[Dict[str, Any]] = []
+
+    # 场景参数：优先显式入参 > constraints 推断 > 到店自取默认
+    c = constraints or {}
+    bt = int(be_type if be_type is not None else (c.get("beType") or 1) or 1)
+    ot = int(order_type if order_type is not None
+             else (c.get("orderType") or SCENE_ORDERTYPE.get(bt, 1)) or 1)
+    if bt in (5, 6) and not be_code:
+        # 得来速/团餐链路必须 beCode；缺失时按到店自取口径取数并如实标注
+        notes.append(f"场景 beType={bt} 需要门店 beCode（得来速经 query-nearby-stores"
+                     f"(beType=5)、团餐经 delivery-query-stores 获取），本次未提供，"
+                     f"菜单按到店自取（beType=1）口径获取，价格与可用品类可能存在差异。")
+        bt, ot = 1, 1
+
+    nutrition = fetch_nutrition_table(token)
+    if nutrition["ok"]:
+        traces.append({"tool": "list-nutrition-foods",
+                       "trace_id": nutrition.get("trace_id")})
+    else:
+        errors["list-nutrition-foods"] = nutrition["error"] or ""
+        notes.append("营养表获取失败：本次营养值按 0 计（不估算、不编造），"
+                     "「最健康」方案的营养评分可能失真。")
+
+    menu = fetch_real_menu(store_code, be_type=bt, order_type=ot,
+                           be_code=be_code, token=token,
+                           nutrition_by_name=nutrition.get("by_name"))
+    if menu["ok"]:
+        traces.append({"tool": "query-meals", "trace_id": menu.get("trace_id")})
+        notes.append(
+            f"菜单 {menu['count']} 品（实时）；营养精确匹配 {menu['nutrition_matched']} 品，"
+            f"未匹配 {menu['nutrition_unmatched']} 品按 0 计（多为套餐/组合/周边，"
+            f"list-nutrition-foods 无套餐口径，不估算）。")
+    else:
+        errors["query-meals"] = menu["error"] or ""
+
+    coupons = fetch_real_coupons(store_code, be_type=bt, order_type=ot,
+                                 be_code=be_code, token=token)
+    coupons_out: List[Dict[str, Any]] = []
+    if coupons["ok"]:
+        traces.append({"tool": "query-store-coupons",
+                       "trace_id": coupons.get("trace_id")})
+        coupons_out = coupons["coupons"]
+        if coupons.get("skipped"):
+            notes.append(f"门店券中 {len(coupons['skipped'])} 张结构无法解析，已跳过"
+                         f"（宁可不计入优惠，不算错价）。")
+        if not coupons_out:
+            notes.append("门店券池为空（query-store-coupons 实时返回）→ 本次按无券计算。")
+    else:
+        errors["query-store-coupons"] = coupons["error"] or ""
+        notes.append("门店券查询失败：本次按无券计算，结果可能偏高。")
+
+    # 团餐场景：促销规则（需 beCode，前面缺 beCode 时已退化为 beType=1，不会走到）
+    if bt == 6 and be_code:
+        promo = fetch_group_meal_promotions(store_code, be_code, token)
+        if promo.get("ok"):
+            coupons_out = coupons_out + (promo.get("coupons") or [])
+            notes.append(f"团餐促销规则已并入券池（query-promotions，"
+                         f"{len(promo.get('coupons') or [])} 条可解析）。")
+        else:
+            errors["query-promotions"] = promo.get("error") or ""
+            notes.append("团餐促销查询失败：未并入满减/满折规则，结果可能偏高。")
+
+    return {
+        "ok": bool(menu["ok"]),
+        "menu": menu.get("menu") or [],
+        "coupons": coupons_out,
+        "store_code": str(store_code),
+        "be_type": bt,
+        "order_type": ot,
+        "traces": traces,
+        "notes": notes,
+        "errors": errors,
+        "menu_error": menu.get("error"),
+        "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def run_live_optimization(
+    user_input: str,
+    store_code: Optional[str] = None,
+    be_code: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """**全链路真实化入口**：解析约束 → 实时取数 → 过滤 → 优化。
+
+    Returns: ``{"ok", "constraints", "kept", "plans", "context", "error"}``。
+    ``ok=False`` 时 ``error`` 为 MCP 获取失败原因（调用方须显式提示，不得静默降级）。
+    """
+    constraints = parse_constraints(user_input)
+    store = str(store_code) if store_code else resolve_store(token=token)["store_code"]
+    ctx = fetch_live_context(store, constraints, be_code=be_code, token=token)
+    if not ctx["ok"]:
+        return {"ok": False, "constraints": constraints, "kept": [],
+                "plans": [], "context": ctx, "error": ctx.get("menu_error")}
+    kept = filter_menu(_normalize_menu(ctx["menu"]), constraints)
+    plans = optimize_plans(kept, ctx["coupons"], constraints)
+    return {"ok": True, "constraints": constraints, "kept": kept,
+            "plans": plans, "context": ctx, "error": None}
+
+
+def acquire_planning_data(
+    constraints: Dict[str, Any],
+    demo: bool = False,
+    strict: bool = False,
+    store_code: Optional[str] = None,
+    be_code: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """获取规划用菜单与券：**默认真实 MCP**；失败时按降级策略兜底（显式标注）。
+
+    Returns: ``{"source"(live|fallback|demo|error), "menu", "coupons", "banner",
+    "notes", "traces", "store_code", "be_type", "order_type", "error", "fetched_at"}``
+    """
+    if demo:
+        return {"source": "demo", "menu": _normalize_menu(SAMPLE_MENU),
+                "coupons": SAMPLE_COUPONS, "banner": DEMO_BANNER,
+                "notes": [], "traces": [], "store_code": None,
+                "be_type": None, "order_type": None, "error": None, "fetched_at": None}
+
+    tok = token or os.environ.get("MCD_MCP_TOKEN") or ""
+    if not tok:
+        err = "未设置 MCD_MCP_TOKEN 环境变量（Token 从 https://open.mcd.cn/mcp 获取）"
+    else:
+        if store_code:
+            store = str(store_code)
+        else:
+            rs = resolve_store(token=tok,
+                               be_type=int(constraints.get("beType") or 1) or 1)
+            store = rs["store_code"]
+        ctx = fetch_live_context(store, constraints, be_code=be_code, token=tok)
+        if ctx["ok"]:
+            return {"source": "live", "menu": _normalize_menu(ctx["menu"]),
+                    "coupons": ctx["coupons"], "banner": None,
+                    "notes": list(ctx["notes"]), "traces": ctx["traces"],
+                    "store_code": store, "be_type": ctx["be_type"],
+                    "order_type": ctx["order_type"], "error": None,
+                    "fetched_at": ctx["fetched_at"]}
+        err = ctx.get("menu_error") or "未知错误"
+
+    # ---- MCP 不可用：如实报告；仅非 strict 模式才允许兜底，且强制标注 ----
+    if strict:
+        return {"source": "error", "menu": [], "coupons": [], "banner": None,
+                "notes": [], "traces": [], "store_code": None, "be_type": None,
+                "order_type": None, "error": err, "fetched_at": None}
+    return {"source": "fallback", "menu": _normalize_menu(SAMPLE_MENU),
+            "coupons": SAMPLE_COUPONS, "banner": FALLBACK_BANNER,
+            "notes": [f"MCP 获取失败原因：{err}"], "traces": [],
+            "store_code": None, "be_type": None, "order_type": None,
+            "error": err, "fetched_at": None}
+
+
+# ---------------------------------------------------------------------------
 # 5.6 渠道比价（到手成本：到店自取 vs 麦乐送 vs 得来速）
 #
 #     ⚠️ 能力边界（2026-10-10 实测，详见 MCP_INTEGRATION.md）：
@@ -2913,9 +3484,15 @@ def render_channel_comparison(result: Dict[str, Any]) -> str:
 
 # ---------------------------------------------------------------------------
 # 7. 样例与自测
+#
+#     ⚠️ 以下 SAMPLE_MENU / SAMPLE_COUPONS 为【兜底/演示数据，非实时】：
+#     * 仅在 --demo（显式演示）或 MCP 获取失败的非 --strict 模式下进入主链路，
+#       且输出中强制标注 FALLBACK_BANNER / DEMO_BANNER；
+#     * 默认主链路一律使用 query-meals / query-store-coupons 实时数据（见 5.7 节）；
+#     * _selftest 作为单元测试固件使用本样例（不触网，断言算法行为）。
 # ---------------------------------------------------------------------------
 
-#: 内置样例菜单（数据取自 list-nutrition-foods 真实营养值）
+#: 兜底/演示样例菜单（数据取自 list-nutrition-foods 真实营养值，2026-10-09 快照）
 SAMPLE_MENU: List[Dict[str, Any]] = [
     {"productCode": "P001", "name": "板烧鸡腿堡", "price": 2150, "kcal": 391, "protein": 23, "fat": 17, "sodium": 1041, "carb": 35},
     {"productCode": "P002", "name": "巨无霸", "price": 2450, "kcal": 513, "protein": 27, "fat": 26, "sodium": 961, "carb": 42},
@@ -2934,7 +3511,7 @@ SAMPLE_MENU: List[Dict[str, Any]] = [
     {"productCode": "P015", "name": "鲜蔬蛋沙拉叠叠卷", "price": 1850, "kcal": 266, "protein": 11, "fat": 14, "sodium": 518, "carb": 24},
 ]
 
-#: 内置样例券（结构对齐 query-store-coupons 的常见字段）
+#: 兜底/演示样例券（结构对齐 query-store-coupons 的常见字段；非实时数据）
 SAMPLE_COUPONS: List[Dict[str, Any]] = [
     {"couponId": "C001", "couponCode": "CC001", "name": "满99减15", "type": "threshold",
      "minSpend": 9900, "discount": 1500, "exclusiveGroup": "order"},
@@ -3933,6 +4510,42 @@ def _demo_channel_comparison() -> None:
     print("    beCode 后即可补齐该渠道（到手成本将包含运费与打包费）。")
 
 
+def _arg_value(argv: Sequence[str], flag: str) -> Optional[str]:
+    """取 ``--flag value`` 形式的命令行参数值；不存在或无值返回 None。"""
+    if flag in argv:
+        i = argv.index(flag)
+        if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+            return argv[i + 1]
+    return None
+
+
+def _print_data_source(data: Dict[str, Any]) -> None:
+    """统一输出数据来源说明（live / fallback / demo 必须显式区分，不得静默）。"""
+    print("\n[数据来源]")
+    if data["source"] == "live":
+        print(f"✅ {LIVE_SOURCE_NOTE}｜门店 {data['store_code']}｜"
+              f"菜单 {len(data['menu'])} 品｜券 {len(data['coupons'])} 张｜"
+              f"获取时间 {data['fetched_at']}")
+        for t in data.get("traces") or []:
+            print(f"   · {t['tool']}  traceId={t['trace_id']}")
+    elif data["source"] == "fallback":
+        print(f"❌ 当前无法连接 MCP，原因：{data['error']}")
+        print("   请检查网络 / MCD_MCP_TOKEN，或在门店营业时段（一般为 07:00–22:00）重试。")
+        print(f"   {FALLBACK_BANNER}")
+    else:
+        print(f"ℹ️ {DEMO_BANNER}")
+    for note in data.get("notes") or []:
+        print(f"   ⚠️ {note}")
+
+
+def _mcp_unavailable_hint(error: str) -> List[str]:
+    return [
+        f"当前无法连接 MCP，原因：{error}",
+        "请检查网络 / MCD_MCP_TOKEN，或在门店营业时段（一般为 07:00–22:00）重试。",
+        "如仅需查看算法演示，可运行：python scripts/optimizer.py --demo",
+    ]
+
+
 def main(argv: Sequence[str]) -> int:
     if argv and argv[0] == "--selftest":
         _selftest()
@@ -3992,7 +4605,15 @@ def main(argv: Sequence[str]) -> int:
                 return 1
         else:
             members = demo_members
-        result = optimize_group_plans(_normalize_menu(SAMPLE_MENU), SAMPLE_COUPONS, members)
+        data = acquire_planning_data(
+            {}, demo="--demo" in argv, strict="--strict" in argv,
+            store_code=_arg_value(argv, "--store"), be_code=_arg_value(argv, "--becode"))
+        if data["source"] == "error":
+            for line in _mcp_unavailable_hint(data["error"]):
+                print(line, file=sys.stderr)
+            return 1
+        _print_data_source(data)
+        result = optimize_group_plans(data["menu"], data["coupons"], members)
         print(render_group_result(result))
         return 0
 
@@ -4002,13 +4623,46 @@ def main(argv: Sequence[str]) -> int:
         return 0
 
     if argv and argv[0] == "--json":
-        # 结构化输出：走完整解析→过滤→优化流水线，输出契约文档（schema.json 校验通过）
+        # 结构化输出：解析 → 【默认实时 MCP 取数】→ 过滤 → 优化 → 契约文档
+        # （--demo 用内置样例；MCP 失败非 strict 模式兜底并强制标注；--strict 报错退出）
         user_input = next((a for a in argv[1:] if not a.startswith("-")), DEMO_INPUT)
         constraints = parse_constraints(user_input)
-        kept = filter_menu(_normalize_menu(SAMPLE_MENU), constraints)
-        plans = optimize_plans(kept, SAMPLE_COUPONS, constraints)
-        doc = plans_to_doc(plans, scene="到店自取（演示）",
+        data = acquire_planning_data(
+            constraints, demo="--demo" in argv, strict="--strict" in argv,
+            store_code=_arg_value(argv, "--store"), be_code=_arg_value(argv, "--becode"))
+        if data["source"] == "error":
+            for line in _mcp_unavailable_hint(data["error"]):
+                print(line, file=sys.stderr)
+            return 1
+        try:
+            kept = filter_menu(data["menu"], constraints)
+        except ValueError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+        plans = optimize_plans(kept, data["coupons"], constraints)
+        scene_name = constraints.get("scene") or "到店自取"
+        if data["source"] == "live":
+            scene = f"{scene_name}（门店 {data['store_code']}，实时 MCP 数据）"
+        elif data["source"] == "fallback":
+            scene = f"{scene_name}（兜底数据，非实时）"
+        else:
+            scene = f"{scene_name}（演示数据）"
+        doc = plans_to_doc(plans, scene=scene,
                            people_count=constraints.get("people_count"))
+        # 数据来源与降级信息写入契约文档（额外字段，不破坏 schema 校验）
+        doc["data_source"] = {
+            "menu": "query-meals（实时）" if data["source"] == "live"
+                    else f"内置样例（{'兜底' if data['source'] == 'fallback' else '演示'}，非实时）",
+            "coupons": "query-store-coupons（实时）" if data["source"] == "live"
+                       else f"内置样例（{'兜底' if data['source'] == 'fallback' else '演示'}，非实时）",
+            "nutrition": "list-nutrition-foods（实时，名称精确匹配）" if data["source"] == "live"
+                         else "内置样例（非实时）",
+            "store_code": data["store_code"],
+            "fetched_at": data["fetched_at"],
+            "trace_ids": {t["tool"]: t["trace_id"] for t in (data.get("traces") or [])},
+            "banner": data["banner"],
+            "notes": data["notes"],
+        }
         errs = validate_plans_doc(doc)
         if errs:  # 防御：结构化输出必须自证契约
             print("Schema 校验失败：", errs, file=sys.stderr)
@@ -4017,6 +4671,13 @@ def main(argv: Sequence[str]) -> int:
         return 0
 
     # 支持命令行传入自定义需求；不传则用内置样例
+    # ⚠️ 默认走【实时 MCP 数据】（方向 5.5 全链路真实化）：
+    #    * 任意用户输入 → query-meals / query-store-coupons / list-nutrition-foods
+    #    * --demo           强制使用内置样例（显式标注「演示数据」）
+    #    * --strict         MCP 不可用时直接报错退出，绝不兜底
+    #    * --store CODE     指定门店（缺省经 query-nearby-stores 自动选址）
+    #    * --becode CODE    得来速/团餐链路的门店 beCode
+    #    * --verify         对最省钱方案调 calculate-price 官方核价
     user_input = next((a for a in argv if not a.startswith("-")), DEMO_INPUT)
 
     print("=" * 68)
@@ -4027,16 +4688,48 @@ def main(argv: Sequence[str]) -> int:
     print("\n[解析结果]")
     print(json.dumps({k: v for k, v in constraints.items() if k != "raw"}, ensure_ascii=False, indent=2))
 
-    kept = filter_menu(_normalize_menu(SAMPLE_MENU), constraints)
+    data = acquire_planning_data(
+        constraints, demo="--demo" in argv, strict="--strict" in argv,
+        store_code=_arg_value(argv, "--store"), be_code=_arg_value(argv, "--becode"))
+    if data["source"] == "error":
+        for line in _mcp_unavailable_hint(data["error"]):
+            print(line, file=sys.stderr)
+        return 1
+    _print_data_source(data)
+
+    try:
+        kept = filter_menu(data["menu"], constraints)
+    except ValueError as exc:
+        print(f"\n❌ {exc}", file=sys.stderr)
+        return 1
     print(f"\n[硬约束过滤] 保留 {len(kept)} 项：", "、".join(m["name"] for m in kept))
 
-    plans = optimize_plans(kept, SAMPLE_COUPONS, constraints)
+    plans = optimize_plans(kept, data["coupons"], constraints)
     print("\n[Top-3 方案（加权评分）]")
+    if data["banner"]:
+        print(data["banner"])
     print(render_plans(plans))
 
+    if "--verify" in argv and data["source"] == "live":
+        cheap = next((p for p in plans if p["label"] == "最省钱"),
+                     plans[0] if plans else None)
+        if cheap:
+            vr = verify_price(cheap, data["store_code"],
+                              be_type=data["be_type"], order_type=data["order_type"])
+            print("\n[官方核价 calculate-price]")
+            if vr["ok"]:
+                print(f"  官方价 ¥{vr['official_final_cny']:.2f}"
+                      f"｜本地估算 ¥{vr['estimated_cny']:.2f}"
+                      f"｜偏差 ¥{vr['diff_cny']:+.2f}（{vr['diff_pct']:.2f}%）→ "
+                      + ("一致 ✅" if vr["diff_pct"] <= 5 else "偏差>5%，以官方价为准"))
+            else:
+                print(f"  核价失败：{vr['error']}（价格以实际下单为准）")
+
+    if data["banner"]:
+        print(data["banner"])
     print("\n[价格 × 热量 双目标]")
-    print(render_pareto(optimize_pareto(kept, SAMPLE_COUPONS, constraints),
-                        curve=optimize_cost_curve(kept, SAMPLE_COUPONS, constraints)))
+    print(render_pareto(optimize_pareto(kept, data["coupons"], constraints),
+                        curve=optimize_cost_curve(kept, data["coupons"], constraints)))
 
     return 0
 

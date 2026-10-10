@@ -4,14 +4,21 @@
 
 **核心数据**：4 人拼单（不辣 + 每人 1 份主食 + 预算 ¥100），最省钱方案 **¥64.80 vs 基线 ¥86.00，省 24.7%**（人均 ¥16.20）；本地估算与官方核价**偏差 0%**（见 [docs/pricing-verification.md](./docs/pricing-verification.md)）。
 
-**三步跑起来**（Python 3.10+，零第三方依赖，纯离线）：
+**三步跑起来**（Python 3.10+，零第三方依赖）：
 
 ```bash
 git clone https://github.com/lqx-shuaige/mcd-meal-brain.git && cd mcd-meal-brain
-python scripts/optimizer.py --selftest     # ① 断言自检
-python scripts/optimizer.py "我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"   # ② 复现三套方案
-python scripts/gen_demo.py                 # ③ 生成 docs/demo.html 可视化报告（浏览器打开）
+python scripts/optimizer.py --selftest     # ① 断言自检（纯离线）
+export MCD_MCP_TOKEN="<从 https://open.mcd.cn/mcp 获取>"    # ② 配置 Token（营业时段 07:00–22:00）
+python scripts/optimizer.py --verify "我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"   # ③ 实时 MCP 数据 + 三套方案 + 官方核价
 ```
+
+> **全链路真实化（方向 5.5）**：任意用户输入默认触发**真实 MCP 调用**——
+> `query-nearby-stores` 自动选址 → `query-meals` 实时菜单 → `query-store-coupons`
+> 门店真实券 → `list-nutrition-foods` 营养精确匹配；输出中展示各调用的 traceId
+> 与获取时间自证实时性。MCP 不可用时如实报告原因（不偷偷用假数据）；非
+> `--strict` 模式才回退内置样例，且强制标注「兜底数据，非实时」。
+> 详见 [MCP_INTEGRATION.md](./MCP_INTEGRATION.md) 方向 5.5 验证记录。
 
 **仓库结构**：
 
@@ -48,6 +55,10 @@ mcd-meal-brain/
 
 ## 二、核心能力
 
+- **全链路真实化**（方向 5.5 新增）：任意输入默认走实时 MCP 数据链路
+  （自动选址 → 实时菜单 → 门店真实券 → 营养精确匹配），输出附 traceId 自证；
+  MCP 失败如实报错，兜底/演示数据强制标注横幅，`--strict` 模式绝不降级；
+  `--json` 结构化输出携带 `data_source`（来源/时间/traceId/横幅）字段。
 - **自然语言 → 结构化约束**：识别忌口成分（「不吃牛」「牛肉过敏」「不碰安格斯」归一为同一黑名单）、预算形式（总额 / 人均）、减脂档位、四种典型画像。
 - **双预算约束**（方向 4 新增）：同时支持「总预算上限」与「每人预算上限」，两者都作为硬约束在优化中生效。例如「4 个人，总预算 100，每人不超过 30」。
 - **券可用性估算**（方向 4 新增）：基于历史可用数据（MCP 若提供）或券特征（门槛高低、时段限制、门店限制）估算每张券的可用性（高/中/低），无数据时如实标注「未知」，绝不编造概率数字。
@@ -92,9 +103,13 @@ cp mcp-config.example.json ~/.workbuddy/mcp.json
 export MCD_MCP_TOKEN="<从 https://open.mcd.cn/mcp 获取>"
 
 python scripts/optimizer.py --compare-channels  # 渠道比价演示（回放 2026-10-10 实测数据）
-python scripts/optimizer.py --json     # 结构化输出（references/schema.json 契约）
+python scripts/optimizer.py --json [需求]       # 结构化输出（references/schema.json 契约，含 data_source）
 python scripts/optimizer.py --clarify "随便"     # 模糊输入三层询问演示
-python scripts/optimizer.py --group    # 群体决策演示（一半要辣一半不要辣 → 双方案）
+python scripts/optimizer.py --group [--strict]  # 群体决策演示（默认实时 MCP 数据）
+python scripts/optimizer.py --demo [需求]       # 强制内置样例（显式标注「演示数据」）
+python scripts/optimizer.py --strict [需求]     # MCP 不可用即报错退出，绝不兜底
+python scripts/optimizer.py --store 1950936 ... # 指定门店（缺省经 query-nearby-stores 自动选址）
+python scripts/optimizer.py --verify [需求]     # 最省钱方案加 calculate-price 官方核价
 
 # 核价联调（需在门店营业时段 07:00–22:00）
 #    见 scripts/optimizer.py::verify_price(plan, store_code, token=...)
@@ -146,7 +161,7 @@ mcd-meal-brain/
 │   └── test_regression.py        回归测试（pytest，5 场景 + 契约回归，25 用例）
 ├── .github/workflows/test.yml    CI：push/PR 自动跑 selftest + pytest + CLI 冒烟（Python 3.10/3.12）
 ├── mcp-config.example.json       MCP 配置示例（Token 用 ${MCD_MCP_TOKEN} 占位）
-├── MCP_INTEGRATION.md            MCP 接入记录（脱敏日志 + 15 项实测 schema 偏差）
+├── MCP_INTEGRATION.md            MCP 接入记录（脱敏日志 + 16 项实测 schema 偏差）
 ├── CONTEST_DECLARATION.md        参赛声明
 └── README.md
 ```
@@ -201,7 +216,7 @@ mcd-meal-brain/
 └ 人均 510 kcal｜蛋白 27.8 g｜四个汉堡出餐快、无需等小食
 ```
 
-> 以上结果可由 `python scripts/optimizer.py "我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"` **一键复现**。营养数据取自 `list-nutrition-foods` 的真实值（160 个餐品）；券为内置示例券，用于演示券组合 DP。
+> 以上结果可由 `python scripts/optimizer.py --demo "我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"` **一键复现**（内置样例数据，输出显式标注「演示模式」；营养取自 `list-nutrition-foods` 真实值快照，券为内置示例券，用于演示券组合 DP）。**实时数据版**：去掉 `--demo` 即走真实 MCP 链路（菜单/券/营养均为实时拉取，输出附 traceId 自证）。
 
 > **拼单底线约束**：算法强制 `主食份数 ≥ 人数`（每人至少 1 份汉堡/卷，小食、饮品、甜品不计入主食），
 > 因此不会出现「2 个汉堡 + 2 份薯条分给 4 个人」这类分不下去的方案。
@@ -229,6 +244,7 @@ mcd-meal-brain/
 
 | 模块 | 实现 |
 |---|---|
+| 真实数据链路（方向 5.5） | `acquire_planning_data()` 默认实时 MCP：`resolve_store()`（env > 自动选址 > 默认门店，来源如实标注）→ `fetch_live_context()`（营养 CSV 解析 + 两级菜单结构 + 门店券，逐项 traceId）；MCP 失败如实报错，兜底/演示数据强制标注横幅，`--strict` 绝不降级 |
 | 约束解析 | 正则 + 关键词表；成分同义词归一（牛/猪/鸡/鱼/辣/油炸/奶/花生…） |
 | 硬约束过滤 | 一票否决 + 原因记录，先压解空间再优化 |
 | 最省钱求解 | **动态规划**：无界背包（状态 = 份数 × 热量桶）最小化成本；券组合另一层 DP（分组互斥 / 门槛 / 商品范围 / 最多叠加 2 张） |
