@@ -198,8 +198,16 @@ def parse_constraints(user_input: str) -> Dict[str, Any]:
     elif any(k in text for k in ("减脂", "控卡", "低脂", "低卡", "健身")):
         tier = "standard"
     if tier:
-        targets = dict(DIET_TIERS[tier])
-        targets["tier"] = tier
+        # ⚠️ 必须输出与消费方一致的键名（max_calories_kcal / max_fat_g / min_protein_g），
+        #    否则档位阈值会被静默忽略（历史 bug：此处曾用 kcal/fat/protein 导致约束失效）。
+        t = DIET_TIERS[tier]
+        targets = {
+            "max_calories_kcal": t["kcal"],
+            "max_fat_g": t["fat"],
+            "min_protein_g": t["protein"],
+            "max_sodium_mg": t["sodium"],
+            "tier": tier,
+        }
     kcal_cap = _find_number(text, [r"(\d+)\s*(?:大卡|千卡|kcal|卡)"])
     if kcal_cap:
         targets["max_calories_kcal"] = kcal_cap
@@ -429,24 +437,19 @@ def _coupon_dp(
     }
 
 
-def _dp_min_cost(
+def _build_dp(
     items: List[Dict[str, Any]],
     people: int,
-    kcal_min: float,
     kcal_max: float,
     step: int = 25,
-) -> List[Dict[str, Any]]:
-    """动态规划求满足「主食份数 + 热量区间」的最低成本篮子（无界背包）。
+) -> Tuple[List[List[Optional[Tuple[int, int, int, int]]]], int, int]:
+    """构建 DP 表（无界背包），供「最低成本」与「价格×热量帕累托」共用。
 
-    状态: ``(主食份数, 热量桶)`` → 最小花费（分）与重建路径。
-
-    ⚠️ 拼单场景的关键约束：**主食份数 ≥ 人数**（每人至少 1 份主食），
-    而不是只看"总份数 ≥ 人数"——否则会出现「2 个汉堡 + 2 份薯条供 4 人」这种分不下去的方案。
+    状态: ``dp[主食份数][热量桶] = (cost, prev_m, prev_b, item_idx)``
     """
     max_mains = max(people, 1) + 2          # 允许比人数多 2 份主食用于凑满减
     max_bucket = int(kcal_max // step) + 1
 
-    # dp[m][b] = (cost, prev_m, prev_b, item_idx)
     dp: List[List[Optional[Tuple[int, int, int, int]]]] = [
         [None] * (max_bucket + 1) for _ in range(max_mains + 1)
     ]
@@ -467,6 +470,46 @@ def _dp_min_cost(
                 tgt = dp[nm][nb]
                 if tgt is None or ncost < tgt[0]:
                     dp[nm][nb] = (ncost, m, b, idx)
+    return dp, max_mains, max_bucket
+
+
+def _trace_basket(
+    dp: List[List[Optional[Tuple[int, int, int, int]]]], m: int, b: int
+) -> List[int]:
+    """从 DP 表回溯出商品下标篮子。"""
+    basket: List[int] = []
+    cm, cb, guard = m, b, 0
+    while guard < 400:
+        guard += 1
+        cell = dp[cm][cb]
+        if cell is None:
+            break
+        _, pm, pb, idx = cell
+        if idx < 0:
+            break
+        basket.append(idx)
+        cm, cb = pm, pb
+    return basket
+
+
+def _basket_kcal(basket: Iterable[int], items: List[Dict[str, Any]]) -> float:
+    """按篮子里的商品下标求和**实际**热量（不吃热量桶取整的亏）。"""
+    return float(sum(items[i]["kcal"] for i in basket))
+
+
+def _dp_min_cost(
+    items: List[Dict[str, Any]],
+    people: int,
+    kcal_min: float,
+    kcal_max: float,
+    step: int = 25,
+) -> List[Dict[str, Any]]:
+    """动态规划求满足「主食份数 + 热量区间」的最低成本篮子（无界背包）。
+
+    ⚠️ 拼单场景的关键约束：**主食份数 ≥ 人数**（每人至少 1 份主食），
+    而不是只看"总份数 ≥ 人数"——否则会出现「2 个汉堡 + 2 份薯条供 4 人」这种分不下去的方案。
+    """
+    dp, max_mains, max_bucket = _build_dp(items, people, kcal_max, step=step)
 
     solutions: List[Dict[str, Any]] = []
     for m in range(max(people, 1), max_mains + 1):
@@ -474,24 +517,15 @@ def _dp_min_cost(
             cell = dp[m][b]
             if cell is None:
                 continue
-            kcal = b * step
-            if kcal < kcal_min or kcal > kcal_max:
+            basket = _trace_basket(dp, m, b)
+            if not basket:
                 continue
-            basket: List[int] = []
-            cm, cb, guard = m, b, 0
-            while guard < 400:
-                guard += 1
-                c2 = dp[cm][cb]
-                if c2 is None:
-                    break
-                _, pm, pb, idx = c2
-                if idx < 0:
-                    break
-                basket.append(idx)
-                cm, cb = pm, pb
-            if basket:
-                solutions.append({"cost": int(cell[0]), "mains": m, "units": len(basket),
-                                  "kcal": kcal, "indices": basket})
+            # ⚠️ 用实际热量校验，而不是桶号 × step（桶是向下取整的，会略微低估）
+            real_kcal = _basket_kcal(basket, items)
+            if real_kcal < kcal_min or real_kcal > kcal_max:
+                continue
+            solutions.append({"cost": int(cell[0]), "mains": m, "units": len(basket),
+                              "kcal": real_kcal, "indices": basket})
 
     solutions.sort(key=lambda s: (s["cost"], abs(s["kcal"] - kcal_min)))
     pruned: List[Dict[str, Any]] = []
@@ -503,6 +537,88 @@ def _dp_min_cost(
         if len(pruned) >= 40:
             break
     return pruned
+
+
+def price_kcal_candidates(
+    items: List[Dict[str, Any]],
+    people: int,
+    kcal_min: float,
+    kcal_max: float,
+    step: int = 25,
+) -> List[Dict[str, Any]]:
+    """**成本–热量权衡曲线**：每个热量档位下的最低成本解（未做帕累托过滤）。
+
+    用途：回答"在满足硬约束的前提下，多吃 X 千卡要多花多少钱"。
+    返回按热量升序排列的候选列表。
+    """
+    if not items:
+        return []
+    dp, max_mains, max_bucket = _build_dp(items, people, kcal_max, step=step)
+
+    cand: List[Dict[str, Any]] = []
+    for b in range(0, max_bucket + 1):
+        best: Optional[Tuple[int, int]] = None
+        for m in range(max(people, 1), max_mains + 1):
+            cell = dp[m][b]
+            if cell is None:
+                continue
+            if best is None or cell[0] < best[0]:
+                best = (int(cell[0]), m)
+        if best is None:
+            continue
+        basket = _trace_basket(dp, best[1], b)
+        if not basket:
+            continue
+        # ⚠️ 以实际热量为准校验上下限（热量桶向下取整会低估）
+        real_kcal = _basket_kcal(basket, items)
+        if real_kcal < kcal_min or real_kcal > kcal_max:
+            continue
+        cand.append({"kcal": real_kcal, "cost": best[0], "mains": best[1],
+                     "units": len(basket), "indices": basket})
+
+    # 同一实际热量可能对应多个篮子，只保留成本最低的那个
+    by_kcal: Dict[float, Dict[str, Any]] = {}
+    for s in cand:
+        cur = by_kcal.get(s["kcal"])
+        if cur is None or s["cost"] < cur["cost"]:
+            by_kcal[s["kcal"]] = s
+    return sorted(by_kcal.values(), key=lambda s: s["kcal"])
+
+
+def pareto_price_kcal(
+    items: List[Dict[str, Any]],
+    people: int,
+    kcal_min: float,
+    kcal_max: float,
+    step: int = 25,
+    limit: int = 12,
+) -> List[Dict[str, Any]]:
+    """**价格 × 热量双目标帕累托解集**（不使用加权评分）。
+
+    两个目标同时最小化：``最终价`` 与 ``总热量``。做法：先取各热量档位的最低成本解
+    （见 :func:`price_kcal_candidates`），再按「热量升序、成本严格下降」提取**非支配解**。
+
+    ⚠️ 若菜单中"最便宜的餐品"同时也"热量最低"，则两目标不冲突，前沿会**退化为单点**。
+    这属于正常的数学结果，调用方应据此说明"该菜单不存在多花钱换低热量的权衡"，
+    而不是伪造多个解。此时可改用 :func:`price_kcal_candidates` 查看完整权衡曲线。
+    """
+    cand = price_kcal_candidates(items, people, kcal_min, kcal_max, step=step)
+
+    # 帕累托前沿：kcal 升序，保留成本严格下降的点
+    front: List[Dict[str, Any]] = []
+    best_cost: Optional[int] = None
+    for s in cand:                        # cand 已按 kcal 升序
+        if best_cost is None or s["cost"] < best_cost:
+            front.append(s)
+            best_cost = s["cost"]
+
+    # 等间隔抽样，避免输出过长（保留首尾）
+    if limit and len(front) > limit:
+        span = len(front) - 1
+        idxs = sorted({round(i * span / (limit - 1)) for i in range(limit)})
+        front = [front[i] for i in idxs]
+    return front
+
 
 
 def _basket_to_plan(
@@ -657,14 +773,19 @@ def optimize_plans(
     coupons: List[Dict[str, Any]],
     constraints: Dict[str, Any],
     weights: Optional[Dict[str, float]] = None,
+    promotions: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """多目标寻优，返回 Top-3 方案。
 
     * **最省钱**：动态规划（无界背包）+ 券组合 DP + 帕累托剪枝
     * **最健康**：按人均热量 / 脂肪 / 蛋白达标率加权
     * **最快**：按油炸 / 现制占比估算出餐速度
+
+    ``promotions``：来自 ``fetch_group_meal_promotions()`` 的团餐促销规则（beType=6 专用），
+    会与 ``coupons`` 合并后一并参与券组合优化。
     """
     items = _normalize_menu(menu)
+    coupons = list(coupons or []) + list(promotions or [])
     weights = weights or constraints.get("weights") or {
         "cheap": 0.34, "healthy": 0.33, "speed": 0.18, "pref": 0.15,
     }
@@ -735,6 +856,109 @@ def optimize_plans(
     ranked = sorted(feasible or dedup.values(),
                     key=lambda x: (-x["score"], x["final_price_cny"]))
     return ranked[:3]
+
+
+def optimize_cost_curve(
+    menu: List[Dict[str, Any]],
+    coupons: List[Dict[str, Any]],
+    constraints: Dict[str, Any],
+    promotions: Optional[List[Dict[str, Any]]] = None,
+    tiers: int = 7,
+) -> List[Dict[str, Any]]:
+    """**成本–热量权衡曲线**：从"刚好达标"到"吃得更好"等间隔取样，给出每档的最低价方案。
+
+    与 :func:`optimize_pareto` 互补：
+      - 帕累托前沿 = 互不支配的解（可能因菜单特性退化为单点）；
+      - 成本曲线   = 每个热量档位的实际最低价，直接回答"多吃 X 千卡要多花多少钱"。
+
+    Returns
+    -------
+    list[dict]  按总热量升序的方案列表，额外带 ``delta_price_cny``（相比上一档多花多少）。
+    """
+    items = _normalize_menu(menu)
+    all_coupons = list(coupons or []) + list(promotions or [])
+
+    people = max(int(constraints.get("people_count") or 1), 1)
+    targets = constraints.get("targets") or {}
+    kcal_per = targets.get("max_calories_kcal") or KCAL_PER_PERSON_MAX
+    kcal_min = KCAL_PER_PERSON_MIN * people
+    kcal_max = float(min(kcal_per, KCAL_PER_PERSON_MAX)) * people
+
+    cand = price_kcal_candidates(items, people, kcal_min, kcal_max)
+    if not cand:
+        return []
+
+    # 按 kcal 等间隔取样（cand 已按 kcal 升序）
+    if tiers and len(cand) > tiers:
+        span = len(cand) - 1
+        idxs = sorted({round(i * span / (tiers - 1)) for i in range(tiers)})
+        picked = [cand[i] for i in idxs]
+    else:
+        picked = cand
+
+    plans: List[Dict[str, Any]] = []
+    prev_price: Optional[float] = None
+    for pt in picked:
+        plan = _basket_to_plan(pt["indices"], items, all_coupons, constraints, "成本曲线")
+        price = plan["final_price_cny"]
+        plan["delta_price_cny"] = None if prev_price is None else round(price - prev_price, 2)
+        prev_price = price
+        plans.append(plan)
+    return plans
+
+
+def optimize_pareto(
+    menu: List[Dict[str, Any]],
+    coupons: List[Dict[str, Any]],
+    constraints: Dict[str, Any],
+    promotions: Optional[List[Dict[str, Any]]] = None,
+    limit: int = 12,
+) -> List[Dict[str, Any]]:
+    """**价格 × 热量双目标帕累托解集**（不走加权评分）。
+
+    与 :func:`optimize_plans` 的区别：
+      - ``optimize_plans`` 用加权评分给出「最省钱 / 最健康 / 最快」三个代表解，适合直接推荐；
+      - ``optimize_pareto`` 给出**完整的非支配解集**，适合让用户自己看到"多花 X 元能少吃 Y 千卡"
+        的完整权衡曲线，不做任何主观加权。
+
+    Returns
+    -------
+    list[dict]
+        按总热量升序排列的方案列表，每项含 ``items / coupons / final_price_cny /
+        per_capita_cny / nutrition`` 等标准字段，另附：
+        ``price_vs_next_cny``（相比下一档多花多少）与 ``kcal_saved_vs_next``（少吃多少千卡）。
+    """
+    items = _normalize_menu(menu)
+    all_coupons = list(coupons or []) + list(promotions or [])
+
+    people = max(int(constraints.get("people_count") or 1), 1)
+    targets = constraints.get("targets") or {}
+    kcal_per = targets.get("max_calories_kcal") or KCAL_PER_PERSON_MAX
+    kcal_min = KCAL_PER_PERSON_MIN * people
+    kcal_max = float(min(kcal_per, KCAL_PER_PERSON_MAX)) * people
+
+    front = pareto_price_kcal(items, people, kcal_min, kcal_max, limit=limit)
+    plans: List[Dict[str, Any]] = []
+    for pt in front:
+        plan = _basket_to_plan(pt["indices"], items, all_coupons, constraints, "帕累托")
+        plan["objective"] = {
+            "total_kcal": plan["nutrition"]["total_kcal"],
+            "final_price_cny": plan["final_price_cny"],
+        }
+        plans.append(plan)
+
+    # 相邻档位的边际权衡（front 按热量升序 ⇒ 热量越低、价格越高）
+    for i, p in enumerate(plans):
+        if i + 1 < len(plans):
+            nxt = plans[i + 1]
+            p["price_vs_next_cny"] = round(p["final_price_cny"] - nxt["final_price_cny"], 2)
+            p["kcal_saved_vs_next"] = round(
+                nxt["nutrition"]["total_kcal"] - p["nutrition"]["total_kcal"], 1
+            )
+        else:
+            p["price_vs_next_cny"] = None
+            p["kcal_saved_vs_next"] = None
+    return plans
 
 
 # ---------------------------------------------------------------------------
@@ -867,6 +1091,174 @@ def verify_price(
 
 
 # ---------------------------------------------------------------------------
+# 5.5 企业团餐专用链路（beType=6）
+#     团餐是唯一可用 query-promotions / query-meal-assistance 的场景，
+#     这两条链路必须在 calculate-price 之前接入，否则算出的价格会偏高。
+# ---------------------------------------------------------------------------
+
+def _promotion_to_coupon(promo: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """把 ``query-promotions`` 返回的促销规则转成内部券结构。
+
+    规则字段（实测 schema）：``promotionId`` / ``promotionType`` / ``ruleCategory`` /
+    ``ruleDetail`` / ``products``。含义：
+      - ``promotionType``：31 = 满额减，33 = 订单折扣
+      - ``ruleCategory``：30 = 满折/折扣，40 = 满减
+      - ``products.type``：1 包含 / 2 不包含 / 3 全部
+
+    ⚠️ ``ruleDetail`` 内部字段名官方未在 schema 中展开（仅描述为"规则明细"），
+    因此本函数对常见命名做**容错取值**；若全部取不到则返回 ``None`` 并记录告警，
+    不会静默产生错误的优惠额。
+    """
+    def pick(*keys: str) -> Optional[float]:
+        for src in (promo.get("ruleDetail") or {}, promo):
+            if isinstance(src, dict):
+                for k in keys:
+                    v = src.get(k)
+                    if isinstance(v, (int, float)) and v > 0:
+                        return float(v)
+                    if isinstance(v, str) and v.replace(".", "", 1).isdigit():
+                        return float(v)
+        return None
+
+    promo_type = promo.get("promotionType")
+    rule_cat = promo.get("ruleCategory")
+    cid = str(promo.get("promotionId") or f"promo-{promo_type}-{rule_cat}")
+
+    # 满减：31 / 40
+    if promo_type == 31 or rule_cat == 40:
+        threshold = pick("thresholdAmount", "threshold", "conditionAmount", "fullAmount", "amountCondition")
+        discount = pick("discountAmount", "reduceAmount", "offAmount", "cutAmount", "amount")
+        if threshold is None or discount is None:
+            return None
+        return {
+            "couponId": cid, "couponCode": None,
+            "name": f"团餐满减(满{threshold / 100:.0f}减{discount / 100:.0f})",
+            "type": "threshold", "minSpend": int(threshold), "discount": int(discount),
+            "exclusiveGroup": "group_order", "source": "query-promotions",
+        }
+
+    # 折扣：33 / 30（rate 表示"应付比例"，如 0.9 = 9 折）
+    if promo_type == 33 or rule_cat == 30:
+        rate = pick("discountRate", "rate", "discount", "zhe", "discountValue")
+        if rate is None:
+            return None
+        if rate > 1:                      # 兼容"9"表示 9 折的写法
+            rate = rate / 10.0
+        if not (0 < rate < 1):
+            return None
+        return {
+            "couponId": cid, "couponCode": None,
+            "name": f"团餐折扣({rate * 10:.1f}折)",
+            "type": "percent", "minSpend": 0, "rate": rate,
+            "exclusiveGroup": "group_order", "source": "query-promotions",
+        }
+    return None
+
+
+def fetch_group_meal_promotions(
+    store_code: str,
+    be_code: str,
+    token: Optional[str] = None,
+    reservation_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """调用 ``query-promotions`` 取团餐满减/满折规则，转为内部券结构。
+
+    ⚠️ 该工具**仅企业团餐(beType=6)可用**，其他场景调用会失败。
+    """
+    args: Dict[str, Any] = {
+        "storeCode": str(store_code), "beCode": str(be_code),
+        "orderType": 2, "beType": 6,          # 团餐固定：外送 + beType=6
+    }
+    if reservation_date:
+        args["reservationDate"] = reservation_date
+    try:
+        resp = _mcp_call("query-promotions", args, token=token)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "coupons": [], "error": f"{type(exc).__name__}: {exc}", "raw": None}
+
+    sc = (resp.get("result") or {}).get("structuredContent") or {}
+    if sc.get("success") is False:
+        return {"ok": False, "coupons": [], "raw": sc,
+                "error": f"服务端业务错误 {sc.get('code')}: {sc.get('message')}"}
+
+    rules = sc.get("data") or []
+    if isinstance(rules, dict):
+        rules = rules.get("promotions") or rules.get("list") or []
+    coupons, skipped = [], []
+    for r in rules if isinstance(rules, list) else []:
+        c = _promotion_to_coupon(r) if isinstance(r, dict) else None
+        (coupons if c else skipped).append(c or r)
+    return {"ok": True, "coupons": coupons, "unparsed": skipped, "raw": rules, "error": None}
+
+
+def fetch_meal_assistance(
+    store_code: str,
+    be_code: Optional[str] = None,
+    token: Optional[str] = None,
+    reservation_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """调用 ``query-meal-assistance`` 取团餐可用助餐服务（拿 ``gmServiceCode``）。
+
+    ⚠️ 该工具**仅企业团餐(beType=6)可用**；选中的 ``gmServiceCode`` 必须传给
+    ``calculate-price`` 与 ``create-order``。
+    """
+    args: Dict[str, Any] = {"storeCode": str(store_code), "orderType": 2, "beType": 6}
+    if be_code:
+        args["beCode"] = str(be_code)
+    if reservation_date:
+        args["reservationDate"] = reservation_date
+    try:
+        resp = _mcp_call("query-meal-assistance", args, token=token)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "options": [], "error": f"{type(exc).__name__}: {exc}", "raw": None}
+
+    sc = (resp.get("result") or {}).get("structuredContent") or {}
+    if sc.get("success") is False:
+        return {"ok": False, "options": [], "raw": sc,
+                "error": f"服务端业务错误 {sc.get('code')}: {sc.get('message')}"}
+
+    data = sc.get("data") or []
+    if isinstance(data, dict):
+        data = data.get("services") or data.get("list") or [data]
+    options = []
+    for s in data if isinstance(data, list) else []:
+        if isinstance(s, dict):
+            options.append({
+                "gmServiceCode": s.get("gmServiceCode") or s.get("serviceCode") or s.get("code"),
+                "name": s.get("serviceName") or s.get("name") or s.get("gmServiceName"),
+                "raw": s,
+            })
+    return {"ok": True, "options": options, "raw": data, "error": None}
+
+
+def fetch_group_meal_context(
+    store_code: str,
+    be_code: str,
+    token: Optional[str] = None,
+    reservation_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """一次取齐团餐上下文：促销规则 + 助餐服务。
+
+    典型用法::
+
+        ctx = fetch_group_meal_context(store_code, be_code)
+        plans = optimize_plans(menu, store_coupons + ctx["promotions"], constraints)
+        # 下单时把选中的 gmServiceCode 传给 calculate-price / create-order
+    """
+    promo = fetch_group_meal_promotions(store_code, be_code, token, reservation_date)
+    assist = fetch_meal_assistance(store_code, be_code, token, reservation_date)
+    return {
+        "promotions": promo.get("coupons") or [],
+        "promotions_ok": promo.get("ok"),
+        "promotions_error": promo.get("error"),
+        "promotions_unparsed": promo.get("unparsed") or [],
+        "assistance": assist.get("options") or [],
+        "assistance_ok": assist.get("ok"),
+        "assistance_error": assist.get("error"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 6. 输出
 # ---------------------------------------------------------------------------
 
@@ -895,6 +1287,46 @@ def render_plans(plans: List[Dict[str, Any]]) -> str:
         )
         out.append(f"└ 体检：{'；'.join(p['nutrition_flags'])}（评分 {p['score']}）")
         out.append("")
+    return "\n".join(out)
+
+
+def render_pareto(plans: List[Dict[str, Any]],
+                  curve: Optional[List[Dict[str, Any]]] = None) -> str:
+    """渲染「价格 × 热量」双目标结果：帕累托前沿 + （可选）成本–热量权衡曲线。"""
+    out: List[str] = []
+    out.append("【价格 × 热量 帕累托前沿】不做加权，全部为互不支配的解")
+    if not plans:
+        out.append("（无可行解，请放宽约束）")
+    else:
+        out.append(f"{'总热量(kcal)':>12} {'总价(元)':>10} {'人均(元)':>10} {'主食':>5}  边际权衡")
+        out.append("-" * 78)
+        for p in plans:
+            n = p["nutrition"]
+            edge = ""
+            if p.get("price_vs_next_cny") is not None:
+                edge = (f"↓换下一档省 ¥{p['price_vs_next_cny']:.2f}"
+                        f"，多吃 {p['kcal_saved_vs_next']:.0f} kcal")
+            out.append(f"{n['total_kcal']:>12.0f} {p['final_price_cny']:>10.2f} "
+                       f"{p['per_capita_cny']:>10.2f} {p.get('mains', 0):>5}  {edge}")
+        if len(plans) == 1:
+            out.append("")
+            out.append("⚠️ 前沿退化为单点：本菜单下「最便宜」与「热量最低」是同一组解，")
+            out.append("   即两个目标不冲突，不存在「多花钱换低热量」的权衡。这不是算法错误。")
+            out.append("   需要看热量增加要花多少钱，请看下方成本–热量曲线。")
+
+    if curve:
+        out.append("")
+        out.append("【成本–热量权衡曲线】各热量档位下的最低价方案")
+        out.append(f"{'总热量(kcal)':>12} {'最终价(元)':>11} {'人均(元)':>10} {'主食':>5}  较上一档")
+        out.append("-" * 78)
+        for p in curve:
+            n = p["nutrition"]
+            d = p.get("delta_price_cny")
+            delta = "—" if d is None else f"{'+' if d >= 0 else ''}¥{d:.2f}"
+            out.append(f"{n['total_kcal']:>12.0f} {p['final_price_cny']:>11.2f} "
+                       f"{p['per_capita_cny']:>10.2f} {p.get('mains', 0):>5}  {delta}")
+        out.append("")
+        out.append("说明：本表为「给定热量下的最低价」，可直接回答「多吃 X 千卡要多花多少钱」。")
     return "\n".join(out)
 
 
@@ -1003,6 +1435,39 @@ def _selftest() -> None:
     assert "main" not in infer_tags({"name": "麦乐鸡5块", "kcal": 213, "fat": 12, "protein": 12, "sodium": 422, "carb": 13})
     assert "main" not in infer_tags({"name": "无糖可口可乐中杯", "kcal": 0, "fat": 0, "protein": 0, "sodium": 35, "carb": 1})
 
+    # 7) 价格 × 热量 帕累托前沿
+    norm = _normalize_menu(SAMPLE_MENU)
+    front = pareto_price_kcal(norm, 4, 1400.0, 3600.0)
+    assert front, "帕累托前沿不应为空"
+    for a, bb in zip(front, front[1:]):
+        assert a["kcal"] < bb["kcal"], ("热量应严格升序", a["kcal"], bb["kcal"])
+        assert a["cost"] > bb["cost"], ("成本应严格下降（否则被支配）", a["cost"], bb["cost"])
+    assert all(pt["mains"] >= 4 for pt in front), "前沿解必须满足主食 >= 人数"
+    pp = optimize_pareto(kept, SAMPLE_COUPONS, c)
+    assert pp, "帕累托方案集不应为空"
+    for p in pp:
+        assert p["mains"] >= 4
+        assert p["final_price_cny"] > 0
+        assert "objective" in p and "total_kcal" in p["objective"]
+
+    # 8) 团餐促销规则解析（query-promotions → 内部券结构）
+    c1 = _promotion_to_coupon({"promotionId": "P1", "promotionType": 31, "ruleCategory": 40,
+                               "ruleDetail": {"thresholdAmount": 20000, "discountAmount": 3000}})
+    assert c1 and c1["type"] == "threshold" and c1["minSpend"] == 20000 and c1["discount"] == 3000, c1
+    c2 = _promotion_to_coupon({"promotionId": "P2", "promotionType": 33, "ruleCategory": 30,
+                               "ruleDetail": {"discountRate": 0.9}})
+    assert c2 and c2["type"] == "percent" and abs(c2["rate"] - 0.9) < 1e-9, c2
+    # 字段缺失时必须返回 None，绝不凭空造优惠
+    assert _promotion_to_coupon({"promotionId": "P3", "promotionType": 31, "ruleDetail": {}}) is None
+    assert _promotion_to_coupon({"promotionId": "P4", "promotionType": 99}) is None
+
+    # 9) 团餐促销必须真正参与券组合优化
+    demo_promo = {"couponId": "G1", "name": "团餐满减", "type": "threshold",
+                  "minSpend": 5000, "discount": 800, "exclusiveGroup": "group_order"}
+    with_promo = optimize_plans(kept, SAMPLE_COUPONS, c, promotions=[demo_promo])
+    assert any(any(cp.get("couponId") == "G1" for cp in p["coupons"]) for p in with_promo), \
+        "团餐促销未参与券组合优化"
+
     # 6) 核价：业务错误识别（离线桩，不联网）
     stub_plan = {"items": [{"productCode": "P001", "quantity": 1}], "coupons": [],
                  "final_price_cny": 21.5, "people_count": 1, "beType": 1, "orderType": 1}
@@ -1052,8 +1517,12 @@ def main(argv: Sequence[str]) -> int:
     print(f"\n[硬约束过滤] 保留 {len(kept)} 项：", "、".join(m["name"] for m in kept))
 
     plans = optimize_plans(kept, SAMPLE_COUPONS, constraints)
-    print("\n[Top-3 方案]")
+    print("\n[Top-3 方案（加权评分）]")
     print(render_plans(plans))
+
+    print("\n[价格 × 热量 双目标]")
+    print(render_pareto(optimize_pareto(kept, SAMPLE_COUPONS, constraints),
+                        curve=optimize_cost_curve(kept, SAMPLE_COUPONS, constraints)))
 
     return 0
 
