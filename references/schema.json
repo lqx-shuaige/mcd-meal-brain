@@ -1,0 +1,254 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mcd-meal-brain 输出契约（plans v1.0）",
+  "description": "optimizer.py 结构化输出的 JSON Schema。金额单位一律「元」（2 位小数）。genui 为本 Skill 自定义的展示提示字段，与 MCP 响应中不存在的 genui 无关。",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "scene",
+    "people_count",
+    "plans"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "generated_by": {
+      "type": "string"
+    },
+    "scene": {
+      "type": "string",
+      "description": "场景（到店自取/得来速/麦乐送/企业团餐）"
+    },
+    "people_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "price_verified": {
+      "type": "boolean",
+      "description": "方案价格是否已过 calculate-price 官方核价"
+    },
+    "plans": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "items",
+          "coupons",
+          "original_total",
+          "final_total",
+          "per_person",
+          "nutrition",
+          "genui"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "方案定位：最省钱/最健康/最快"
+          },
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "productCode",
+                "name",
+                "quantity",
+                "unit_price_cny",
+                "subtotal_cny"
+              ],
+              "properties": {
+                "productCode": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "query-meals 真实编码；内置演示数据可为 null"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "quantity": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "unit_price_cny": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "subtotal_cny": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "is_main": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "coupons": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "couponId",
+                "name",
+                "discount_cny"
+              ],
+              "properties": {
+                "couponId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "couponCode": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "type": "string"
+                },
+                "discount_cny": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "source": {
+                  "type": "string",
+                  "description": "券出处：query-store-coupons / query-promotions / builtin-demo"
+                }
+              }
+            }
+          },
+          "original_total": {
+            "type": "number",
+            "minimum": 0,
+            "description": "原价（元）"
+          },
+          "discount_cny": {
+            "type": "number",
+            "minimum": 0,
+            "description": "总优惠额（元）"
+          },
+          "final_total": {
+            "type": "number",
+            "minimum": 0,
+            "description": "最终价（元）；未核价时为估算值"
+          },
+          "per_person": {
+            "type": "number",
+            "minimum": 0,
+            "description": "人均（元）"
+          },
+          "people_count": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mains": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "主食份数；拼单底线：必须 ≥ people_count"
+          },
+          "nutrition": {
+            "type": "object",
+            "required": [
+              "total_kcal",
+              "per_capita_kcal",
+              "total_protein_g",
+              "per_capita_protein_g",
+              "total_fat_g",
+              "per_capita_fat_g",
+              "total_sodium_mg"
+            ],
+            "properties": {
+              "total_kcal": {
+                "type": "number",
+                "minimum": 0
+              },
+              "per_capita_kcal": {
+                "type": "number",
+                "minimum": 0
+              },
+              "total_protein_g": {
+                "type": "number",
+                "minimum": 0
+              },
+              "per_capita_protein_g": {
+                "type": "number",
+                "minimum": 0
+              },
+              "total_fat_g": {
+                "type": "number",
+                "minimum": 0
+              },
+              "per_capita_fat_g": {
+                "type": "number",
+                "minimum": 0
+              },
+              "total_sodium_mg": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          },
+          "nutrition_flags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "体检结论：营养达标/热量超标/脂肪超标/蛋白不足/主食不足"
+          },
+          "tradeoffs": {
+            "type": "string",
+            "description": "取舍说明：牺牲了什么、换来了什么"
+          },
+          "price_note": {
+            "type": "string",
+            "description": "如「价格为估算，未核价」"
+          },
+          "genui": {
+            "type": "object",
+            "required": [
+              "card_title",
+              "emoji",
+              "tagline"
+            ],
+            "description": "展示提示（本 Skill 自定义），供渲染层生成方案卡片",
+            "properties": {
+              "card_title": {
+                "type": "string"
+              },
+              "emoji": {
+                "type": "string"
+              },
+              "tagline": {
+                "type": "string"
+              },
+              "highlights": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "accent": {
+                "type": "string",
+                "enum": [
+                  "green",
+                  "orange",
+                  "blue"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

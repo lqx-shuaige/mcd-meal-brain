@@ -25,6 +25,8 @@
     python optimizer.py "我们4个人，预算100，一个减脂，一个不吃辣"   # 自定义输入
     python optimizer.py --selftest                 # 只跑断言自检
     python optimizer.py --compare-channels         # 渠道比价演示（回放 2026-10-10 实测数据）
+    python optimizer.py --json [需求]              # 结构化输出（references/schema.json 契约）
+    python optimizer.py --dump-schema              # 输出契约镜像（重定向到 references/schema.json）
 """
 
 from __future__ import annotations
@@ -1624,6 +1626,310 @@ SAMPLE_COUPONS: List[Dict[str, Any]] = [
 DEMO_INPUT = "我们4个人拼单，人均40以内，有人减脂，有人不吃牛肉，忌辣，帮我把券用上凑个满减"
 
 
+# ---------------------------------------------------------------------------
+# 7.1 输出契约（JSON Schema）
+#
+#     optimizer.py 的结构化输出（--json）遵循本契约；镜像文件 references/schema.json
+#     由 ``--dump-schema`` 生成，``--selftest`` 会校验两者同步。
+#
+#     ⚠️ 命名澄清：这里的 ``genui`` 是**本 Skill 自定义的展示提示字段**（渲染层的
+#     卡片建议），与 MCP 响应中不存在的 genui 字段是两回事
+#     （见 MCP_INTEGRATION.md 偏差 3：35 个工具 schema 实测命中 0 次）。
+#
+#     校验器 ``validate_plans_doc`` 为**纯标准库**实现（本脚本不依赖第三方），
+#     支持 draft-07 的子集：type / required / properties / items / enum / const /
+#     minimum / maximum / minItems / maxItems / minLength。
+# ---------------------------------------------------------------------------
+
+#: 结构化输出契约（JSON Schema draft-07；镜像文件 references/schema.json）
+PLAN_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "mcd-meal-brain 输出契约（plans v1.0）",
+    "description": (
+        "optimizer.py 结构化输出的 JSON Schema。金额单位一律「元」（2 位小数）。"
+        "genui 为本 Skill 自定义的展示提示字段，与 MCP 响应中不存在的 genui 无关。"
+    ),
+    "type": "object",
+    "required": ["schema_version", "scene", "people_count", "plans"],
+    "properties": {
+        "schema_version": {"type": "string", "const": "1.0"},
+        "generated_by": {"type": "string"},
+        "scene": {"type": "string", "description": "场景（到店自取/得来速/麦乐送/企业团餐）"},
+        "people_count": {"type": "integer", "minimum": 1},
+        "price_verified": {"type": "boolean",
+                            "description": "方案价格是否已过 calculate-price 官方核价"},
+        "plans": {
+            "type": "array", "minItems": 1, "maxItems": 3,
+            "items": {
+                "type": "object",
+                "required": ["name", "items", "coupons", "original_total",
+                             "final_total", "per_person", "nutrition", "genui"],
+                "properties": {
+                    "name": {"type": "string",
+                              "description": "方案定位：最省钱/最健康/最快"},
+                    "items": {
+                        "type": "array", "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["productCode", "name", "quantity",
+                                         "unit_price_cny", "subtotal_cny"],
+                            "properties": {
+                                "productCode": {"type": ["string", "null"],
+                                                 "description": "query-meals 真实编码；内置演示数据可为 null"},
+                                "name": {"type": "string"},
+                                "quantity": {"type": "integer", "minimum": 1},
+                                "unit_price_cny": {"type": "number", "minimum": 0},
+                                "subtotal_cny": {"type": "number", "minimum": 0},
+                                "is_main": {"type": "boolean"},
+                            },
+                        },
+                    },
+                    "coupons": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["couponId", "name", "discount_cny"],
+                            "properties": {
+                                "couponId": {"type": ["string", "null"]},
+                                "couponCode": {"type": ["string", "null"]},
+                                "name": {"type": "string"},
+                                "discount_cny": {"type": "number", "minimum": 0},
+                                "source": {"type": "string",
+                                            "description": "券出处：query-store-coupons / query-promotions / builtin-demo"},
+                            },
+                        },
+                    },
+                    "original_total": {"type": "number", "minimum": 0,
+                                        "description": "原价（元）"},
+                    "discount_cny": {"type": "number", "minimum": 0,
+                                      "description": "总优惠额（元）"},
+                    "final_total": {"type": "number", "minimum": 0,
+                                     "description": "最终价（元）；未核价时为估算值"},
+                    "per_person": {"type": "number", "minimum": 0,
+                                    "description": "人均（元）"},
+                    "people_count": {"type": "integer", "minimum": 1},
+                    "mains": {"type": "integer", "minimum": 0,
+                               "description": "主食份数；拼单底线：必须 ≥ people_count"},
+                    "nutrition": {
+                        "type": "object",
+                        "required": ["total_kcal", "per_capita_kcal",
+                                      "total_protein_g", "per_capita_protein_g",
+                                      "total_fat_g", "per_capita_fat_g",
+                                      "total_sodium_mg"],
+                        "properties": {
+                            "total_kcal": {"type": "number", "minimum": 0},
+                            "per_capita_kcal": {"type": "number", "minimum": 0},
+                            "total_protein_g": {"type": "number", "minimum": 0},
+                            "per_capita_protein_g": {"type": "number", "minimum": 0},
+                            "total_fat_g": {"type": "number", "minimum": 0},
+                            "per_capita_fat_g": {"type": "number", "minimum": 0},
+                            "total_sodium_mg": {"type": "number", "minimum": 0},
+                        },
+                    },
+                    "nutrition_flags": {"type": "array",
+                                         "items": {"type": "string"},
+                                         "description": "体检结论：营养达标/热量超标/脂肪超标/蛋白不足/主食不足"},
+                    "tradeoffs": {"type": "string",
+                                   "description": "取舍说明：牺牲了什么、换来了什么"},
+                    "price_note": {"type": "string",
+                                    "description": "如「价格为估算，未核价」"},
+                    "genui": {
+                        "type": "object",
+                        "required": ["card_title", "emoji", "tagline"],
+                        "description": "展示提示（本 Skill 自定义），供渲染层生成方案卡片",
+                        "properties": {
+                            "card_title": {"type": "string"},
+                            "emoji": {"type": "string"},
+                            "tagline": {"type": "string"},
+                            "highlights": {"type": "array",
+                                            "items": {"type": "string"}},
+                            "accent": {"type": "string",
+                                        "enum": ["green", "orange", "blue"]},
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
+
+#: 方案定位 → 展示提示（genui 渲染素材）
+_GENUI_META: Dict[str, Dict[str, str]] = {
+    "最省钱": {"emoji": "🍔", "accent": "green", "tagline": "预算内的最大满足"},
+    "最健康": {"emoji": "🥗", "accent": "blue", "tagline": "营养达标优先"},
+    "最快": {"emoji": "⚡", "accent": "orange", "tagline": "出餐最快组合"},
+}
+
+
+def _plan_genui(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """由方案数据推导展示提示（genui）。纯确定性派生，不含编造信息。"""
+    meta = _GENUI_META.get(plan.get("label") or "",
+                           {"emoji": "🍟", "accent": "green", "tagline": "综合方案"})
+    highlights: List[str] = []
+    if plan.get("final_price_cny") is not None:
+        highlights.append(f"最终价 ¥{plan['final_price_cny']:.2f}")
+    n = plan.get("nutrition") or {}
+    if n.get("per_capita_kcal") is not None:
+        highlights.append(f"人均 {n['per_capita_kcal']:.0f} kcal")
+    flags = [f for f in (plan.get("nutrition_flags") or []) if f]
+    if flags:
+        highlights.append("；".join(flags))
+    return {
+        "card_title": f"{meta['emoji']} {plan.get('label') or '方案'}",
+        "emoji": meta["emoji"],
+        "tagline": meta["tagline"],
+        "highlights": highlights,
+        "accent": meta["accent"],
+    }
+
+
+def _plan_tradeoffs(plan: Dict[str, Any]) -> str:
+    """由方案定位与体检结论推导取舍说明（确定性文案，不编造数值）。"""
+    label = plan.get("label") or ""
+    parts: List[str] = []
+    if label == "最省钱":
+        parts.append("以最低总价优先，牺牲口味多样性与凑券深度")
+    elif label == "最健康":
+        parts.append("多花预算换营养达标（蛋白/脂肪/热量）")
+    elif label == "最快":
+        parts.append("以经典单品为主，牺牲部分优惠换出餐速度")
+    bad = [f for f in (plan.get("nutrition_flags") or []) if f != "营养达标"]
+    if bad:
+        parts.append("注意：" + "；".join(bad))
+    return "；".join(parts) if parts else "无额外取舍"
+
+
+def plans_to_doc(
+    plans: List[Dict[str, Any]],
+    scene: str = "未指定",
+    people_count: Optional[int] = None,
+    price_verified: bool = False,
+) -> Dict[str, Any]:
+    """把内部方案列表转成**符合 PLAN_OUTPUT_SCHEMA 契约**的输出文档。
+
+    字段映射：label→name，subtotal_cny→original_total，final_price_cny→final_total，
+    per_capita_cny→per_person；genui / tradeoffs 为确定性派生。
+    """
+    people = int(people_count or (plans[0]["people_count"] if plans else 1) or 1)
+    doc_plans: List[Dict[str, Any]] = []
+    for p in plans:
+        doc_plan: Dict[str, Any] = {
+            "name": p.get("label") or "方案",
+            "items": [
+                {
+                    "productCode": ln.get("productCode"),
+                    "name": ln.get("name"),
+                    "quantity": int(ln.get("quantity") or 1),
+                    "unit_price_cny": ln.get("unit_price_cny"),
+                    "subtotal_cny": ln.get("subtotal_cny"),
+                    "is_main": bool(ln.get("is_main")),
+                }
+                for ln in (p.get("items") or [])
+            ],
+            "coupons": [
+                {
+                    "couponId": c.get("couponId"),
+                    "couponCode": c.get("couponCode"),
+                    "name": c.get("name"),
+                    "discount_cny": c.get("discount_cny"),
+                    "source": c.get("source") or "builtin-demo",
+                }
+                for c in (p.get("coupons") or [])
+            ],
+            "original_total": p.get("subtotal_cny"),
+            "discount_cny": p.get("discount_cny"),
+            "final_total": p.get("final_price_cny"),
+            "per_person": p.get("per_capita_cny"),
+            "people_count": int(p.get("people_count") or people),
+            "mains": int(p.get("mains") or 0),
+            "nutrition": p.get("nutrition") or {},
+            "nutrition_flags": list(p.get("nutrition_flags") or []),
+            "tradeoffs": _plan_tradeoffs(p),
+            "genui": _plan_genui(p),
+        }
+        if not price_verified:
+            # 契约：price_note 可选；仅在未核价时携带提示
+            doc_plan["price_note"] = "价格为估算，未核价"
+        doc_plans.append(doc_plan)
+    return {
+        "schema_version": "1.0",
+        "generated_by": "mcd-meal-brain optimizer",
+        "scene": scene,
+        "people_count": people,
+        "price_verified": bool(price_verified),
+        "plans": doc_plans,
+    }
+
+
+def _type_ok(value: Any, expected: Any) -> bool:
+    """JSON Schema type 校验（注意：Python 的 bool 是 int 子类，须先排除）。"""
+    if isinstance(expected, list):
+        return any(_type_ok(value, t) for t in expected)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return True  # 未知类型关键字：放行（向前兼容）
+
+
+def _validate_schema(
+    node: Any,
+    schema: Dict[str, Any],
+    path: str,
+    errors: List[str],
+) -> None:
+    """递归校验（draft-07 子集：type/required/properties/items/enum/const/
+    minimum/maximum/minItems/maxItems/minLength）。"""
+    t = schema.get("type")
+    if t is not None and not _type_ok(node, t):
+        errors.append(f"{path}: 期望 type={t}，实际 {type(node).__name__}")
+        return
+    if "const" in schema and node != schema["const"]:
+        errors.append(f"{path}: 必须等于 {schema['const']!r}")
+    if "enum" in schema and node not in schema["enum"]:
+        errors.append(f"{path}: 必须是 {schema['enum']!r} 之一")
+    if isinstance(node, (int, float)) and not isinstance(node, bool):
+        if "minimum" in schema and node < schema["minimum"]:
+            errors.append(f"{path}: {node} < minimum {schema['minimum']}")
+        if "maximum" in schema and node > schema["maximum"]:
+            errors.append(f"{path}: {node} > maximum {schema['maximum']}")
+    if isinstance(node, str) and "minLength" in schema and len(node) < schema["minLength"]:
+        errors.append(f"{path}: 长度 {len(node)} < minLength {schema['minLength']}")
+    if isinstance(node, list):
+        if "minItems" in schema and len(node) < schema["minItems"]:
+            errors.append(f"{path}: 元素数 {len(node)} < minItems {schema['minItems']}")
+        if "maxItems" in schema and len(node) > schema["maxItems"]:
+            errors.append(f"{path}: 元素数 {len(node)} > maxItems {schema['maxItems']}")
+        sub = schema.get("items")
+        if isinstance(sub, dict):
+            for i, el in enumerate(node):
+                _validate_schema(el, sub, f"{path}[{i}]", errors)
+    if isinstance(node, dict):
+        for key in schema.get("required") or []:
+            if key not in node:
+                errors.append(f"{path}: 缺少必填字段 {key!r}")
+        for key, sub in (schema.get("properties") or {}).items():
+            if key in node:
+                _validate_schema(node[key], sub, f"{path}.{key}", errors)
+
+
+def validate_plans_doc(doc: Any) -> List[str]:
+    """校验输出文档是否符合 PLAN_OUTPUT_SCHEMA；返回错误列表（空 = 通过）。"""
+    errors: List[str] = []
+    _validate_schema(doc, PLAN_OUTPUT_SCHEMA, "$", errors)
+    return errors
+
+
 def _selftest() -> None:
     # 1) 约束解析
     c = parse_constraints(DEMO_INPUT)
@@ -1826,6 +2132,61 @@ def _selftest() -> None:
     finally:
         globals()["_mcp_call"] = orig_call
 
+    # 11) 输出契约（JSON Schema）
+    #     a) 真实优化结果 → 契约文档必须零错误通过校验
+    _c11 = parse_constraints(DEMO_INPUT)
+    _kept11 = filter_menu(_normalize_menu(SAMPLE_MENU), _c11)
+    _plans11 = optimize_plans(_kept11, SAMPLE_COUPONS, _c11)
+    doc = plans_to_doc(_plans11, scene="到店自取（演示）",
+                       people_count=_c11.get("people_count"))
+    errs = validate_plans_doc(doc)
+    assert not errs, errs
+    assert doc["schema_version"] == "1.0" and doc["price_verified"] is False
+    p0 = doc["plans"][0]
+    for key in ("name", "items", "coupons", "original_total", "final_total",
+                "per_person", "nutrition", "genui"):
+        assert key in p0, key
+    assert p0["price_note"] == "价格为估算，未核价"
+    assert p0["genui"]["accent"] in ("green", "orange", "blue")
+    assert p0["genui"]["card_title"] and p0["genui"]["tagline"]
+    # 拼单底线在契约层同样成立：主食份数 ≥ 人数
+    assert p0["mains"] >= p0["people_count"], (p0["mains"], p0["people_count"])
+
+    #     b) 负向：删除必填字段 → 必须报错
+    bad = json.loads(json.dumps(doc))
+    del bad["plans"][0]["genui"]
+    assert validate_plans_doc(bad), "缺 genui 未被检出"
+
+    #     c) 负向：类型错误（final_total 传字符串）→ 必须报错
+    bad2 = json.loads(json.dumps(doc))
+    bad2["plans"][0]["final_total"] = "47.00"
+    assert validate_plans_doc(bad2), "final_total 类型错误未被检出"
+
+    #     d) 负向：const 破坏（schema_version 改版本号）→ 必须报错
+    bad3 = json.loads(json.dumps(doc))
+    bad3["schema_version"] = "9.9"
+    assert validate_plans_doc(bad3), "schema_version 破坏未被检出"
+
+    #     e) 负向：枚举越界（genui.accent 传非法色）→ 必须报错
+    bad4 = json.loads(json.dumps(doc))
+    bad4["plans"][0]["genui"]["accent"] = "purple"
+    assert validate_plans_doc(bad4), "accent 枚举越界未被检出"
+
+    #     f) 负向：people_count=0 违反 minimum → 必须报错
+    bad5 = json.loads(json.dumps(doc))
+    bad5["people_count"] = 0
+    assert validate_plans_doc(bad5), "people_count minimum 未生效"
+
+    #     g) 镜像同步：references/schema.json 与 PLAN_OUTPUT_SCHEMA 必须一致
+    _schema_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "references", "schema.json")
+    if os.path.exists(_schema_path):
+        with open(_schema_path, "r", encoding="utf-8") as fh:
+            disk = json.load(fh)
+        assert disk == PLAN_OUTPUT_SCHEMA, (
+            "references/schema.json 与 PLAN_OUTPUT_SCHEMA 不同步，"
+            "请运行 python scripts/optimizer.py --dump-schema > references/schema.json 重新生成")
+
     print("[selftest] 全部断言通过 ✅")
 
 
@@ -1915,6 +2276,26 @@ def main(argv: Sequence[str]) -> int:
 
     if argv and argv[0] == "--compare-channels":
         _demo_channel_comparison()
+        return 0
+
+    if argv and argv[0] == "--dump-schema":
+        # 输出契约镜像（重定向到 references/schema.json 以保持同步）
+        print(json.dumps(PLAN_OUTPUT_SCHEMA, ensure_ascii=False, indent=2))
+        return 0
+
+    if argv and argv[0] == "--json":
+        # 结构化输出：走完整解析→过滤→优化流水线，输出契约文档（schema.json 校验通过）
+        user_input = next((a for a in argv[1:] if not a.startswith("-")), DEMO_INPUT)
+        constraints = parse_constraints(user_input)
+        kept = filter_menu(_normalize_menu(SAMPLE_MENU), constraints)
+        plans = optimize_plans(kept, SAMPLE_COUPONS, constraints)
+        doc = plans_to_doc(plans, scene="到店自取（演示）",
+                           people_count=constraints.get("people_count"))
+        errs = validate_plans_doc(doc)
+        if errs:  # 防御：结构化输出必须自证契约
+            print("Schema 校验失败：", errs, file=sys.stderr)
+            return 1
+        print(json.dumps(doc, ensure_ascii=False, indent=2))
         return 0
 
     # 支持命令行传入自定义需求；不传则用内置样例

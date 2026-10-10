@@ -36,6 +36,11 @@
   美团 / 饿了么等外部平台不在 MCP 能力范围内，明确不做。
 - **写操作强确认**：下单、取消、领券、建地址、抽奖一律先展示、后确认，绝不擅自执行。
 - **营养化输出**：热量 / 蛋白 / 脂肪 / 钠全部给数值，不给「较健康」这种空话。
+- **结构化输出契约**：`--json` 输出符合 JSON Schema（`references/schema.json`）的 plans 文档
+  （`name / items / coupons / original_total / final_total / per_person / nutrition / genui`），
+  纯标准库校验器保证类型与必填字段，`--selftest` 附带负向用例与镜像同步检查。
+- **子代理编排设计**：解析 / 查询 / 优化三角色协作（见 SKILL.md），职责隔离，
+  输入输出契约与现有函数一一对应，可直接落地。
 
 ---
 
@@ -53,6 +58,7 @@ export MCD_MCP_TOKEN="<从 https://open.mcd.cn/mcp 获取>"
 python scripts/optimizer.py            # 输出 Top-3 方案
 python scripts/optimizer.py --selftest # 断言自检
 python scripts/optimizer.py --compare-channels  # 渠道比价演示（回放 2026-10-10 实测数据）
+python scripts/optimizer.py --json     # 结构化输出（references/schema.json 契约）
 
 # 4. 核价联调（需在门店营业时段 07:00–22:00）
 #    见 scripts/optimizer.py::verify_price(plan, store_code, token=...)
@@ -64,12 +70,14 @@ python scripts/optimizer.py --compare-channels  # 渠道比价演示（回放 20
 
 ```
 mcd-meal-brain/
-├── SKILL.md                      技能主文档：触发条件 / 8 步工作流 / 6 条核心规则 / 输出格式
+├── SKILL.md                      技能主文档：触发条件 / 8 步工作流概览 / 子代理编排 / 6 条核心规则
 ├── references/
+│   ├── workflow.md               八步工作流详解 · 得来速/渠道比价专题 · 偏好解析 JSON · 输出字段细则
+│   ├── schema.json               结构化输出契约（JSON Schema，与 optimizer.py::PLAN_OUTPUT_SCHEMA 同步）
 │   ├── tools.md                  35 个 MCP 工具的参数与返回值注意事项
 │   └── strategy.md               菜品标签字典 / 营养约束映射 / 软硬约束处理逻辑
 ├── scripts/
-│   └── optimizer.py              约束解析 · 硬约束过滤 · 组合优化 · 核价校验
+│   └── optimizer.py              约束解析 · 硬约束过滤 · 组合优化 · 核价校验 · 渠道比价 · Schema 校验
 ├── mcp-config.example.json       MCP 配置示例（Token 用 ${MCD_MCP_TOKEN} 占位）
 ├── MCP_INTEGRATION.md            MCP 接入记录（脱敏日志 + 15 项实测 schema 偏差）
 ├── CONTEST_DECLARATION.md        参赛声明
@@ -161,11 +169,13 @@ mcd-meal-brain/
 | 加权评分 | `cheap / healthy / speed / pref` 四维，权重由画像决定 |
 | 核价校验 | 极简 MCP Streamable HTTP 客户端；**分 → 元**换算；偏差 >5% 以官方为准 |
 | 渠道比价 | 同一篮子 × 内部渠道（到店自取/麦乐送/得来速）到手成本对比；恒等式校验（商品+运费+打包+餐具−优惠=现价）；缺前置条件（如无配送地址）如实标「无法核价」 |
+| 输出契约 | JSON Schema draft-07（`references/schema.json`）；`plans_to_doc()` 转换 + 纯标准库递归校验器（type/required/enum/const/边界），`--dump-schema` 生成镜像 |
 | 错误处理 | 识别「业务错误不置 `isError`」的服务端行为，读 `structuredContent.success/code` |
 
-**内建质量保障**：`--selftest` 覆盖 10 组断言，含 4 个已修 bug 的回归用例
-（油炸误标、折扣券语义、浮点截断、券跨商品误用）、业务错误识别与渠道比价
-（beCode 传递约定、到手成本恒等式、外部平台拒绝、无法核价兜底）。
+**内建质量保障**：`--selftest` 覆盖 11 组断言，含 4 个已修 bug 的回归用例
+（油炸误标、折扣券语义、浮点截断、券跨商品误用）、业务错误识别、渠道比价
+（beCode 传递约定、到手成本恒等式、外部平台拒绝、无法核价兜底）与输出契约
+（必填缺失 / 类型错误 / const 破坏 / 枚举越界 / 镜像同步）。
 
 ---
 
@@ -183,7 +193,9 @@ mcd-meal-brain/
 
 ## 八、延伸阅读
 
-- 工作流与核心规则 → [`SKILL.md`](./SKILL.md)
+- 工作流概览与核心规则 → [`SKILL.md`](./SKILL.md)（含子代理编排设计）
+- 详细工作流与输出字段细则 → [`references/workflow.md`](./references/workflow.md)
+- 结构化输出契约 → [`references/schema.json`](./references/schema.json)
 - 工具参数速查 → [`references/tools.md`](./references/tools.md)
 - 标签字典与约束逻辑 → [`references/strategy.md`](./references/strategy.md)
 - MCP 接入踩坑记录（15 项实测偏差）→ [`MCP_INTEGRATION.md`](./MCP_INTEGRATION.md)
