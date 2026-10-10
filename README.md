@@ -2,6 +2,15 @@
 
 > 面向多人场景的麦当劳智能点餐决策引擎 —— 一句话进、三套可执行方案出、**确认后才下单**的 Agent Skill。
 
+[![CI](https://github.com/lqx-shuaige/mcd-meal-brain/actions/workflows/test.yml/badge.svg)](https://github.com/lqx-shuaige/mcd-meal-brain/actions/workflows/test.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-green.svg)](#)
+[![Agent Skills 规范](https://img.shields.io/badge/Agent_Skills-规范符合-8A2BE2.svg)](./SKILL.md)
+
+> 🏆 **麦当劳程序员创意开发大赛参赛作品**（2026.10.09–10.25，比赛按 GitHub Star 排名定榜）
+>
+> **如果这个项目让你觉得有意思、或真的帮你省到了钱，右上角点一个 ⭐Star 就是对参赛者最大的支持——定榜前每一个 Star 都算数。**
+
 **核心数据**：4 人拼单（不辣 + 每人 1 份主食 + 预算 ¥100），最省钱方案 **¥64.80 vs 基线 ¥86.00，省 24.7%**（人均 ¥16.20）；本地估算与官方核价**偏差 0%**（见 [docs/pricing-verification.md](./docs/pricing-verification.md)）。
 
 **三步跑起来**（Python 3.10+，零第三方依赖）：
