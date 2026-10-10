@@ -857,3 +857,71 @@ class TestReflectCache:
         # 最旧的 S0 已被淘汰 → miss；S1/S2 命中
         assert cache.lookup("query-meals", {"storeCode": "S0"}) is None
         assert cache.lookup("query-meals", {"storeCode": "S2"}) == {"i": 2}
+
+
+class TestSplitBill:
+    """智能分账：归属分配 + 优惠比例分摊 + 分账平衡。"""
+
+    PLAN = {
+        "label": "分账回归", "people_count": 4,
+        "items": [
+            {"name": "板烧鸡腿堡", "quantity": 1, "unit_price_cny": 21.5,
+             "subtotal_cny": 21.5, "kcal_per_unit": 440, "tags": ["main"], "is_main": True},
+            {"name": "麦香鱼", "quantity": 1, "unit_price_cny": 17.5,
+             "subtotal_cny": 17.5, "kcal_per_unit": 330, "tags": ["main"], "is_main": True},
+            {"name": "麦辣鸡腿堡", "quantity": 1, "unit_price_cny": 22.0,
+             "subtotal_cny": 22.0, "kcal_per_unit": 520, "tags": ["main", "fried"], "is_main": True},
+            {"name": "双层吉士汉堡", "quantity": 1, "unit_price_cny": 19.5,
+             "subtotal_cny": 19.5, "kcal_per_unit": 450, "tags": ["main"], "is_main": True},
+            {"name": "圆筒冰淇淋", "quantity": 2, "unit_price_cny": 5.0,
+             "subtotal_cny": 10.0, "kcal_per_unit": 200, "tags": ["dessert"], "is_main": False},
+            {"name": "小杯玉米杯", "quantity": 2, "unit_price_cny": 8.0,
+             "subtotal_cny": 16.0, "kcal_per_unit": 100, "tags": ["low_calorie"], "is_main": False},
+        ],
+        "coupons": [{"name": "9折券", "discount_cny": 10.0}],
+        "subtotal_cny": 106.5, "discount_cny": 10.0, "final_price_cny": 96.5,
+    }
+    MAINS = {"板烧鸡腿堡", "麦香鱼", "麦辣鸡腿堡", "双层吉士汉堡"}
+
+    def test_balanced_persona_mode(self):
+        s = opt.split_bill(self.PLAN, ["减脂", "忌口", "要赠品", "预算控"])
+        assert s["mode"] == "persona"
+        assert s["total"]["balanced"] is True
+        assert round(s["total"]["sum_due_cny"], 2) == 96.5
+
+    def test_everyone_gets_main(self):
+        for s in (opt.split_bill(self.PLAN, ["减脂", "忌口", "要赠品", "预算控"]),
+                  opt.split_bill(self.PLAN)):
+            for m in s["members"]:
+                assert any(it["name"] in self.MAINS for it in m["items"]), \
+                    f"{m['name']} 未分到主食"
+
+    def test_persona_matching(self):
+        s = opt.split_bill(self.PLAN, ["减脂", "忌口", "要赠品", "预算控"])
+        jianfei = next(m for m in s["members"] if m["persona"] == "减脂")
+        assert "麦香鱼" in {it["name"] for it in jianfei["items"]}, "减脂→最低热量主食"
+        zengpin = next(m for m in s["members"] if m["persona"] == "要赠品")
+        assert any("冰淇淋" in it["name"] for it in zengpin["items"]), "要赠品→甜品"
+
+    def test_discount_proportional(self):
+        s = opt.split_bill(self.PLAN, ["减脂", "忌口", "要赠品", "预算控"])
+        assert round(sum(m["discount_share_cny"] for m in s["members"]), 2) == 10.0
+        # 比例性：小计更高的成员分摊的优惠绝对值不小于小计更低者（同比例下成立）
+        shares = [(m["subtotal_cny"], m["discount_share_cny"]) for m in s["members"]]
+        shares.sort()
+        assert shares[-1][1] >= shares[0][1]
+
+    def test_no_discount(self):
+        plan = {**self.PLAN, "discount_cny": 0.0, "final_price_cny": 106.5, "coupons": []}
+        s = opt.split_bill(plan, ["减脂", "忌口", "要赠品", "预算控"])
+        assert all(m["discount_share_cny"] == 0 for m in s["members"])
+        assert s["total"]["balanced"] is True
+
+    def test_balanced_mode(self):
+        s = opt.split_bill(self.PLAN)
+        assert s["mode"] == "balanced" and s["total"]["balanced"] is True
+
+    def test_render(self):
+        s = opt.split_bill(self.PLAN, ["减脂", "忌口", "要赠品", "预算控"])
+        text = opt.render_split_bill(s)
+        assert "智能分账" in text and "分账平衡" in text and "应付" in text

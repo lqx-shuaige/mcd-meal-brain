@@ -90,6 +90,10 @@ mcd-meal-brain/
 - **结构化输出契约**：`--json` 输出符合 JSON Schema（`references/schema.json`）的 plans 文档
   （`name / items / coupons / original_total / final_total / per_person / nutrition / genui`），
   纯标准库校验器保证类型与必填字段，`--selftest` 附带负向用例与镜像同步检查。
+- **智能分账**（新增）：拼单的最后一公里——「谁该付多少」。按成员画像把每个商品归属到人
+  （减脂→低热量主食、要赠品→甜品、预算控→便宜项），主食轮转保障每人 1 份；券优惠按
+  各人小计占总价的比例分摊（整数分、尾差给小计最大者），分级别校验 Σ应付 == 方案最终价。
+  `--split` 一键输出逐成员账单（商品明细 / 小计 / 优惠分摊 / 应付）。
 - **模糊输入处理**：三层询问机制（静默默认 → 聚焦追问 ≤3 问 → 「你看着办」全默认），
   「随便」「都行」不再瞎猜也不卡死，默认偏好显式标注。
 - **群体决策公平性**：`aggregate_preferences()` 硬约束交集（禁忌并集排除）、
@@ -120,6 +124,7 @@ python scripts/optimizer.py --compare-channels  # 渠道比价演示（回放 20
 python scripts/optimizer.py --json [需求]       # 结构化输出（references/schema.json 契约，含 data_source）
 python scripts/optimizer.py --clarify "随便"     # 模糊输入三层询问演示
 python scripts/optimizer.py --group [--strict]  # 群体决策演示（默认实时 MCP 数据）
+python scripts/optimizer.py --demo [需求] --split  # 智能分账：按画像归属+优惠比例分摊出逐人账单
 python scripts/optimizer.py --demo [需求]       # 强制内置样例（显式标注「演示数据」）
 python scripts/optimizer.py --strict [需求]     # MCP 不可用即报错退出，绝不兜底
 python scripts/optimizer.py --store 1950936 ... # 指定门店（缺省经 query-nearby-stores 自动选址）

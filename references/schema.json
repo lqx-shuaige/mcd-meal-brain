@@ -87,6 +87,10 @@
                 },
                 "is_main": {
                   "type": "boolean"
+                },
+                "kcal_per_unit": {
+                  "type": "number",
+                  "minimum": 0
                 }
               }
             }

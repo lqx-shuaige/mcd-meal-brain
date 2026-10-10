@@ -1575,6 +1575,7 @@ def _basket_to_plan(
             "quantity": qty,
             "unit_price_cny": round(it["price"] / 100.0, 2),
             "subtotal_cny": round(line_total / 100.0, 2),
+            "kcal_per_unit": round(it["kcal"], 1),
             "tags": list(it.get("tags") or []),
             "is_main": "main" in (it.get("tags") or []),
         })
@@ -4280,6 +4281,210 @@ def render_channel_comparison(result: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 6.5 智能分账（split_bill）
+#
+#     拼单的真实痛点不是「总价多少」而是「谁该付多少」：
+#     * 按成员画像把每个商品归属到人（减脂→低热量、预算控→低价、要赠品→甜品）；
+#     * 主食优先保证每人 1 份；非主食在「画像匹配 + 金额均衡」间取平衡；
+#     * 券优惠按各成员小计占总价的比例分摊（整数分，尾差给小计最大者）；
+#     * 内部一律以「分」计算，输出前转元，校验 Σ应付 == 方案最终价。
+# ---------------------------------------------------------------------------
+
+_PERSONA_MEMBER_NAMES = {
+    "减脂": "减脂党",
+    "忌口": "忌口党",
+    "要赠品": "赠品党",
+    "预算控": "省钱党",
+}
+
+
+def _persona_fit_score(line: Dict[str, Any], persona: Optional[str]) -> float:
+    """成员画像对单个商品（单位份）的匹配分，越高越应归属给该成员。"""
+    score = 0.0
+    tags = set(line.get("tags") or [])
+    kcal = float(line.get("kcal_per_unit") or 0)
+    price_cents = int(round(float(line.get("unit_price_cny") or 0) * 100))
+    if persona == "减脂":
+        if "low_calorie" in tags or "vegetable" in tags:
+            score += 2.0
+        if "fried" in tags or "high_fat" in tags:
+            score -= 2.0
+        score -= kcal / 400.0          # 同类里热量越低越好
+    elif persona == "预算控":
+        # 量级刻意压低（≤1.25），不得压过「要赠品→甜品 +2」等强标签偏好
+        score += max(0.0, (2500 - price_cents) / 2000.0)   # 越便宜越加分
+    elif persona == "要赠品":
+        if "dessert" in tags or "toy" in tags:
+            score += 2.0
+    elif persona == "忌口":
+        # 方案已过忌口过滤（全员可吃），忌口成员优先拿「最保险」的非重口味项
+        if not ({"spicy", "fried"} & tags):
+            score += 1.0
+    return score
+
+
+def split_bill(plan: Dict[str, Any], personas: Optional[List[str]] = None) -> Dict[str, Any]:
+    """把一个方案按成员归属精确分账。
+
+    * ``plan``     : ``_basket_to_plan`` 产出的标准方案（items / coupons / final_price_cny）
+    * ``personas`` : 成员画像列表（如 ["减脂", "忌口", "要赠品", "预算控"]），
+                     缺省或数量不等于人数时退化为「均衡轮转」模式（每人物理均摊感更强）。
+    """
+    people = max(int(plan.get("people_count") or 1), 1)
+    personas = list(personas or [])
+    # 画像数量须与人数一致才启用画像匹配，否则退化为均衡模式
+    persona_mode = len(personas) == people and people > 1
+
+    members: List[Dict[str, Any]] = []
+    for i in range(people):
+        persona = personas[i] if persona_mode else None
+        members.append({
+            "name": _PERSONA_MEMBER_NAMES.get(persona, f"成员{i + 1}") if persona
+            else f"成员{i + 1}",
+            "persona": persona,
+            "units": [],
+            "subtotal_cents": 0,
+        })
+
+    # ---- 展开单位商品（每行 × 数量），分主食/非主食两批 --------------------
+    units: List[Dict[str, Any]] = []
+    for line in plan.get("items") or []:
+        for _ in range(int(line.get("quantity") or 1)):
+            units.append({
+                "name": line.get("name"),
+                "price_cents": int(round(float(line.get("unit_price_cny") or 0) * 100)),
+                "is_main": bool(line.get("is_main")),
+                "kcal": float(line.get("kcal_per_unit") or 0),
+                "tags": list(line.get("tags") or []),
+            })
+    mains = [u for u in units if u["is_main"]]
+    others = [u for u in units if not u["is_main"]]
+
+    def _fit(unit: Dict[str, Any], member: Dict[str, Any]) -> float:
+        if persona_mode:
+            # 适配 _persona_fit_score 的字段约定（unit 为展开后的单位商品）
+            return _persona_fit_score(
+                {"tags": unit["tags"],
+                 "kcal_per_unit": unit["kcal"],
+                 "unit_price_cny": unit["price_cents"] / 100.0},
+                member["persona"])
+        return 0.0
+
+    def _take(member: Dict[str, Any], unit: Dict[str, Any]) -> None:
+        member["units"].append(unit)
+        member["subtotal_cents"] += unit["price_cents"]
+
+    # ---- 阶段 1：主食轮转保障 —— 每人先分到 1 份「TA 画像最匹配」的主食 ----
+    # 纯贪心会让单一画像（如预算控）包揽全部主食，必须先保障人人有主食，
+    # 多余主食才进入阶段 2 参与画像匹配竞争。
+    remaining_mains = list(mains)
+    while remaining_mains:
+        needy = [m for m in members
+                 if not any(u["is_main"] for u in m["units"])]
+        if not needy:
+            break
+        for m in needy:
+            if not remaining_mains:
+                break
+            best_i = max(range(len(remaining_mains)),
+                         key=lambda i: _fit(remaining_mains[i], m))
+            _take(m, remaining_mains.pop(best_i))
+
+    # ---- 阶段 2：其余商品按「画像匹配优先，其次金额均衡」竞争 --------------
+    for u in others + remaining_mains:
+        best, best_key = None, None
+        for m in members:
+            key = (-_fit(u, m), m["subtotal_cents"])
+            if best_key is None or key < best_key:
+                best, best_key = m, key
+        assert best is not None
+        _take(best, u)
+
+    # ---- 券优惠按小计比例分摊（整分，尾差给小计最大者） --------------------
+    total_sub = sum(m["subtotal_cents"] for m in members)
+    discount_cents = int(round(float(plan.get("discount_cny") or 0) * 100))
+    final_cents = int(round(float(plan.get("final_price_cny") or 0) * 100))
+    allocated = 0
+    if total_sub > 0 and discount_cents > 0:
+        shares: List[int] = []
+        for m in members:
+            share = int(discount_cents * m["subtotal_cents"] / total_sub)
+            shares.append(share)
+            allocated += share
+        remainder = discount_cents - allocated
+        if remainder:
+            # 尾差分给小计最大者（优惠绝对值最大，误差感知最小）
+            idx = max(range(people), key=lambda i: members[i]["subtotal_cents"])
+            shares[idx] += remainder
+        for m, s in zip(members, shares):
+            m["discount_share_cents"] = s
+    else:
+        for m in members:
+            m["discount_share_cents"] = 0
+
+    for m in members:
+        m["due_cents"] = m["subtotal_cents"] - m["discount_share_cents"]
+
+    # ---- 校验：Σ应付必须等于方案最终价（分级别） --------------------------
+    sum_due = sum(m["due_cents"] for m in members)
+
+    # 汇总输出（行明细按商品名合并）
+    out_members: List[Dict[str, Any]] = []
+    for m in members:
+        agg: Dict[str, Dict[str, Any]] = {}
+        for u in m["units"]:
+            e = agg.setdefault(u["name"], {"name": u["name"], "quantity": 0,
+                                           "subtotal_cny": 0.0})
+            e["quantity"] += 1
+            e["subtotal_cny"] = round(e["subtotal_cny"] + u["price_cents"] / 100.0, 2)
+        out_members.append({
+            "name": m["name"],
+            "persona": m["persona"],
+            "items": [agg[k] for k in sorted(agg)],
+            "subtotal_cny": round(m["subtotal_cents"] / 100.0, 2),
+            "discount_share_cny": round(m["discount_share_cents"] / 100.0, 2),
+            "due_cny": round(m["due_cents"] / 100.0, 2),
+        })
+
+    return {
+        "plan_label": plan.get("label"),
+        "people_count": people,
+        "mode": "persona" if persona_mode else "balanced",
+        "members": out_members,
+        "total": {
+            "subtotal_cny": round(total_sub / 100.0, 2),
+            "discount_cny": round(discount_cents / 100.0, 2),
+            "final_price_cny": round(final_cents / 100.0, 2),
+            "sum_due_cny": round(sum_due / 100.0, 2),
+            "balanced": sum_due == final_cents,
+        },
+    }
+
+
+def render_split_bill(split: Dict[str, Any]) -> str:
+    """渲染智能分账结果（文本表格）。"""
+    out: List[str] = []
+    out.append("=" * 68)
+    out.append(f"💰 智能分账 · {split['plan_label']}（{split['people_count']} 人 · "
+               f"{'画像匹配' if split['mode'] == 'persona' else '均衡分摊'}模式）")
+    out.append("=" * 68)
+    for m in split["members"]:
+        items_desc = "、".join(
+            f"{it['name']}×{it['quantity']}" for it in m["items"]) or "（无）"
+        out.append(f"👤 {m['name']}" + (f"（{m['persona']}）" if m["persona"] else ""))
+        out.append(f"   商品：{items_desc}")
+        out.append(f"   小计 ¥{m['subtotal_cny']:.2f} − 优惠分摊 "
+                   f"¥{m['discount_share_cny']:.2f} = 应付 ¥{m['due_cny']:.2f}")
+    t = split["total"]
+    out.append("-" * 68)
+    out.append(f"合计：应付 Σ¥{t['sum_due_cny']:.2f} vs 方案最终价 "
+               f"¥{t['final_price_cny']:.2f}    "
+               f"{'✅ 分账平衡' if t['balanced'] else '❌ 不平，请检查'}")
+    out.append("（优惠按各人小计占总价比例分摊；主食优先保证每人 1 份）")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # 7. 样例与自测
 #
 #     ⚠️ 以下 SAMPLE_MENU / SAMPLE_COUPONS 为【兜底/演示数据，非实时】：
@@ -4379,6 +4584,7 @@ PLAN_OUTPUT_SCHEMA: Dict[str, Any] = {
                                 "unit_price_cny": {"type": "number", "minimum": 0},
                                 "subtotal_cny": {"type": "number", "minimum": 0},
                                 "is_main": {"type": "boolean"},
+                                "kcal_per_unit": {"type": "number", "minimum": 0},
                             },
                         },
                     },
@@ -5379,6 +5585,65 @@ def _selftest() -> None:
         globals()["_mcp_call_once"] = _orig_once17
         REFLECT_CACHE.clear()
 
+    # ------------------------------------------------------------------
+    # 第 18 组：智能分账（split_bill）
+    #     a) 分账平衡：Σ应付 == 最终价（分级别）
+    #     b) 主食保障：每人至少 1 份主食
+    #     c) 画像匹配：减脂→最低热量主食；要赠品→甜品
+    #     d) 优惠按小计比例分摊，无优惠时全部为 0
+    #     e) 均衡模式（无画像）：金额均衡且主食有保障
+    # ------------------------------------------------------------------
+    _sb_plan = {
+        "label": "分账自测", "people_count": 4,
+        "items": [
+            {"name": "板烧鸡腿堡", "quantity": 1, "unit_price_cny": 21.5,
+             "subtotal_cny": 21.5, "kcal_per_unit": 440, "tags": ["main"], "is_main": True},
+            {"name": "麦香鱼", "quantity": 1, "unit_price_cny": 17.5,
+             "subtotal_cny": 17.5, "kcal_per_unit": 330, "tags": ["main"], "is_main": True},
+            {"name": "麦辣鸡腿堡", "quantity": 1, "unit_price_cny": 22.0,
+             "subtotal_cny": 22.0, "kcal_per_unit": 520, "tags": ["main", "fried"], "is_main": True},
+            {"name": "双层吉士汉堡", "quantity": 1, "unit_price_cny": 19.5,
+             "subtotal_cny": 19.5, "kcal_per_unit": 450, "tags": ["main"], "is_main": True},
+            {"name": "圆筒冰淇淋", "quantity": 2, "unit_price_cny": 5.0,
+             "subtotal_cny": 10.0, "kcal_per_unit": 200, "tags": ["dessert"], "is_main": False},
+            {"name": "小杯玉米杯", "quantity": 2, "unit_price_cny": 8.0,
+             "subtotal_cny": 16.0, "kcal_per_unit": 100, "tags": ["low_calorie"], "is_main": False},
+        ],
+        "coupons": [{"name": "9折券", "discount_cny": 10.0}],
+        "subtotal_cny": 106.5, "discount_cny": 10.0, "final_price_cny": 96.5,
+    }
+    # a+b+c) 画像模式
+    _sb = split_bill(_sb_plan, ["减脂", "忌口", "要赠品", "预算控"])
+    assert _sb["mode"] == "persona"
+    assert _sb["total"]["balanced"] is True, "分账必须平衡（Σ应付==最终价）"
+    for _m in _sb["members"]:
+        _main_names = {"板烧鸡腿堡", "麦香鱼", "麦辣鸡腿堡", "双层吉士汉堡"}
+        assert any(it["name"] in _main_names for it in _m["items"]), \
+            f"{_m['name']} 未分到主食"
+    _jiani = next(m for m in _sb["members"] if m["persona"] == "减脂")
+    _jiani_items = {it["name"] for it in _jiani["items"]}
+    assert "麦香鱼" in _jiani_items, "减脂成员应分到最低热量主食（麦香鱼 330kcal）"
+    _zengpin = next(m for m in _sb["members"] if m["persona"] == "要赠品")
+    assert any("冰淇淋" in it["name"] for it in _zengpin["items"]), \
+        "要赠品成员应分到甜品（圆筒冰淇淋）"
+    # 优惠分摊：Σ分摊 == 优惠总额
+    _sum_share = round(sum(m["discount_share_cny"] for m in _sb["members"]), 2)
+    assert _sum_share == _sb_plan["discount_cny"], f"优惠分摊合计 {_sum_share} != 10.0"
+    # d) 无优惠
+    _sb_noc = split_bill({**_sb_plan, "discount_cny": 0.0, "final_price_cny": 106.5,
+                          "coupons": []}, ["减脂", "忌口", "要赠品", "预算控"])
+    assert all(m["discount_share_cny"] == 0 for m in _sb_noc["members"])
+    assert _sb_noc["total"]["balanced"] is True
+    # e) 均衡模式
+    _sb_bal = split_bill(_sb_plan)
+    assert _sb_bal["mode"] == "balanced" and _sb_bal["total"]["balanced"] is True
+    for _m in _sb_bal["members"]:
+        _main_names = {"板烧鸡腿堡", "麦香鱼", "麦辣鸡腿堡", "双层吉士汉堡"}
+        assert any(it["name"] in _main_names for it in _m["items"])
+    # 渲染不崩
+    _render18 = render_split_bill(_sb)
+    assert "分账平衡" in _render18 and "智能分账" in _render18
+
     print("[selftest] 全部断言通过 ✅")
 
 
@@ -5712,6 +5977,14 @@ def main(argv: Sequence[str]) -> int:
                       + ("一致 ✅" if vr["diff_pct"] <= 5 else "偏差>5%，以官方价为准"))
             else:
                 print(f"  核价失败：{vr['error']}（价格以实际下单为准）")
+
+    if "--split" in argv:
+        # 智能分账：对最省钱方案按成员归属精确分账（画像来自约束解析）
+        cheap = next((p for p in plans if p["label"] == "最省钱"),
+                     plans[0] if plans else None)
+        if cheap:
+            split = split_bill(cheap, constraints.get("personas"))
+            print("\n" + render_split_bill(split))
 
     if data["banner"]:
         print(data["banner"])
