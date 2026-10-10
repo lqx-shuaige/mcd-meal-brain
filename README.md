@@ -338,7 +338,7 @@ GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
    由 `python scripts/validate_skill.py` 自动检查，**8/8 项全部通过**
    （frontmatter / 渐进式披露 / references 引用完整 / 零依赖 / 敏感信息扫描）。
 2. **渐进式披露**：`references/`（workflow / schema / tools / strategy）按需加载、
-   不进初始上下文；SKILL.md 本体 304 行（≤500 行建议上限），三层结构符合规范。
+   不进初始上下文；SKILL.md 本体 198 行（≤500 行建议上限），三层结构符合规范。
 3. **跨框架加载**：可被任何支持 MCP / Agent Skills 规范的框架加载——
    Claude Code（`.claude/skills/`，官方声明遵循 Agent Skills 开放标准）、
    Cursor（`.cursor/skills/`，并兼容读取 `.claude/skills/`）、

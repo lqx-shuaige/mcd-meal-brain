@@ -141,78 +141,27 @@ create-order                    →  下单（需用户确认）
 
 ---
 
-## 9. 异常处理（重试 / 超时 / 降级 / 幂等）
+## 9. 异常处理（重试 / 超时 / 降级 / 幂等 / 缓存）
 
-> 实现：`scripts/optimizer.py` 第 4.5 节（`_mcp_call` / `call_with_degrade` /
-> `create_order_guarded` / `log_mcp_call`）。所有 MCP 调用方自动获得以下能力。
+> 以下机制已由 `scripts/optimizer.py`（`_mcp_call` / `call_with_degrade` /
+> `create_order_guarded` / `ReflectCache`）**自动执行**，所有 MCP 调用方自动受益；
+> 这里只列需要模型知晓的行为约定。实现细节见 optimizer.py 第 4.5/4.6 节。
 
-### 9.1 指数退避重试
-
-| 规则 | 内容 |
-|---|---|
-| **重试条件** | HTTP 429（限流）、网络超时（TimeoutError）、HTTP 5xx（服务端错误） |
-| **不重试条件** | HTTP 401（未授权，提示重新获取 Token）、HTTP 400（参数错误）、业务逻辑错误（`structuredContent.success=false`，如门店打烊 60003/600057）——重试不会有不同结果，只浪费配额 |
-| **重试策略** | 最多 3 次，间隔 1s → 2s → 4s；**每次重试前检查总预算 20s**，超预算立即放弃 |
-| **禁止** | 并发轰炸式重试；写操作的重试必须串行 |
-
-### 9.2 超时与降级
-
-单次 MCP 调用超时 **10 秒**。超时/网络故障后按工具走降级：
-
-| 工具 | 降级行为 | 用户提示要点 |
+| 场景 | 自动行为 | 模型要做的 |
 |---|---|---|
-| `query-meals` / `list-nutrition-foods` | 读本地缓存菜单/营养表 | 标注缓存来源 |
-| `query-store-coupons` | 跳过券优化，仅按满减计算 | 价格可能偏高 |
-| `query-promotions` | 跳过满减规则 | 不影响下单，只影响凑单建议 |
-| `calculate-price` | 标注「价格以实际下单为准」 | 不编造核价结果 |
-| `query-nearby-stores` / `delivery-query-*` | 提示用户手动输入门店/地址 | 不猜门店 |
-| `create-order` | **不降级**（写操作必须真实成功或如实失败） | —— |
+| 429 限流 / 网络超时 / 5xx | 指数退避重试（1s→2s→4s ×3，总预算 20s）；同参数重复调用命中 ReflectCache（TTL 300s）直接复用，不触网 | 缓存命中/重试耗尽仍失败 → 如实提示「请求太频繁，请稍后再试」，不连续轰炸 |
+| 401 未授权 | 不重试 | 提示用户重新获取 Token，检查 MCP 配置 `Authorization` |
+| 400 参数错误 / 业务错误（`structuredContent.success=false`，如门店打烊 60003/600057） | 不重试 | 如实转述错误码与文案，回到对应步骤修正参数；**业务错误不置 isError，必须读 success** |
+| `query-meals` / `list-nutrition-foods` 超时 | 降级读本地缓存 | 输出标注缓存来源 |
+| `query-store-coupons` / `query-promotions` 失败 | 降级跳过券优化 | 提示「价格可能偏高」 |
+| `calculate-price` 失败 | 标注「未核价」 | 注明「价格为估算，以实际下单为准」 |
+| `create-order` | **不降级**（写操作必须真实成功或如实失败） | 禁止未真实调用就输出「下单成功」 |
 
-**降级必须显式标注**：输出中附「该结果基于缓存/降级逻辑，可能与实际有偏差」。
-业务错误（门店打烊等）**不走降级**——如实返回错误码与文案，不编数据。
-
-### 9.3 下单幂等（防重复下单）
-
-`create-order` 前必须经 `create_order_guarded()`：
-
-1. 幂等键 = `sha256(user_id + store_code + 订单内容哈希 + 5 分钟时间窗口)`；
-2. 键命中已有成功订单 → 不调 MCP，直接返回已有订单（防手抖双击/重试风暴）；
-3. 下单失败 → 不记录幂等键（允许用户修复后重试）；
-4. 记录存 `logs/idempotency.json`（键→订单号+时间戳，>1 天自动清理）；
-5. 同内容隔 5 分钟再点 = 新窗口 = 正常复购。
-
-### 9.4 调用日志与脱敏
-
-- 每次 MCP 调用记录 JSON Lines 至 `logs/mcp_calls.log`：
-  `{"ts", "tool", "duration_ms", "status"(success|error|retry|degraded|**cache**), "retries", "args", "detail"}`；
-  `status=cache` 表示 ReflectCache 命中（未触网，duration_ms=0）；
-- **脱敏规则**（写入前强制执行）：Token/Authorization → `[TOKEN]`、手机号（11 位）→ `[PHONE]`、
-  address/addressDetail/fullAddress → `[ADDRESS]`；
-- `logs/` 目录已在 `.gitignore` 中排除，不入库；
-- 日志写失败**静默跳过**，绝不阻断业务主流程。
-
-### 9.5 ReflectCache 参数级缓存（批 2 算法升级）
-
-> 实现：`scripts/optimizer.py` 4.6 节（`ReflectCache` / `_reflect_cache_lookup` /
-> `_reflect_cache_store`）。已接入 `_mcp_call` 统一入口，所有调用方自动受益。
-
-**机制**：键 = `sha256(工具名 + 规范化参数 JSON)` —— **参数级精确匹配**：
-参数键顺序无关，但值或类型不同（`1` vs `1.0` vs `"1"`）即不同键，不做模糊匹配、
-不做语义归并。
-
-| 规则 | 内容 |
-|---|---|
-| **只缓存只读工具** | `CACHEABLE_TOOLS` 白名单（27 个查询类工具）；写操作（create-order / cancel-order / mall-create-order / party-order-create / draw-lottery / auto-bind-coupons / delivery-create-address）一律穿透 |
-| **只缓存成功响应** | `isError=false` 且 `structuredContent.success ≠ false`；业务错误不缓存（重试语义不变） |
-| **时间敏感排除** | `now-time-info` 永不缓存 |
-| **TTL** | 默认 300s（菜单/券/营养变化频率远低于该窗口）；`MCD_CACHE_TTL_S` 可调 |
-| **容量** | 256 条，超容按最旧淘汰（FIFO） |
-| **深拷贝** | 命中返回响应深拷贝，调用方修改不污染缓存 |
-| **统计** | `REFLECT_CACHE.stats()` → hits / misses / entries / hit_rate |
-| **开关** | `MCD_REFLECT_CACHE=0` 整体关闭；`_mcp_call(..., use_cache=False)` 单次关闭 |
-
-**与规则 5 的关系**：429 限流时「优先读本地缓存」由本机制落地——同参数调用直接命中，
-不触网、不重试。命中记录 `status=cache` 日志（duration_ms=0）。
+**降级必须显式标注**（「该结果基于缓存/降级逻辑，可能与实际有偏差」）；
+**下单幂等**：`create-order` 前必经 `create_order_guarded()`（sha256(user+store+内容+5min 窗口)，
+命中成功订单直接复用；失败不记录；`logs/idempotency.json` 落盘，>1 天清理）；
+**调用日志**：JSONL 落盘 `logs/mcp_calls.log`（状态 success·error·retry·degraded·cache），
+Token/手机号/地址写入前强制脱敏（`[TOKEN]`/`[PHONE]`/`[ADDRESS]`），`logs/` 已 gitignore。
 
 ---
 

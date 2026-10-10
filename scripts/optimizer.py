@@ -53,6 +53,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
@@ -1959,8 +1960,21 @@ def optimize_plans(
     c_objs = [_plan_objectives(p) for p in cands]
 
     # --- 三个极值点：min 价 / max 蛋白 / min 油炸 -------------------------
+    #     「最健康」额外尊重显式营养目标：用户给了 targets.max_fat_g 时，
+    #     若前沿中存在脂肪达标者，则只在达标子集里选蛋白最高者——避免
+    #     「蛋白冠军但脂肪超标」的方案顶着「最健康」标签（2026-10 实测缺陷：
+    #     脂肪 30.5g > 目标 25g 曾被选为最健康）。全部超标则回退全局极值，
+    #     由 nutrition_flags 如实标注，不静默放宽。
     i_cheap = min(range(len(cands)), key=lambda i: (c_objs[i][0], c_objs[i][1]))
-    i_health = min(range(len(cands)), key=lambda i: (c_objs[i][3], c_objs[i][0]))
+    fat_cap = targets.get("max_fat_g")
+    health_pool = range(len(cands))
+    if fat_cap is not None:
+        fat_ok = [i for i in range(len(cands))
+                  if (cands[i]["nutrition"].get("per_capita_fat_g") or 0)
+                  <= float(fat_cap) + 1e-6]
+        if fat_ok:
+            health_pool = fat_ok
+    i_health = min(health_pool, key=lambda i: (c_objs[i][3], c_objs[i][0]))
     i_fast = min(range(len(cands)), key=lambda i: (c_objs[i][2], c_objs[i][0]))
 
     result: List[Dict[str, Any]] = []
@@ -2310,6 +2324,9 @@ def optimize_calorie_budget(
 NSGA2_GENERATIONS = 20
 NSGA2_POP_SIZE = 40
 NSGA2_SEED = 20261010
+#: 早停窗口：第一前沿目标签名连续 N 代不变视为收敛，提前终止演化
+#: （固定种子下早停路径确定，可复现性不受影响）
+NSGA2_EARLY_STOP = 5
 #: 单位上限：单人 ≤6 份、多人 ≤ 2×人数（防爆篮子）
 NSGA2_UNITS_CAP = lambda people: max(6, 2 * people)  # noqa: E731
 
@@ -2519,9 +2536,22 @@ def _nsga2_evolve(items: List[Dict[str, Any]], people: int,
             return population[a if rank.get(a, 99) < rank.get(b, 99) else b]
         return population[a if crowd.get(a, 0.0) >= crowd.get(b, 0.0) else b]
 
+    front_sig: Optional[tuple] = None
+    stable = 0
     for _ in range(max(generations, 1)):
         objs = [raw_objs(b) for b in pop]
         fronts = _fast_non_dominated_sort(objs)
+        # 早停：前沿四目标极值点（价格min/热量min/油炸min/蛋白max，即三方案
+        # 极值的来源）连续 N 代不变 → 输出已收敛，剩余代数只填充前沿中部
+        fo = [objs[i] for i in fronts[0]]
+        sig = (min(o[0] for o in fo), min(o[1] for o in fo),
+               min(o[2] for o in fo), min(o[3] for o in fo))
+        if sig == front_sig:
+            stable += 1
+            if stable >= NSGA2_EARLY_STOP:
+                break
+        else:
+            front_sig, stable = sig, 0
         rank: Dict[int, int] = {}
         crowd: Dict[int, float] = {}
         for r, front in enumerate(fronts):
@@ -3848,7 +3878,18 @@ def fetch_live_context(
                      f"菜单按到店自取（beType=1）口径获取，价格与可用品类可能存在差异。")
         bt, ot = 1, 1
 
-    nutrition = fetch_nutrition_table(token)
+    # --- 并行取数：营养表与门店券互不依赖，并行拉取（3 RTT → 2 RTT）--------
+    #     菜单依赖营养表（nutrition_by_name 做精确匹配），串行在两者之后。
+    #     ReflectCache 为参数级缓存（GIL 下 dict 原子操作），线程安全；
+    #     日志按行 append，乱序无害（每行带时间戳）。
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_nutrition = pool.submit(fetch_nutrition_table, token)
+        fut_coupons = pool.submit(
+            fetch_real_coupons, store_code,
+            be_type=bt, order_type=ot, be_code=be_code, token=token)
+        nutrition = fut_nutrition.result()
+        coupons = fut_coupons.result()
+
     if nutrition["ok"]:
         traces.append({"tool": "list-nutrition-foods",
                        "trace_id": nutrition.get("trace_id")})
@@ -3869,8 +3910,6 @@ def fetch_live_context(
     else:
         errors["query-meals"] = menu["error"] or ""
 
-    coupons = fetch_real_coupons(store_code, be_type=bt, order_type=ot,
-                                 be_code=be_code, token=token)
     coupons_out: List[Dict[str, Any]] = []
     if coupons["ok"]:
         traces.append({"tool": "query-store-coupons",
@@ -4197,8 +4236,99 @@ def compare_channels(
 # 6. 输出
 # ---------------------------------------------------------------------------
 
+def _disp_width(s: str) -> int:
+    """字符串终端显示宽度（CJK/全角字符按 2 列计）。"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(s))
+
+
+def _pad(s: str, width: int, align: str = "left") -> str:
+    """按显示宽度补空格对齐（中文与数字混排列对齐用）。"""
+    s = str(s)
+    gap = max(width - _disp_width(s), 0)
+    return s + " " * gap if align == "left" else " " * gap + s
+
+
+def _budget_brief(constraints: Dict[str, Any]) -> str:
+    """预算的一句话摘要（总预算 / 人均预算，无预算 → 不限）。"""
+    b = constraints.get("budget") or {}
+    if b.get("total_cny") is not None:
+        return f"总预算 ≤¥{float(b['total_cny']):.0f}"
+    if b.get("per_person_cny") is not None:
+        return f"人均 ≤¥{float(b['per_person_cny']):.0f}"
+    return "预算不限"
+
+
+def constraints_brief(constraints: Dict[str, Any]) -> str:
+    """约束解析结果的单行摘要（替代整份 JSON，供人类快速核对）。"""
+    people = constraints.get("people_count") or 1
+    scene = constraints.get("scene") or "到店自取"
+    parts = [f"{people} 人", scene, _budget_brief(constraints)]
+    hard = constraints.get("hard") or {}
+    excl = [t for t in (hard.get("exclude_tags") or [])]
+    ing = [i for i in (hard.get("exclude_ingredients") or [])]
+    if ing or excl:
+        parts.append("忌：" + "、".join(ing + excl))
+    tgt = constraints.get("targets") or {}
+    tgt_bits = []
+    if tgt.get("max_calories_kcal"):
+        tgt_bits.append(f"≤{tgt['max_calories_kcal']:.0f}kcal")
+    if tgt.get("max_fat_g"):
+        tgt_bits.append(f"脂肪≤{tgt['max_fat_g']:.0f}g")
+    if tgt.get("min_protein_g"):
+        tgt_bits.append(f"蛋白≥{tgt['min_protein_g']:.0f}g")
+    if tgt_bits:
+        parts.append("目标：" + "·".join(tgt_bits))
+    personas = constraints.get("personas") or []
+    if personas:
+        parts.append("画像：" + "/".join(personas))
+    return "｜".join(parts)
+
+
+def recommend_plan(plans: List[Dict[str, Any]],
+                   constraints: Dict[str, Any]) -> str:
+    """三方案对比总表 + 一句话推荐（含取舍理由，不把选择权甩给用户）。"""
+    if not plans:
+        return ""
+    w = constraints.get("weights") or {"cheap": 0.34, "healthy": 0.33,
+                                       "speed": 0.18, "pref": 0.15}
+    out: List[str] = ["【三方案对比】"]
+    out.append(_pad("方案", 10) + _pad("最终价", 10) + _pad("人均", 9)
+               + _pad("人均kcal", 9) + _pad("蛋白g", 7) + _pad("脂肪g", 7)
+               + _pad("券优惠", 9) + "体检")
+    for i, p in enumerate(plans, 1):
+        n = p.get("nutrition") or {}
+        disc = sum(float(c.get("discount_cny") or 0) for c in (p.get("coupons") or []))
+        flags = "；".join(p.get("nutrition_flags") or []) or "达标"
+        out.append(_pad(f"{chr(64 + i)} {p.get('label', '')}", 10)
+                   + _pad(f"¥{p['final_price_cny']:.2f}", 10)
+                   + _pad(f"¥{p['per_capita_cny']:.2f}", 9)
+                   + _pad(f"{(n.get('per_capita_kcal') or 0):.0f}", 9)
+                   + _pad(f"{(n.get('per_capita_protein_g') or 0):.1f}", 7)
+                   + _pad(f"{(n.get('per_capita_fat_g') or 0):.1f}", 7)
+                   + _pad(f"−¥{disc:.2f}", 9) + flags)
+    # 推荐：按约束权重综合得分最高者（与 _score 同口径），理由取其最强项
+    try:
+        best = max(plans, key=lambda p: _score(p, constraints, w))
+    except Exception:  # noqa: BLE001 —— 评分异常时退化为最省钱
+        best = plans[0]
+    bi = plans.index(best) + 1
+    others = [p for p in plans if p is not best]
+    reason = {
+        "最省钱": f"在「{_budget_brief(constraints)}」下综合得分最高，价格最稳",
+        "最健康": "营养目标满足度最好（蛋白/脂肪/kcal 均衡）",
+        "最快": "主食结构最简单、非油炸，出餐最快",
+    }.get(best.get("label"), "与你们的人数/预算/画像约束最匹配")
+    alt = ""
+    if others:
+        o = others[0]
+        oi = plans.index(o) + 1
+        alt = f"；若更在意{'省钱' if o.get('label') == '最省钱' else '营养' if o.get('label') == '最健康' else '速度'}可看方案 {chr(64 + oi)}"
+    out.append(f"💡 推荐方案 {chr(64 + bi)}（{best.get('label')}）：{reason}{alt}")
+    return "\n".join(out)
+
+
 def render_plans(plans: List[Dict[str, Any]]) -> str:
-    """把 Top-3 方案渲染成可读文本（金额一律「元」）。"""
+    """把 Top-3 方案渲染成可读文本（金额一律「元」，列按显示宽度对齐）。"""
     icon = {"最省钱": "🍔", "最健康": "🥗", "最快": "⚡",
             "减配方案": "🥶", "分步下单方案": "📝",
             "热量预算·最省": "🔥", "热量预算·高蛋白": "💪",
@@ -4210,12 +4340,19 @@ def render_plans(plans: List[Dict[str, Any]]) -> str:
             out.append(f"├ ⚠️ {p.get('degrade_reason', '该方案为降级方案')}")
         out.append(f"├ 人数：{p['people_count']} 人｜主食 {p.get('mains', 0)} 份（每人至少 1 份 ✅）")
         out.append(f"├ 总份数：{p.get('units', 0)} 份")
+        # 商品明细：名称左对齐、金额右对齐（显示宽度，中文 2 列）
+        lines = p.get("items") or []
+        name_w = max((_disp_width(ln["name"]) for ln in lines), default=0)
         out.append("├ 商品明细：")
-        for ln in p.get("items") or []:
-            out.append(f"│   · {ln['name']} ×{ln['quantity']}   ¥{ln['subtotal_cny']:.2f}")
+        for ln in lines:
+            amt = f"¥{ln['subtotal_cny']:.2f}"
+            out.append(f"│   · {_pad(ln['name'], name_w)}  ×{ln['quantity']}  "
+                       f"{_pad(amt, 9, 'right')}")
+        # 券组合：合并为一行（多券用「｜」分隔，省行数省 token）
         if p.get("coupons"):
-            for c in p["coupons"]:
-                out.append(f"├ 券组合：{c['name']}（{c['couponId']}）  −¥{c['discount_cny']:.2f}")
+            segs = [f"{c['name']}（{c['couponId']}）−¥{c['discount_cny']:.2f}"
+                    for c in p["coupons"]]
+            out.append(f"├ 券组合：{'｜'.join(segs)}")
         else:
             out.append("├ 券组合：无可用券")
         out.append(f"├ 原价：¥{p['subtotal_cny']:.2f}  →  最终价：¥{p['final_price_cny']:.2f}")
@@ -4249,6 +4386,8 @@ def render_plans(plans: List[Dict[str, Any]]) -> str:
             flags = p.get("nutrition_flags", [])
             if flags:
                 out.append(f"└ 体检：{'；'.join(flags)}")
+            else:
+                out.append("└ 体检：—")
         out.append("")
     return "\n".join(out)
 
@@ -4261,7 +4400,9 @@ def render_pareto(plans: List[Dict[str, Any]],
     if not plans:
         out.append("（无可行解，请放宽约束）")
     else:
-        out.append(f"{'总热量(kcal)':>12} {'总价(元)':>10} {'人均(元)':>10} {'主食':>5}  边际权衡")
+        out.append(_pad("总热量(kcal)", 12, "right") + " " + _pad("总价(元)", 10, "right")
+                   + " " + _pad("人均(元)", 10, "right") + " " + _pad("主食", 4, "right")
+                   + "  边际权衡")
         out.append("-" * 78)
         for p in plans:
             n = p["nutrition"]
@@ -4269,8 +4410,10 @@ def render_pareto(plans: List[Dict[str, Any]],
             if p.get("price_vs_next_cny") is not None:
                 edge = (f"↓换下一档省 ¥{p['price_vs_next_cny']:.2f}"
                         f"，多吃 {p['kcal_saved_vs_next']:.0f} kcal")
-            out.append(f"{n['total_kcal']:>12.0f} {p['final_price_cny']:>10.2f} "
-                       f"{p['per_capita_cny']:>10.2f} {p.get('mains', 0):>5}  {edge}")
+            out.append(_pad(f"{n['total_kcal']:.0f}", 12, "right") + " "
+                       + _pad(f"{p['final_price_cny']:.2f}", 10, "right") + " "
+                       + _pad(f"{p['per_capita_cny']:.2f}", 10, "right") + " "
+                       + _pad(f"{p.get('mains', 0)}", 4, "right") + "  " + edge)
         if len(plans) == 1:
             out.append("")
             out.append("⚠️ 前沿退化为单点：本菜单下「最便宜」与「热量最低」是同一组解，")
@@ -4280,14 +4423,18 @@ def render_pareto(plans: List[Dict[str, Any]],
     if curve:
         out.append("")
         out.append("【成本–热量权衡曲线】各热量档位下的最低价方案")
-        out.append(f"{'总热量(kcal)':>12} {'最终价(元)':>11} {'人均(元)':>10} {'主食':>5}  较上一档")
+        out.append(_pad("总热量(kcal)", 12, "right") + " " + _pad("最终价(元)", 11, "right")
+                   + " " + _pad("人均(元)", 10, "right") + " " + _pad("主食", 4, "right")
+                   + "  较上一档")
         out.append("-" * 78)
         for p in curve:
             n = p["nutrition"]
             d = p.get("delta_price_cny")
             delta = "—" if d is None else f"{'+' if d >= 0 else ''}¥{d:.2f}"
-            out.append(f"{n['total_kcal']:>12.0f} {p['final_price_cny']:>11.2f} "
-                       f"{p['per_capita_cny']:>10.2f} {p.get('mains', 0):>5}  {delta}")
+            out.append(_pad(f"{n['total_kcal']:.0f}", 12, "right") + " "
+                       + _pad(f"{p['final_price_cny']:.2f}", 11, "right") + " "
+                       + _pad(f"{p['per_capita_cny']:.2f}", 10, "right") + " "
+                       + _pad(f"{p.get('mains', 0)}", 4, "right") + "  " + delta)
         out.append("")
         out.append("说明：本表为「给定热量下的最低价」，可直接回答「多吃 X 千卡要多花多少钱」。")
     return "\n".join(out)
@@ -5972,12 +6119,9 @@ def main(argv: Sequence[str]) -> int:
             print(f"❌ {exc}", file=sys.stderr)
             return 1
         plans = optimize_calorie_budget(kept, data["coupons"], constraints)
+        # banner 已由 _print_data_source 统一输出，此处不重复
         print("\n[热量预算配餐 · 主餐+小食+饮品 Top-3]")
-        if data["banner"]:
-            print(data["banner"])
         print(render_plans(plans))
-        if data["banner"]:
-            print(data["banner"])
         return 0
 
     if argv and argv[0] == "--dump-schema":
@@ -6048,8 +6192,13 @@ def main(argv: Sequence[str]) -> int:
     print("=" * 68)
 
     constraints = parse_constraints(user_input)
-    print("\n[解析结果]")
-    print(json.dumps({k: v for k, v in constraints.items() if k != "raw"}, ensure_ascii=False, indent=2))
+    # 默认单行摘要（省 40+ 行输出/token）；--debug 展开完整约束 JSON
+    if "--debug" in argv:
+        print("\n[解析结果]")
+        print(json.dumps({k: v for k, v in constraints.items() if k != "raw"},
+                         ensure_ascii=False, indent=2))
+    else:
+        print(f"\n[解析] {constraints_brief(constraints)}")
 
     data = acquire_planning_data(
         constraints, demo="--demo" in argv, strict="--strict" in argv,
@@ -6068,10 +6217,11 @@ def main(argv: Sequence[str]) -> int:
     print(f"\n[硬约束过滤] 保留 {len(kept)} 项：", "、".join(m["name"] for m in kept))
 
     plans = optimize_plans(kept, data["coupons"], constraints)
+    # banner 已由 _print_data_source 统一输出（demo/fallback 必显式标注），此处不重复
     print("\n[Top-3 方案（NSGA-II 帕累托前沿）]")
-    if data["banner"]:
-        print(data["banner"])
     print(render_plans(plans))
+    if plans:
+        print(recommend_plan(plans, constraints))
 
     if "--verify" in argv and data["source"] == "live":
         cheap = next((p for p in plans if p["label"] == "最省钱"),
@@ -6096,8 +6246,6 @@ def main(argv: Sequence[str]) -> int:
             split = split_bill(cheap, constraints.get("personas"))
             print("\n" + render_split_bill(split))
 
-    if data["banner"]:
-        print(data["banner"])
     print("\n[价格 × 热量 双目标]")
     print(render_pareto(optimize_pareto(kept, data["coupons"], constraints),
                         curve=optimize_cost_curve(kept, data["coupons"], constraints)))

@@ -64,7 +64,9 @@
 ### 第 7 步 · 核价校验
 
 对候选方案调 `calculate-price` 核价（**必须**，优化器算的是估算值）。
-用 `verify_price()` 比对「估算价 vs 官方核价」，偏差超 5% 时以官方价为准并如实标注。
+**默认只核 Top-1（最省钱方案）**——控制 MCP 调用次数与耗时；用户对其他方案
+有明确意向（「B 方案多少钱」）时再逐个核。用 `verify_price()` 比对
+「估算价 vs 官方核价」，偏差超 5% 时以官方价为准并如实标注。
 
 ### 第 8 步 · 确认下单
 
@@ -259,7 +261,16 @@ create-order(..., takeWayCode)                             → 下单（需用�
 `query-meals`（同款现金价，用于比价）→ `mall-product-detail`（SKU）→
 用户确认 → `mall-create-order`（写操作）。
 
-**兑换比价算法**（分支 A 第 3 步的展开）：
+**余额与类目**：
+- `query-my-account` 字段均为字符串：`availablePoint`（可用）/
+  `currentMouthExpirePoint`（本月将过期）——**将过期 > 0 时必须优先提醒消耗**；
+- `mall-points-products` 类目过滤 `catRuleIds`（多选逗号分隔）：
+  `1>4` 商品券、`2` 实物、`2>8` 周边、`1>6>20` 生日派对、`1>6>21` 主题派对、
+  `1>6>22` 麦麦体验营、`1>6>25` 品鉴会等；不传查全部；
+- 兑换前必须核对 `status`（**仅 2=上架可兑**；3 售罄 / 4 下架 / 5 预热要说明）与
+  `upTime`/`downTime`（窗口外跳过并注明原因）。
+
+**兑换比价算法**（券后到手价 vs 现金价）：
 
 | 量 | 来源 | 说明 |
 |---|---|---|
@@ -276,7 +287,11 @@ create-order(..., takeWayCode)                             → 下单（需用�
 **边界**：
 - `status ≠ 2`（售罄/下架/预热）一律不推荐，如实说明状态；
 - 兑换窗口（`upTime`/`downTime`）外的不推荐；
-- 积分不足：告知差额，提示点餐攒积分；不为凑积分推荐超预算点单（预算优先级更高）。
+- 积分不足：如实告知「积分不够，还差 Z 分」，提示点餐可攒积分；**不为凑积分
+  推荐超预算点单**（预算优先级更高，见冲突优先级）；
+- 兑换下单：用户选定 SKU 并**明确确认**后 `mall-create-order`（写操作，规则 4；
+  `spuCategory=2` 实物必传 `addressId`）；多件兑换**分别下单且串行排队**，
+  前单成功后再下新单。
 
 ### 6.2 预约取餐
 
@@ -318,7 +333,13 @@ create-order(..., reservationDate)    →  预约下单（写操作，需确认�
 - `query-lottery-info` → `activityStatusText`「进行中」才提示；
 - 提示模板：「🎰 点餐后可参与抽奖：{activityName}，单次消耗 {drawDecision.nextConsumption.text}，
   有机会抽 {prizes 挑 2–3 个代表奖品}」；
-- 抽奖资格与消耗一律以 `drawDecision` 为准；未经明确确认不调 `draw-lottery`。
+- 抽奖资格与消耗**一律以 `drawDecision` 为准**：`resourceEligible` 判资格，
+  `nextConsumption` 是本次实际消耗；`resourceEligible=false` 时不引导抽奖，
+  如实转述 `reason`（如积分不足）；
+- **严禁**用 `availableTimes=0/null` 自行推断不能抽——混合规则下
+  `availableTimes=0` 且 `nextConsumption.type=POINTS` 仍可积分抽；
+- 未经用户明确确认不调 `draw-lottery`（写操作，规则 4——「试试看」不算确认；
+  有频控，重复调用返回「操作太频繁」但不扣积分）。
 
 **满意度评价领券**（下单后闭环）：
 - 支付完成后提示：「💬 完成本单满意度评价可领奖券」；
