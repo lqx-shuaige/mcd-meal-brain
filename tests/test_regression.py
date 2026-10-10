@@ -925,3 +925,89 @@ class TestSplitBill:
         s = opt.split_bill(self.PLAN, ["减脂", "忌口", "要赠品", "预算控"])
         text = opt.render_split_bill(s)
         assert "智能分账" in text and "分账平衡" in text and "应付" in text
+
+
+class TestDPExactness:
+    """DP 精确性：与暴力穷举交叉验证（同一搜索空间内必须严格最优）。
+
+    历史教训：热量桶向下取整时，同桶竞争中「超限的便宜解」会挤掉
+    「合规的最优解」（2026-10-10 审计发现，随机实例可复现差 ¥5.59）。
+    修复：ceil 桶语义 + step 自适应（整数热量下 step=1 零取整误差）。
+    """
+
+    @staticmethod
+    def _brute(items, people, kcal_min, kcal_max, max_units=8):
+        max_mains = max(people, 1) + 2          # 与 DP 同一搜索空间
+        n = len(items)
+        best = None
+        import itertools
+        for combo in itertools.product(*[range(0, max_units // n + 2) for _ in range(n)]):
+            mains = sum(c for c, it in zip(combo, items) if "main" in it["tags"])
+            if mains < people or mains > max_mains:
+                continue
+            if sum(combo) == 0 or sum(combo) > max_units:
+                continue
+            kcal = sum(c * it["kcal"] for c, it in zip(combo, items))
+            if kcal < kcal_min or kcal > kcal_max:
+                continue
+            cost = sum(c * it["price"] for c, it in zip(combo, items))
+            if best is None or cost < best:
+                best = cost
+        return best
+
+    def test_dp_matches_brute_force(self):
+        import random
+        rng = random.Random(20261010)
+        checked = 0
+        for _ in range(150):
+            n = rng.randint(3, 6)
+            items = [{"name": f"P{i}", "price": rng.randint(300, 3500),
+                      "kcal": float(rng.randint(30, 800)),
+                      "tags": ["main"] if i % 2 == 0 else ["side"]} for i in range(n)]
+            people = rng.randint(1, 3)
+            kcal_min = float(rng.randint(200, 900))
+            kcal_max = kcal_min + rng.randint(300, 1600)
+            bf = self._brute(items, people, kcal_min, kcal_max)
+            sols = opt._dp_min_cost(items, people, kcal_min, kcal_max)
+            dp_best = sols[0]["cost"] if sols else None
+            if bf is None:
+                continue
+            checked += 1
+            assert dp_best is not None, "DP 漏解：暴力找到可行解而 DP 无解"
+            assert dp_best <= bf, f"DP 次优：{dp_best} > 暴力最优 {bf}"
+        assert checked >= 100, "随机实例有效率不足，测试本身可疑"
+
+    def test_dp_never_outputs_overlimit(self):
+        import random
+        rng = random.Random(9527)
+        for _ in range(150):
+            n = rng.randint(3, 6)
+            items = [{"name": f"P{i}", "price": rng.randint(300, 3500),
+                      "kcal": float(rng.randint(30, 800)),
+                      "tags": ["main"] if i % 2 == 0 else ["side"]} for i in range(n)]
+            people = rng.randint(1, 3)
+            kcal_min = float(rng.randint(200, 900))
+            kcal_max = kcal_min + rng.randint(300, 1600)
+            for s in opt._dp_min_cost(items, people, kcal_min, kcal_max):
+                real = sum(items[i]["kcal"] for i in s["indices"])
+                assert kcal_min <= real <= kcal_max, \
+                    f"DP 输出违反热量约束：{real} ∉ [{kcal_min}, {kcal_max}]"
+
+    def test_split_bill_over_discount_guard(self):
+        """券面额异常大于小计：不产生负应付，超出部分记 unallocated。"""
+        plan = {
+            "label": "异常券", "people_count": 2,
+            "items": [
+                {"name": "麦香鱼", "quantity": 1, "unit_price_cny": 17.5,
+                 "subtotal_cny": 17.5, "kcal_per_unit": 325, "tags": ["main"], "is_main": True},
+                {"name": "圆筒冰淇淋", "quantity": 1, "unit_price_cny": 6.0,
+                 "subtotal_cny": 6.0, "kcal_per_unit": 93, "tags": ["dessert"], "is_main": False},
+            ],
+            "coupons": [{"name": "异常满减", "discount_cny": 50.0}],
+            "subtotal_cny": 23.5, "discount_cny": 50.0, "final_price_cny": 0.0,
+        }
+        s = opt.split_bill(plan)
+        assert all(m["due_cny"] >= 0 for m in s["members"]), "出现负应付"
+        assert all(m["discount_share_cny"] <= m["subtotal_cny"] for m in s["members"]), \
+            "成员分摊优惠超出其小计"
+        assert s["total"]["unallocated_discount_cny"] == 26.5, "超出部分未正确记入 unallocated"

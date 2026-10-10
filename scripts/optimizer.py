@@ -45,6 +45,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -1359,14 +1360,36 @@ def _build_dp(
     items: List[Dict[str, Any]],
     people: int,
     kcal_max: float,
-    step: int = 25,
+    step: Optional[int] = None,
 ) -> Tuple[List[List[Optional[Tuple[int, int, int, int]]]], int, int]:
     """构建 DP 表（无界背包），供「最低成本」与「价格×热量帕累托」共用。
 
     状态: ``dp[主食份数][热量桶] = (cost, prev_m, prev_b, item_idx)``
+
+    🔒 **桶语义（正确性关键）**：桶转移按**向上取整**（ceil）——桶号 ``b``
+    状态下的任何篮子，其**实际热量 ≤ b×step**。这保证同桶竞争中「合规解」
+    不可能被「同桶号但实际热量已超限的更便宜解」挤掉（向下取整的老实现
+    存在此漏解风险，暴力穷举交叉验证已证实）。
+
+    🔒 **step 自适应**：``step=None`` 时，状态空间 ≤ 3M 则取 ``step=1``
+    ——热量先规范化为整数（向上取整），桶号 = 精确热量和，**零取整误差，
+    DP 最优性可证**；菜单极大时按 ``kcal_max/2000`` 放大步长保性能
+    （ceil 语义保证任何输出仍绝不超限，仅极端情况下可能轻微次优）。
     """
+    # 热量规范化：向上取整为整数（麦当劳营养表本为整数；浮点输入走保守方向）
+    kcals = [int(math.ceil(float(it["kcal"]))) for it in items] if items else [1]
+    min_kcal = max(min(kcals), 1)
+    if step is None:
+        est_states = (max(people, 1) + 3) * (int(math.ceil(kcal_max)) + 2) * max(len(items), 1)
+        step = 1 if est_states <= 3_000_000 else max(1, int(math.ceil(kcal_max / 2000.0)))
+    step = max(int(step), 1)
+
     max_mains = max(people, 1) + 2          # 允许比人数多 2 份主食用于凑满减
-    max_bucket = int(kcal_max // step) + 1
+    # 桶数：ceil(kcal_max/step) + 余量。step=1 且热量为整数时桶号即精确值，
+    # 余量 0；step>1 时每件最多多算 step-1，按最坏件数（kcal_max/min_kcal）补余量，
+    # 余量桶中的解由输出侧 real_kcal 校验兜底（宁可多算不可漏算）。
+    slack = 0 if step == 1 else int(math.ceil(kcal_max / min_kcal)) + 1
+    max_bucket = int(math.ceil(kcal_max / step)) + slack + 1
 
     dp: List[List[Optional[Tuple[int, int, int, int]]]] = [
         [None] * (max_bucket + 1) for _ in range(max_mains + 1)
@@ -1381,7 +1404,8 @@ def _build_dp(
             cost = cur[0]
             for idx, it in enumerate(items):
                 nm = m + (1 if "main" in it["tags"] else 0)
-                nb = b + int(it["kcal"] // step)
+                # 向上取整进桶：保证桶号是实际热量的上界（见 docstring）
+                nb = b + -(-kcals[idx] // step)
                 if nm > max_mains or nb > max_bucket:
                     continue
                 ncost = cost + it["price"]
@@ -1420,7 +1444,7 @@ def _dp_min_cost(
     people: int,
     kcal_min: float,
     kcal_max: float,
-    step: int = 25,
+    step: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """动态规划求满足「主食份数 + 热量区间」的最低成本篮子（无界背包）。
 
@@ -1462,7 +1486,7 @@ def price_kcal_candidates(
     people: int,
     kcal_min: float,
     kcal_max: float,
-    step: int = 25,
+    step: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """**成本–热量权衡曲线**：每个热量档位下的最低成本解（未做帕累托过滤）。
 
@@ -1508,7 +1532,7 @@ def pareto_price_kcal(
     people: int,
     kcal_min: float,
     kcal_max: float,
-    step: int = 25,
+    step: Optional[int] = None,
     limit: int = 12,
 ) -> List[Dict[str, Any]]:
     """**价格 × 热量双目标帕累托解集**（不使用加权评分）。
@@ -4404,18 +4428,27 @@ def split_bill(plan: Dict[str, Any], personas: Optional[List[str]] = None) -> Di
     total_sub = sum(m["subtotal_cents"] for m in members)
     discount_cents = int(round(float(plan.get("discount_cny") or 0) * 100))
     final_cents = int(round(float(plan.get("final_price_cny") or 0) * 100))
+    # 🔒 边界防护：券面额异常大于商品小计时（数据异常场景），
+    # 可分摊优惠以小计为上限，超出部分记入 unallocated（不硬摊、绝不产生负应付）。
+    allocatable = min(discount_cents, total_sub)
+    unallocated_cents = discount_cents - allocatable
     allocated = 0
-    if total_sub > 0 and discount_cents > 0:
+    if total_sub > 0 and allocatable > 0:
         shares: List[int] = []
         for m in members:
-            share = int(discount_cents * m["subtotal_cents"] / total_sub)
+            share = int(allocatable * m["subtotal_cents"] / total_sub)
+            share = min(share, m["subtotal_cents"])   # 逐人不得超出其小计
             shares.append(share)
             allocated += share
-        remainder = discount_cents - allocated
-        if remainder:
-            # 尾差分给小计最大者（优惠绝对值最大，误差感知最小）
-            idx = max(range(people), key=lambda i: members[i]["subtotal_cents"])
-            shares[idx] += remainder
+        remainder = allocatable - allocated
+        # 尾差逐分回填给「小计最大且仍有余量」者：杜绝任何成员负应付
+        while remainder > 0:
+            cands = [i for i in range(people) if shares[i] < members[i]["subtotal_cents"]]
+            if not cands:
+                break
+            idx = max(cands, key=lambda i: members[i]["subtotal_cents"])
+            shares[idx] += 1
+            remainder -= 1
         for m, s in zip(members, shares):
             m["discount_share_cents"] = s
     else:
@@ -4457,6 +4490,7 @@ def split_bill(plan: Dict[str, Any], personas: Optional[List[str]] = None) -> Di
             "final_price_cny": round(final_cents / 100.0, 2),
             "sum_due_cny": round(sum_due / 100.0, 2),
             "balanced": sum_due == final_cents,
+            "unallocated_discount_cny": round(unallocated_cents / 100.0, 2),
         },
     }
 
