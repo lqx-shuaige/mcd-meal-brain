@@ -137,6 +137,57 @@ create-order                    →  下单（需用户确认）
 
 ---
 
+## 9. 异常处理（重试 / 超时 / 降级 / 幂等）
+
+> 实现：`scripts/optimizer.py` 第 4.5 节（`_mcp_call` / `call_with_degrade` /
+> `create_order_guarded` / `log_mcp_call`）。所有 MCP 调用方自动获得以下能力。
+
+### 9.1 指数退避重试
+
+| 规则 | 内容 |
+|---|---|
+| **重试条件** | HTTP 429（限流）、网络超时（TimeoutError）、HTTP 5xx（服务端错误） |
+| **不重试条件** | HTTP 401（未授权，提示重新获取 Token）、HTTP 400（参数错误）、业务逻辑错误（`structuredContent.success=false`，如门店打烊 60003/600057）——重试不会有不同结果，只浪费配额 |
+| **重试策略** | 最多 3 次，间隔 1s → 2s → 4s；**每次重试前检查总预算 20s**，超预算立即放弃 |
+| **禁止** | 并发轰炸式重试；写操作的重试必须串行 |
+
+### 9.2 超时与降级
+
+单次 MCP 调用超时 **10 秒**。超时/网络故障后按工具走降级：
+
+| 工具 | 降级行为 | 用户提示要点 |
+|---|---|---|
+| `query-meals` / `list-nutrition-foods` | 读本地缓存菜单/营养表 | 标注缓存来源 |
+| `query-store-coupons` | 跳过券优化，仅按满减计算 | 价格可能偏高 |
+| `query-promotions` | 跳过满减规则 | 不影响下单，只影响凑单建议 |
+| `calculate-price` | 标注「价格以实际下单为准」 | 不编造核价结果 |
+| `query-nearby-stores` / `delivery-query-*` | 提示用户手动输入门店/地址 | 不猜门店 |
+| `create-order` | **不降级**（写操作必须真实成功或如实失败） | —— |
+
+**降级必须显式标注**：输出中附「该结果基于缓存/降级逻辑，可能与实际有偏差」。
+业务错误（门店打烊等）**不走降级**——如实返回错误码与文案，不编数据。
+
+### 9.3 下单幂等（防重复下单）
+
+`create-order` 前必须经 `create_order_guarded()`：
+
+1. 幂等键 = `sha256(user_id + store_code + 订单内容哈希 + 5 分钟时间窗口)`；
+2. 键命中已有成功订单 → 不调 MCP，直接返回已有订单（防手抖双击/重试风暴）；
+3. 下单失败 → 不记录幂等键（允许用户修复后重试）；
+4. 记录存 `logs/idempotency.json`（键→订单号+时间戳，>1 天自动清理）；
+5. 同内容隔 5 分钟再点 = 新窗口 = 正常复购。
+
+### 9.4 调用日志与脱敏
+
+- 每次 MCP 调用记录 JSON Lines 至 `logs/mcp_calls.log`：
+  `{"ts", "tool", "duration_ms", "status"(success|error|retry|degraded), "retries", "args", "detail"}`；
+- **脱敏规则**（写入前强制执行）：Token/Authorization → `[TOKEN]`、手机号（11 位）→ `[PHONE]`、
+  address/addressDetail/fullAddress → `[ADDRESS]`；
+- `logs/` 目录已在 `.gitignore` 中排除，不入库；
+- 日志写失败**静默跳过**，绝不阻断业务主流程。
+
+---
+
 ## 附：工具总数与命名核对
 
 35 个工具：`auto-bind-coupons`、`query-promotions`、`query-my-prizes`、`query-party-store`、`query-my-coupons`、`query-meals`、`query-meal-detail`、`calculate-price`、`order-list`、`mall-create-order`、`query-party-store-session`、`query-store-coupons`、`create-order`、`party-order-create`、`campaign-calendar`、`now-time-info`、`delivery-create-address`、`query-party-store-date`、`query-lottery-info`、`mall-points-products`、`draw-lottery`、`mall-order-detail`、`available-coupons`、`list-nutrition-foods`、`delivery-query-addresses`、`delivery-query-stores`、`cancel-order`、`query-my-account`、`query-party-city`、`query-order`、`query-nearby-stores`、`query-meal-assistance`、`query-survey-coupon`、`mall-product-detail`、`mall-order-list`

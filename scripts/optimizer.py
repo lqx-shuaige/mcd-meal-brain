@@ -31,10 +31,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -98,6 +101,27 @@ KCAL_PER_PERSON_MAX = 900
 
 #: MCP 端点
 MCP_URL = "https://mcp.mcd.cn/mcp-servers/mcd-mcp"
+
+#: 健壮性参数：单次 MCP 调用超时（秒）、重试次数上限与退避间隔（秒）、总预算（秒）
+MCP_TIMEOUT_S = 10
+MCP_RETRY_MAX = 3
+MCP_BACKOFF_S: Tuple[float, ...] = (1.0, 2.0, 4.0)
+MCP_TOTAL_BUDGET_S = 20.0
+
+#: 幂等键有效窗口（秒）：同窗口内同内容下单直接复用已有订单
+IDEMPOTENCY_WINDOW_S = 5 * 60
+
+#: 日志目录与文件（logs/ 已在 .gitignore 中排除）
+LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+LOG_FILE = os.path.join(LOG_DIR, "mcp_calls.log")
+
+#: 脱敏占位符
+REDACT_TOKEN = "[TOKEN]"
+REDACT_PHONE = "[PHONE]"
+REDACT_ADDRESS = "[ADDRESS]"
+
+#: 手机号正则（中国大陆 11 位）
+_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 
 
 # ---------------------------------------------------------------------------
@@ -1576,13 +1600,94 @@ def optimize_pareto(
 
 
 # ---------------------------------------------------------------------------
-# 5. 核价校验（MCP calculate-price）
+# 4.5 健壮性基础设施：脱敏、JSONL 日志、指数退避重试、超时、幂等键
+#
+#     * 日志：每次 MCP 调用记录 工具名/耗时/状态(成功|失败|降级)/重试次数，
+#       JSON Lines 落盘 logs/mcp_calls.log；敏感信息一律占位符替代。
+#     * 重试：仅对 429 / 网络超时 / 5xx 重试，间隔 1s/2s/4s，最多 3 次，
+#       每次重试前检查总预算（MCP_TOTAL_BUDGET_S）；401/400/业务错误**不重试**。
+#     * 超时：单次调用 MCP_TIMEOUT_S=10s，超时抛 TimeoutError 由调用方走降级。
+#     * 幂等：create-order 前生成幂等键（user+store+订单内容哈希+5 分钟时间窗口），
+#       命中已有成功订单则直接复用，不重复下单；记录存 logs/idempotency.json。
 # ---------------------------------------------------------------------------
 
-def _mcp_call(tool: str, arguments: Dict[str, Any], token: Optional[str] = None,
-              timeout: int = 30) -> Dict[str, Any]:
-    """极简 MCP(Streamable HTTP) 客户端：一次 POST 完成 tools/call。"""
-    token = token or os.environ.get("MCD_MCP_TOKEN") or ""
+def redact_text(text: Any) -> str:
+    """敏感信息脱敏：手机号→[PHONE]、地址→[ADDRESS]、Bearer Token→[TOKEN]。"""
+    s = str(text or "")
+    s = _PHONE_RE.sub(REDACT_PHONE, s)
+    s = re.sub(r"Bearer\s+\S+", f"Bearer {REDACT_TOKEN}", s)
+    s = re.sub(r"(?i)(token|authorization)[\"':= ]+\S{8,}",
+               lambda m: m.group(0).split(m.group(1))[0] + m.group(1) + "=" + REDACT_TOKEN,
+               s)
+    for kw in ("addressDetail", "fullAddress", "address"):
+        s = re.sub(rf'"{kw}"\s*:\s*"[^"]*"', f'"{kw}": "{REDACT_ADDRESS}"', s)
+    return s
+
+
+def _redact_obj(obj: Any) -> Any:
+    """递归脱敏 dict/list/str（用于日志入参快照）。"""
+    if isinstance(obj, dict):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if lk in ("token", "authorization"):
+                out[k] = REDACT_TOKEN
+            elif lk in ("address", "addressdetail", "fulladdress"):
+                out[k] = REDACT_ADDRESS
+            elif lk in ("phone", "contactphone", "mobile", "tel"):
+                out[k] = REDACT_PHONE
+            else:
+                out[k] = _redact_obj(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_obj(x) for x in obj]
+    if isinstance(obj, str):
+        return redact_text(obj)
+    return obj
+
+
+def log_mcp_call(
+    tool: str,
+    duration_ms: int,
+    status: str,                 # success | error | degraded | retry
+    retries: int = 0,
+    arguments: Optional[Dict[str, Any]] = None,
+    detail: str = "",
+) -> None:
+    """追加一条 JSON Lines 日志（失败时静默跳过，不影响主流程）。"""
+    rec = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "tool": tool,
+        "duration_ms": int(duration_ms),
+        "status": status,
+        "retries": int(retries),
+        "args": _redact_obj(arguments or {}),
+        "detail": redact_text(detail)[:500],
+    }
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass  # 日志失败不阻断业务
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """可重试：429 限流 / 网络超时 / 5xx 服务端错误；其余（401/400/业务错）不重试。"""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or exc.code >= 500
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
+        # URLError 包一层时看内因是否超时
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, Exception) and not isinstance(reason, (TimeoutError, ConnectionError)):
+            return isinstance(reason, OSError)
+        return True
+    return False
+
+
+def _mcp_call_once(tool: str, arguments: Dict[str, Any], token: str,
+                   timeout: int) -> Dict[str, Any]:
+    """单次 MCP HTTP 调用（无重试），超时抛 TimeoutError。"""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -1599,8 +1704,24 @@ def _mcp_call(tool: str, arguments: Dict[str, Any], token: Optional[str] = None,
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            exc_body = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:  # noqa: BLE001 —— 读错误体失败无所谓
+            exc_body = ""
+        raise urllib.error.HTTPError(exc.url, exc.code,
+                                     f"{exc.reason}|{exc_body}", exc.headers, None)  # type: ignore[arg-type]
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, TimeoutError) or (
+                isinstance(reason, Exception) and "timed out" in str(reason).lower()):
+            raise TimeoutError(f"MCP 调用超时（{timeout}s）: {exc}") from exc
+        raise
+    except TimeoutError:
+        raise
     if body.lstrip().startswith("event:") or "\ndata:" in body:
         for line in body.splitlines():
             if line.startswith("data:"):
@@ -1608,6 +1729,286 @@ def _mcp_call(tool: str, arguments: Dict[str, Any], token: Optional[str] = None,
                 break
     return json.loads(body)
 
+
+def _mcp_call(tool: str, arguments: Dict[str, Any], token: Optional[str] = None,
+              timeout: int = MCP_TIMEOUT_S,
+              retries: Optional[int] = None,
+              budget_s: float = MCP_TOTAL_BUDGET_S,
+              log: bool = True) -> Dict[str, Any]:
+    """带**指数退避重试 + 超时 + 日志**的 MCP 调用（统一入口）。
+
+    * 重试条件：429 / 网络超时 / 5xx；间隔 1s→2s→4s，最多 3 次；
+      每次重试前检查总预算 ``budget_s``，超预算立即放弃。
+    * 不重试：401 / 400 / 其他 4xx / 业务错误（success=false，由调用方判读）。
+    * 全程记录 JSONL 日志（工具名/耗时/状态/重试次数，入参脱敏快照）。
+    """
+    token = token or os.environ.get("MCD_MCP_TOKEN") or ""
+    max_retry = MCP_RETRY_MAX if retries is None else int(retries)
+    attempt = 0
+    started = time.monotonic()
+    last_exc: Optional[Exception] = None
+    while attempt <= max_retry:
+        attempt += 1
+        t0 = time.monotonic()
+        try:
+            resp = _mcp_call_once(tool, arguments, token, timeout)
+            if log:
+                log_mcp_call(tool, int((time.monotonic() - t0) * 1000), "success",
+                             retries=attempt - 1, arguments=arguments)
+            return resp
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            elapsed = time.monotonic() - started
+            retryable = _is_retryable_error(exc)
+            if log:
+                log_mcp_call(tool, int((time.monotonic() - t0) * 1000),
+                             "retry" if retryable else "error",
+                             retries=attempt - 1, arguments=arguments,
+                             detail=f"{type(exc).__name__}: {exc}")
+            if not retryable:
+                break
+            if attempt > max_retry:
+                break
+            backoff = MCP_BACKOFF_S[min(attempt - 1, len(MCP_BACKOFF_S) - 1)]
+            if elapsed + backoff > budget_s:
+                if log:
+                    log_mcp_call(tool, 0, "error", retries=attempt - 1,
+                                 arguments=arguments, detail="总预算耗尽，放弃重试")
+                break
+            time.sleep(backoff)
+    raise last_exc if last_exc else RuntimeError(f"MCP 调用失败: {tool}")
+
+
+# --- 降级策略 -------------------------------------------------------------
+
+#: 各 MCP 工具超时/失败后的降级行为（供上层决策与用户提示）
+DEGRADE_RULES: Dict[str, Dict[str, Any]] = {
+    "query-meals": {"fallback": "cache", "note": "菜单查询失败，已回退到本地缓存菜单"},
+    "list-nutrition-foods": {"fallback": "cache", "note": "营养查询失败，已回退到本地缓存营养表"},
+    "query-store-coupons": {"fallback": "skip_coupons", "note": "券查询失败，本次仅按满减促销计算，结果可能偏高"},
+    "query-promotions": {"fallback": "skip_promotions", "note": "促销查询失败，本次跳过满减规则"},
+    "calculate-price": {"fallback": "mark_unverified", "note": "核价失败，价格以实际下单为准"},
+    "query-nearby-stores": {"fallback": "ask_user", "note": "门店查询失败，请手动提供门店编号或名称"},
+    "delivery-query-stores": {"fallback": "ask_user", "note": "配送门店查询失败，请确认地址后重试"},
+    "delivery-query-addresses": {"fallback": "ask_user", "note": "地址查询失败，请手动提供配送地址"},
+    "create-order": {"fallback": "none", "note": "下单失败，不降级（写操作必须真实成功）"},
+}
+
+#: 降级提示统一话术
+DEGRADED_BANNER = "该结果基于缓存/降级逻辑，可能与实际有偏差"
+
+
+def degrade_for(tool: str) -> Dict[str, Any]:
+    """返回工具的降级策略与提示文案；未知工具默认「如实报告失败」。"""
+    rule = DEGRADE_RULES.get(tool)
+    if rule:
+        return {"tool": tool, **rule, "banner": DEGRADED_BANNER,
+                "degraded": True}
+    return {"tool": tool, "fallback": "none", "note": f"{tool} 调用失败",
+            "banner": DEGRADED_BANNER, "degraded": True}
+
+
+def call_with_degrade(
+    tool: str,
+    arguments: Dict[str, Any],
+    token: Optional[str] = None,
+    cache_loader: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """MCP 调用 + 超时降级包装：失败时按 DEGRADE_RULES 返回降级结果。
+
+    Returns
+    -------
+    dict
+        ``{"ok": bool, "data": …, "degraded": bool, "banner": str, "note": str,
+        "error": str|None, "fallback": str}``。``ok=False`` 且 ``degraded=True``
+        表示走降级路径，调用方须把 ``banner`` 展示给用户。
+    """
+    t0 = time.monotonic()
+    try:
+        resp = _mcp_call(tool, arguments, token=token)
+        sc = (resp.get("result") or {}).get("structuredContent") or {}
+        if sc.get("success") is False:
+            # 业务错误（门店打烊等）：不重试、不降级编数据，如实返回
+            return {"ok": False, "data": None, "degraded": False, "banner": None,
+                    "note": f"业务错误 {sc.get('code')}: {sc.get('message')}",
+                    "error": f"业务错误 {sc.get('code')}: {sc.get('message')}",
+                    "fallback": "none"}
+        return {"ok": True, "data": sc.get("data"), "degraded": False,
+                "banner": None, "note": "", "error": None, "fallback": "none"}
+    except Exception as exc:  # noqa: BLE001 —— 超时/网络/5xx 全部走降级
+        dg = degrade_for(tool)
+        data = None
+        if dg["fallback"] == "cache" and cache_loader is not None:
+            try:
+                data = cache_loader()
+                dg = {**dg, "note": dg["note"] + "（已命中本地缓存）"}
+            except Exception:  # noqa: BLE001 —— 缓存也没有就纯降级
+                dg = {**dg, "note": dg["note"] + "（本地缓存不可用）"}
+        log_mcp_call(tool, int((time.monotonic() - t0) * 1000), "degraded",
+                     arguments=arguments, detail=f"降级: {type(exc).__name__}: {exc}")
+        return {"ok": False, "data": data, "degraded": True,
+                "banner": dg["banner"], "note": dg["note"],
+                "error": f"{type(exc).__name__}: {exc}", "fallback": dg["fallback"]}
+
+
+# --- 幂等键（防重复下单） --------------------------------------------------
+
+_IDEMPOTENCY_FILE = os.path.join(LOG_DIR, "idempotency.json")
+
+
+def make_idempotency_key(
+    user_id: str,
+    store_code: str,
+    items: Sequence[Tuple[str, int]],
+    now: Optional[float] = None,
+) -> Tuple[str, int]:
+    """生成 create-order 幂等键：user+store+订单内容哈希+5 分钟时间窗口。
+
+    同一 5 分钟窗口内，同一用户在同一门店提交**完全相同**的订单内容，
+    幂等键相同 → 视为重复提交，复用已有订单。窗口序号随时间前进，
+    正常的「隔几分钟再点一单」不受影响。
+    """
+    ts = float(now if now is not None else time.time())
+    window = int(ts // IDEMPOTENCY_WINDOW_S)
+    normalized = json.dumps(
+        [[str(c), int(q)] for c, q in sorted(items, key=lambda x: str(x[0]))],
+        ensure_ascii=False, sort_keys=True)
+    raw = f"{user_id}|{store_code}|{normalized}|{window}"
+    key = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return key, window
+
+
+def _load_idempotency_store() -> Dict[str, Dict[str, Any]]:
+    try:
+        with open(_IDEMPOTENCY_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_idempotency_store(store: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(_IDEMPOTENCY_FILE, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, ensure_ascii=False, indent=2)
+    except OSError:
+        pass  # 持久化失败不阻断（下次可能重复下单，但比崩溃好）
+
+
+def check_idempotency(
+    user_id: str,
+    store_code: str,
+    items: Sequence[Tuple[str, int]],
+    now: Optional[float] = None,
+    store: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """create-order 前置检查：命中已有成功订单 → 直接复用，不重复创建。
+
+    Returns
+    -------
+    dict
+        ``{"duplicate": bool, "key": str, "existing_order": dict|None,
+        "window": int}``。``duplicate=True`` 时 ``existing_order``
+        含订单号与时间戳，调用方应直接返回该订单。
+    """
+    key, window = make_idempotency_key(user_id, store_code, items, now=now)
+    db = store if store is not None else _load_idempotency_store()
+    hit = db.get(key)
+    if hit and hit.get("status") == "success":
+        return {"duplicate": True, "key": key, "existing_order": hit, "window": window}
+    return {"duplicate": False, "key": key, "existing_order": None, "window": window}
+
+
+def record_idempotency(
+    key: str,
+    order_id: str,
+    status: str = "success",
+    now: Optional[float] = None,
+    store: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> None:
+    """记录幂等键 → 订单号映射（create-order 成功后必须调用）。
+
+    ``store`` 注入时仅更新内存（测试用），不落盘。
+    """
+    ts_now = float(now if now is not None else time.time())
+    if store is not None:
+        store[key] = {
+            "order_id": str(order_id),
+            "status": status,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts_now)),
+        }
+        return
+    db = _load_idempotency_store()
+    db[key] = {
+        "order_id": str(order_id),
+        "status": status,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts_now)),
+        "_epoch": ts_now,
+    }
+    # 清理 >1 天的过期条目，防文件无限膨胀
+    cutoff = ts_now - 86400
+    db = {k: v for k, v in db.items()
+          if not isinstance(v, dict) or float(v.get("_epoch", 0) or 0) >= cutoff}
+    _save_idempotency_store(db)
+
+
+def create_order_guarded(
+    user_id: str,
+    store_code: str,
+    items: Sequence[Tuple[str, int]],
+    order_arguments: Dict[str, Any],
+    token: Optional[str] = None,
+    mcp_call: Optional[Any] = None,
+    now: Optional[float] = None,
+    idem_store: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """**幂等下单入口**：查重 → 调 create-order → 记录幂等键。
+
+    * 幂等键命中已有成功订单 → **不调用 MCP**，直接返回已有订单
+      （``duplicate=True``）；
+    * 调用失败 / 业务错误 → 不记录幂等键（下次可重试），如实返回错误；
+    * 成功 → 记录 ``key → orderId``，窗口内重复提交会被拦截。
+
+    ``mcp_call`` 可注入自定义函数用于测试（默认用 :func:`_mcp_call`）。
+    """
+    chk = check_idempotency(user_id, store_code, items, now=now, store=idem_store)
+    if chk["duplicate"]:
+        log_mcp_call("create-order", 0, "success", arguments={"storeCode": store_code},
+                     detail=f"幂等命中，复用订单 {chk['existing_order'].get('order_id')}")
+        return {"ok": True, "duplicate": True,
+                "order": chk["existing_order"],
+                "key": chk["key"], "error": None}
+
+    caller = mcp_call or _mcp_call
+    try:
+        resp = caller("create-order", order_arguments, token=token)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "duplicate": False, "order": None,
+                "key": chk["key"], "error": f"{type(exc).__name__}: {exc}"}
+
+    sc = (resp.get("result") or {}).get("structuredContent") or {}
+    if sc.get("success") is False:
+        return {"ok": False, "duplicate": False, "order": None, "key": chk["key"],
+                "error": f"业务错误 {sc.get('code')}: {sc.get('message')}"}
+    data = sc.get("data") or {}
+    order_id = (data.get("orderId") or data.get("orderNo")
+                or data.get("order_id") or "")
+    if not order_id:
+        # 没拿到订单号视为未确认成功：不记录幂等键（宁可重复检查，不可漏单）
+        return {"ok": False, "duplicate": False, "order": data, "key": chk["key"],
+                "error": "响应中未找到订单号，未记录幂等键"}
+    record_idempotency(chk["key"], str(order_id), "success",
+                       now=now, store=idem_store)
+    return {"ok": True, "duplicate": False, "order": data,
+            "key": chk["key"], "error": None}
+
+
+# ---------------------------------------------------------------------------
+# 5. 核价校验（MCP calculate-price）
+#     ⚠️ _mcp_call 已升级为带 重试/超时/日志 的统一入口（见第 4.5 节），
+#        verify_price 等全部调用方自动获得健壮性能力。
+# ---------------------------------------------------------------------------
 
 def verify_price(
     plan: Dict[str, Any],
@@ -2967,6 +3368,182 @@ def _selftest() -> None:
     assert agg4["taste"]["spicy"] == 2.5, agg4["taste"]
     # 两人 0 vs 5 也构成严重对立（双方阵营各 1 人 ≥ ⌈2/3⌉=1，gap=5）
     assert agg4["needs_negotiation"]
+
+    # 14) 系统健壮性：幂等键 / 指数退避重试 / 超时降级 / 日志脱敏
+    #     ⚠️ 整组重定向 LOG_FILE 到临时目录，避免测试数据污染真实日志
+    import urllib.error as _ue
+    import tempfile as _tf
+
+    _saved_logfile14 = globals()["LOG_FILE"]
+    _tf14 = _tf.TemporaryDirectory()
+    globals()["LOG_FILE"] = os.path.join(_tf14.name, "mcp_calls.log")
+
+    #     a) 幂等键生成：同一订单内容+同窗口 → 同键；内容或窗口变化 → 不同键
+    k1, w1 = make_idempotency_key("u1", "1950936",
+                                  [("5022", 2), ("4825", 1)], now=1000000.0)
+    k2, w2 = make_idempotency_key("u1", "1950936",
+                                  [("4825", 1), ("5022", 2)], now=1000000.0)
+    assert k1 == k2 and w1 == w2, "内容排序不同但本质相同的订单应生成相同幂等键"
+    k3, _ = make_idempotency_key("u1", "1950936",
+                                 [("5022", 2), ("4825", 2)], now=1000000.0)
+    k4, _ = make_idempotency_key("u1", "1950936",
+                                 [("5022", 2), ("4825", 1)],
+                                 now=1000000.0 + IDEMPOTENCY_WINDOW_S + 1)
+    k5, _ = make_idempotency_key("u2", "1950936",
+                                 [("5022", 2), ("4825", 1)], now=1000000.0)
+    assert k1 != k3, "订单内容不同必须得到不同幂等键"
+    assert k1 != k4, "超出 5 分钟窗口后应生成新键（允许再点一单）"
+    assert k1 != k5, "不同用户必须得到不同幂等键"
+
+    #     b) 幂等去重：注入内存 store，第二次同键下单不触达 MCP
+    _idem_db: Dict[str, Dict[str, Any]] = {}
+    calls: List[str] = []
+
+    def _fake_order_ok(tool: str, args: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+        calls.append(tool)
+        return {"result": {"isError": False, "structuredContent": {
+            "success": True, "code": 200,
+            "data": {"orderId": "ORD-10001"}}}}
+
+    items14 = [("5022", 2), ("4825", 1)]
+    r1 = create_order_guarded("u1", "1950936", items14, {"storeCode": "1950936"},
+                              mcp_call=_fake_order_ok, now=1000000.0,
+                              idem_store=_idem_db)
+    assert r1["ok"] and not r1["duplicate"] and r1["order"]["orderId"] == "ORD-10001"
+    assert calls == ["create-order"]
+    r2 = create_order_guarded("u1", "1950936", items14, {"storeCode": "1950936"},
+                              mcp_call=_fake_order_ok, now=1000000.0 + 60,
+                              idem_store=_idem_db)      # 同窗口重复提交
+    assert r2["ok"] and r2["duplicate"], "同窗口重复提交必须命中幂等键"
+    assert r2["order"]["order_id"] == "ORD-10001"
+    assert calls == ["create-order"], "幂等命中时不得再次调用 create-order"
+
+    #     c) 下单失败不记录幂等键（可重试）
+    def _fake_order_fail(tool: str, args: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+        return {"result": {"isError": False, "structuredContent": {
+            "success": False, "code": 60003, "message": "门店暂停营业"}}}
+
+    _idem_db2: Dict[str, Dict[str, Any]] = {}
+    r3 = create_order_guarded("u1", "1950936", items14, {"storeCode": "1950936"},
+                              mcp_call=_fake_order_fail, now=1000000.0,
+                              idem_store=_idem_db2)
+    assert r3["ok"] is False and "60003" in r3["error"]
+    assert not _idem_db2, "失败的订单不得记录幂等键"
+
+    #     d) 指数退避重试：429 重试至成功；次数正确；401 不重试
+    attempts14: List[int] = []
+
+    def _flaky_429(tool: str, args: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+        attempts14.append(1)
+        if len(attempts14) < 3:
+            raise _ue.HTTPError(MCP_URL, 429, "Too Many Requests", None, None)
+        return {"result": {"isError": False, "structuredContent": {"success": True}}}
+
+    _saved_call14 = globals()["_mcp_call_once"]
+
+    def _dispatch(tool: str, args: Dict[str, Any], token: str = "", timeout: int = 0):
+        # _mcp_call 内部走 _mcp_call_once；这里拦截转给可变函数
+        return _dispatch.fn(tool, args)  # type: ignore[attr-defined]
+
+    _dispatch.fn = _flaky_429  # type: ignore[attr-defined]
+    globals()["_mcp_call_once"] = _dispatch
+    try:
+        resp14 = _mcp_call("query-meals", {"storeCode": "1950936"},
+                           retries=3, budget_s=60.0, log=False)
+        assert (resp14.get("result") or {}).get(
+            "structuredContent", {}).get("success") is True
+        assert len(attempts14) == 3, f"429 应重试到成功，实际尝试 {len(attempts14)} 次"
+
+        # 401 不重试：立即抛出
+        attempts14.clear()
+
+        def _unauthorized(tool: str, args: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+            attempts14.append(1)
+            raise _ue.HTTPError(MCP_URL, 401, "Unauthorized", None, None)
+
+        _dispatch.fn = _unauthorized  # type: ignore[attr-defined]
+        try:
+            _mcp_call("query-meals", {"storeCode": "1950936"},
+                      retries=3, budget_s=60.0, log=False)
+            raise AssertionError("401 应当抛出异常")
+        except _ue.HTTPError as e14:
+            assert e14.code == 401
+        assert len(attempts14) == 1, f"401 不得重试，实际调用 {len(attempts14)} 次"
+
+        # 5xx 重试耗尽：抛最后一个异常
+        attempts14.clear()
+
+        def _always_500(tool: str, args: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+            attempts14.append(1)
+            raise _ue.HTTPError(MCP_URL, 500, "Internal Server Error", None, None)
+
+        _dispatch.fn = _always_500  # type: ignore[attr-defined]
+        try:
+            _mcp_call("query-meals", {"storeCode": "1950936"},
+                      retries=2, budget_s=60.0, log=False)
+            raise AssertionError("5xx 重试耗尽应抛异常")
+        except _ue.HTTPError as e14b:
+            assert e14b.code == 500
+        assert len(attempts14) == 3, f"初始+2次重试应共 3 次调用，实际 {len(attempts14)}"
+    finally:
+        globals()["_mcp_call_once"] = _saved_call14
+
+    #     e) 超时降级：call_with_degrade 走 DEGRADE_RULES，带 banner
+    def _timeout_call(tool: str, args: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+        raise TimeoutError("MCP 调用超时（10s）")
+
+    _saved_mcp14 = globals()["_mcp_call"]
+    globals()["_mcp_call"] = _timeout_call
+    try:
+        dg14 = call_with_degrade("calculate-price", {"storeCode": "1950936"})
+        assert dg14["ok"] is False and dg14["degraded"] is True
+        assert dg14["fallback"] == "mark_unverified"
+        assert dg14["banner"] == DEGRADED_BANNER
+        dg14b = call_with_degrade("query-nearby-stores", {"beType": 1})
+        assert dg14b["fallback"] == "ask_user" and "手动" in dg14b["note"]
+        # 菜单查询带缓存加载器 → 降级取缓存
+        dg14c = call_with_degrade("query-meals", {"storeCode": "1950936"},
+                                  cache_loader=lambda: [{"name": "缓存菜单"}])
+        assert dg14c["fallback"] == "cache" and dg14c["data"] == [{"name": "缓存菜单"}]
+        assert "已命中本地缓存" in dg14c["note"]
+        # 业务错误：不降级、如实返回
+        def _biz_err(tool: str, args: Dict[str, Any], **_k: Any) -> Dict[str, Any]:
+            return {"result": {"isError": False, "structuredContent": {
+                "success": False, "code": 600057, "message": "门店可能已关闭"}}}
+        globals()["_mcp_call"] = _biz_err
+        dg14d = call_with_degrade("query-meals", {"storeCode": "1950936"})
+        assert dg14d["ok"] is False and dg14d["degraded"] is False
+        assert "600057" in dg14d["error"]
+    finally:
+        globals()["_mcp_call"] = _saved_mcp14
+
+    #     f) 日志脱敏：手机号/Token/地址不落盘
+    log_mcp_call("create-order", 123, "success", retries=1,
+                 arguments={"storeCode": "1950936",
+                            "phone": "13812345678",
+                            "token": "secret-token-abc",
+                            "addressDetail": "北京市朝阳区某街道1号"},
+                 detail="Bearer abc123 13812345678")
+    with open(globals()["LOG_FILE"], "r", encoding="utf-8") as _fh14:
+        line = _fh14.readlines()[-1]
+    assert "13812345678" not in line, "真实手机号不得写入日志"
+    assert "[PHONE]" in line
+    assert "secret-token-abc" not in line and "[TOKEN]" in line
+    assert "某街道" not in line and "[ADDRESS]" in line
+    assert "abc123" not in line, "Bearer 凭证不得出现在日志 detail 中"
+    rec14 = json.loads(line)
+    assert rec14["tool"] == "create-order" and rec14["status"] == "success"
+    assert rec14["duration_ms"] == 123 and rec14["retries"] == 1
+
+    globals()["LOG_FILE"] = _saved_logfile14
+    _tf14.cleanup()
+
+    #     g) _is_retryable_error 分类正确
+    assert _is_retryable_error(_ue.HTTPError(MCP_URL, 429, "Too Many", None, None)) is True
+    assert _is_retryable_error(_ue.HTTPError(MCP_URL, 503, "Service Unavailable", None, None)) is True
+    assert _is_retryable_error(_ue.HTTPError(MCP_URL, 401, "Unauthorized", None, None)) is False
+    assert _is_retryable_error(_ue.HTTPError(MCP_URL, 400, "Bad Request", None, None)) is False
+    assert _is_retryable_error(TimeoutError("timeout")) is True
 
     print("[selftest] 全部断言通过 ✅")
 

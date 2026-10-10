@@ -140,7 +140,7 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 任何「用券后的最终价」必须以 `query-store-coupons` 为依据；
 `available-coupons` 只能用于提示用户「可以去领券」。
 
-### 规则 4 · 写操作必须确认
+### 规则 4 · 写操作必须确认 + 幂等防重
 以下工具会改变账户/订单状态，**一律先展示变更内容，再等用户明确确认**：
 
 `auto-bind-coupons`、`delivery-create-address`、`create-order`、`cancel-order`、`mall-create-order`、`party-order-create`、`draw-lottery`
@@ -148,6 +148,16 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 - 下单类：**禁止**未真实调用工具就输出「下单成功」；必须真实调用后回传结果。
 - 抽奖类：必须先展示 `drawDecision.nextConsumption`，「试试看」**不算**确认。
 - 多件兑换：必须**分别下单且串行排队**，前单成功后再下新单。
+
+**下单幂等机制**（防重复下单）：调 `create-order` 前必须走
+`optimizer.py::create_order_guarded(user_id, store_code, items, arguments)`——
+幂等键 = `sha256(user_id + store_code + 订单内容哈希 + 5 分钟时间窗口)`：
+
+1. 键命中已有**成功**订单 → **不再调用 MCP**，直接返回已有订单并告知用户；
+2. 下单失败 / 业务错误 → **不记录**幂等键（用户重试不受影响）；
+3. 响应中拿不到订单号 → 视为未确认成功，不记录（宁可重复检查，不可漏单）；
+4. 记录落盘 `logs/idempotency.json`（键 → 订单号 + 时间戳，>1 天自动清理）；
+5. 同一订单内容隔 5 分钟后再点 = 新窗口 = 允许再下一单（正常复购不受影响）。
 
 ### 规则 5 · 限流与鉴权异常处理
 - **429 / 「操作太频繁」**：优先读本地缓存；缓存未命中则友好提示「请求太频繁，请稍后再试」，不连续重试。
