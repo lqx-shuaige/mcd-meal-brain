@@ -169,7 +169,11 @@ def parse_constraints(user_input: str) -> Dict[str, Any]:
     text = (user_input or "").strip()
 
     # --- 人数 -------------------------------------------------------------
-    people = _find_number(text, [r"(\d+)\s*(?:人|位)", r"我们\s*(\d+)", r"(\d+)\s*份"])
+    people = _find_number(text, [
+        r"(\d+)\s*(?:个|位)?\s*(?:人|位)",   # 「4个人」「4人」「4位」都命中
+        r"我们\s*(\d+)",
+        r"(\d+)\s*份",
+    ])
     people_count = int(people) if people and people > 0 else 1
 
     # --- 场景 -------------------------------------------------------------

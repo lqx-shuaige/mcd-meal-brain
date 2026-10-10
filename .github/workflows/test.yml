@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # optimizer.py 本体零第三方依赖；pytest 仅测试期需要
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+
+      - name: Run selftest (builtin assertions, 14 groups)
+        run: python scripts/optimizer.py --selftest
+
+      - name: Run regression tests (pytest)
+        run: python -m pytest tests/ -v
+
+      # 冒烟：主要 CLI 入口不崩（离线，不依赖 MCP 网络）
+      - name: Smoke test CLI entry points
+        run: |
+          python scripts/optimizer.py > /dev/null
+          python scripts/optimizer.py --json > /dev/null
+          python scripts/optimizer.py --compare-channels > /dev/null
+          python scripts/optimizer.py --group > /dev/null
+          python scripts/optimizer.py --clarify "随便" > /dev/null

@@ -88,10 +88,13 @@ mcd-meal-brain/
 ├── references/
 │   ├── workflow.md               八步工作流详解 · 得来速/渠道比价专题 · 偏好解析 JSON · 输出字段细则
 │   ├── schema.json               结构化输出契约（JSON Schema，与 optimizer.py::PLAN_OUTPUT_SCHEMA 同步）
-│   ├── tools.md                  35 个 MCP 工具的参数与返回值注意事项
-│   └── strategy.md               菜品标签字典 / 营养约束映射 / 软硬约束处理逻辑
+│   ├── tools.md                  35 个 MCP 工具的参数与返回值注意事项 + 异常处理规则
+│   └── strategy.md               菜品标签字典 / 营养约束映射 / 软硬约束处理 / 群体偏好聚合规则
 ├── scripts/
-│   └── optimizer.py              约束解析 · 硬约束过滤 · 组合优化 · 核价校验 · 渠道比价 · Schema 校验
+│   └── optimizer.py              约束解析 · 硬约束过滤 · 组合优化 · 核价校验 · 渠道比价 · Schema 校验 · 健壮性
+├── tests/
+│   └── test_regression.py        回归测试（pytest，5 场景 + 契约回归，25 用例）
+├── .github/workflows/test.yml    CI：push/PR 自动跑 selftest + pytest + CLI 冒烟（Python 3.10/3.12）
 ├── mcp-config.example.json       MCP 配置示例（Token 用 ${MCD_MCP_TOKEN} 占位）
 ├── MCP_INTEGRATION.md            MCP 接入记录（脱敏日志 + 15 项实测 schema 偏差）
 ├── CONTEST_DECLARATION.md        参赛声明
@@ -197,6 +200,46 @@ mcd-meal-brain/
 截尾均值 / 冲突双方案 / 木桶效应 / 硬违反零分 / 契约兼容）与系统健壮性
 （幂等键去重与窗口 / 429 重试次数与 401 不重试 / 降级策略与 banner /
 日志脱敏 / 重试条件分类）。
+
+---
+
+## 测试与质量保障
+
+### 回归测试（pytest）
+
+`tests/test_regression.py` 覆盖 5 个典型场景 + 输出契约回归，共 25 个用例：
+
+| 场景 | 输入 | 关键断言 |
+|---|---|---|
+| 标准 4 人拼单 | 「4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜」 | 3 套方案（最省钱/最健康/最快）；每套主食 ≥4；总价 ≤¥100；忌辣零违反；群体入口逐成员公平性评分 |
+| 单人点餐 | 「1个人，想吃板烧鸡腿堡」 | 3 套方案；主食 ≥1 且总份数 ≤6（不冗余）；人均=总价 |
+| 模糊输入 | 「随便」 | L3 默认路径（不追问）；banner「基于默认偏好：不辣、不油炸」；默认口味下菜单仍可解；answers 合并后 ready 翻转 |
+| 偏好冲突 | 「4个人，2个要辣2个不要辣，预算120」 | 检测 spicy 冲突（阵营均值差 ≥3）；A/B 双备选；各有妥协说明；A 不排除辣 / B 硬排除辣 |
+| 极端预算 | 「4个人，预算30」 | 有解→守主食底线且预算可判读；无解→明确说明；预算 ¥1~¥10000 均不崩溃 |
+| 输出契约 | —— | `--json` 文档通过 schema 校验；群体/单人路径兼容；未核价标注 |
+
+运行方式：
+
+```bash
+python -m pip install pytest        # 仅测试期依赖（optimizer 本体零依赖）
+python -m pytest tests/ -v          # 全部回归测试
+python scripts/optimizer.py --selftest   # 内置 14 组断言自检
+```
+
+**测试通过标准**：`pytest tests/` 全绿（25 passed）且 `--selftest` 输出
+「全部断言通过」；任一失败即视为核心逻辑被破坏，禁止合并/发布。
+GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
+自动跑 Python 3.10 + 3.12 双版本：selftest → pytest → 5 个 CLI 入口冒烟，
+失败即红。
+
+### 可观测性
+
+- **调用日志**：每次 MCP 调用记 JSON Lines 至 `logs/mcp_calls.log`
+  （工具名 / 耗时 / 状态 success·error·retry·degraded / 重试次数 / 入参快照）；
+- **敏感信息脱敏**：Token→`[TOKEN]`、手机号→`[PHONE]`、地址→`[ADDRESS]`，
+  写入前强制替换；`logs/` 目录已 gitignore，不入库；
+- **幂等记录**：`logs/idempotency.json` 存幂等键→订单号映射（>1 天自动清理），
+  防重复下单且可追溯。
 
 ---
 
