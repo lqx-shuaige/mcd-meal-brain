@@ -39,6 +39,12 @@
 - **结构化输出契约**：`--json` 输出符合 JSON Schema（`references/schema.json`）的 plans 文档
   （`name / items / coupons / original_total / final_total / per_person / nutrition / genui`），
   纯标准库校验器保证类型与必填字段，`--selftest` 附带负向用例与镜像同步检查。
+- **模糊输入处理**：三层询问机制（静默默认 → 聚焦追问 ≤3 问 → 「你看着办」全默认），
+  「随便」「都行」不再瞎猜也不卡死，默认偏好显式标注。
+- **群体决策公平性**：`aggregate_preferences()` 硬约束交集（禁忌并集排除）、
+  软约束自适应截尾均值（去极端取中间）、严重冲突检测（一半要辣一半不要辣 →
+  「需协商」+ A/B 两套备选 + 妥协点说明）；每方案带逐成员公平性评分
+  （0-1 满足度，整体取最低分——木桶效应），冲突场景 `--group` 可演示。
 - **子代理编排设计**：解析 / 查询 / 优化三角色协作（见 SKILL.md），职责隔离，
   输入输出契约与现有函数一一对应，可直接落地。
 
@@ -59,6 +65,8 @@ python scripts/optimizer.py            # 输出 Top-3 方案
 python scripts/optimizer.py --selftest # 断言自检
 python scripts/optimizer.py --compare-channels  # 渠道比价演示（回放 2026-10-10 实测数据）
 python scripts/optimizer.py --json     # 结构化输出（references/schema.json 契约）
+python scripts/optimizer.py --clarify "随便"     # 模糊输入三层询问演示
+python scripts/optimizer.py --group    # 群体决策演示（一半要辣一半不要辣 → 双方案）
 
 # 4. 核价联调（需在门店营业时段 07:00–22:00）
 #    见 scripts/optimizer.py::verify_price(plan, store_code, token=...)
@@ -170,12 +178,16 @@ mcd-meal-brain/
 | 核价校验 | 极简 MCP Streamable HTTP 客户端；**分 → 元**换算；偏差 >5% 以官方为准 |
 | 渠道比价 | 同一篮子 × 内部渠道（到店自取/麦乐送/得来速）到手成本对比；恒等式校验（商品+运费+打包+餐具−优惠=现价）；缺前置条件（如无配送地址）如实标「无法核价」 |
 | 输出契约 | JSON Schema draft-07（`references/schema.json`）；`plans_to_doc()` 转换 + 纯标准库递归校验器（type/required/enum/const/边界），`--dump-schema` 生成镜像 |
+| 模糊输入 | `clarify_input()` 三层询问：静默默认 / 聚焦追问（≤3 问）/ 你看着办（全默认 + banner 标注） |
+| 群体公平 | `aggregate_preferences()`：硬约束禁忌并集、软偏好多数 + avoid 并集、口味自适应截尾均值（n≥4 去两端 n//4）；冲突检测（阵营各 ≥⌈n/3⌉ 且均值差 ≥3）→ A/B 双方案 + 妥协点；`fairness_score()` 逐成员 0-1 满足度，整体取最低（木桶效应） |
 | 错误处理 | 识别「业务错误不置 `isError`」的服务端行为，读 `structuredContent.success/code` |
 
-**内建质量保障**：`--selftest` 覆盖 11 组断言，含 4 个已修 bug 的回归用例
+**内建质量保障**：`--selftest` 覆盖 13 组断言，含 4 个已修 bug 的回归用例
 （油炸误标、折扣券语义、浮点截断、券跨商品误用）、业务错误识别、渠道比价
-（beCode 传递约定、到手成本恒等式、外部平台拒绝、无法核价兜底）与输出契约
-（必填缺失 / 类型错误 / const 破坏 / 枚举越界 / 镜像同步）。
+（beCode 传递约定、到手成本恒等式、外部平台拒绝、无法核价兜底）、输出契约
+（必填缺失 / 类型错误 / const 破坏 / 枚举越界 / 镜像同步）、模糊输入
+（三层路径 / answers 合并 / 默认口味可解性）与群体公平性（硬约束交集 /
+截尾均值 / 冲突双方案 / 木桶效应 / 硬违反零分 / 契约兼容）。
 
 ---
 
@@ -197,5 +209,5 @@ mcd-meal-brain/
 - 详细工作流与输出字段细则 → [`references/workflow.md`](./references/workflow.md)
 - 结构化输出契约 → [`references/schema.json`](./references/schema.json)
 - 工具参数速查 → [`references/tools.md`](./references/tools.md)
-- 标签字典与约束逻辑 → [`references/strategy.md`](./references/strategy.md)
+- 标签字典与约束逻辑 → [`references/strategy.md`](./references/strategy.md)（含群体偏好聚合规则）
 - MCP 接入踩坑记录（15 项实测偏差）→ [`MCP_INTEGRATION.md`](./MCP_INTEGRATION.md)

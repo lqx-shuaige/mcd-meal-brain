@@ -205,6 +205,61 @@
             },
             "description": "体检结论：营养达标/热量超标/脂肪超标/蛋白不足/主食不足"
           },
+          "fairness": {
+            "type": "object",
+            "description": "公平性评分（群体决策时由 attach_fairness 附加）",
+            "required": [
+              "overall",
+              "per_member"
+            ],
+            "properties": {
+              "overall": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "整体公平性 = 最低成员分（木桶效应）"
+              },
+              "per_member": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "score"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "score": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "taste_sat": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "prefer_sat": {
+                      "type": "number"
+                    },
+                    "avoid_sat": {
+                      "type": "number"
+                    }
+                  }
+                }
+              },
+              "note": {
+                "type": "string"
+              }
+            }
+          },
           "tradeoffs": {
             "type": "string",
             "description": "取舍说明：牺牲了什么、换来了什么"

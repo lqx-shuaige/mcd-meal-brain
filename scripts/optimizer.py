@@ -433,6 +433,441 @@ def clarify_input(
 
 
 # ---------------------------------------------------------------------------
+# 1.2 群体决策公平性（偏好聚合 + 公平性评分）
+#
+#     目标：多人偏好冲突时，输出让各方都能接受的方案，而不是只满足多数人。
+#
+#     ① 硬约束「交集」= 禁忌并集排除：A 不吃辣、B 不吃牛肉 → 菜单同时排除辣和牛肉
+#        （每个人「能吃集合」的交集 = 全员禁忌并集的补集；一票否决，不可被多数推翻）
+#     ② 软约束自适应截尾均值：口味强度排序后去掉两端各 n//4 个极端值（n≥4 时），
+#        取中间均值。例：很辣4/中辣2/不辣0/不辣0 → 截尾后 [0,2] → 1.0（微辣以下）
+#     ③ 严重冲突检测：口味维度两阵营（强度≥3 vs ≤1）各达投票人数 1/3 以上且
+#        阵营均值差 ≥3 → 标记「需协商」，输出 A/B 两套备选约束（各自妥协点显式说明）
+#     ④ 公平性评分：每成员 0-1 满足度（口味接近度 0.5 + 偏好命中 0.3 + 避免命中 0.2；
+#        硬约束被违反直接 0 分），整体取最低分（木桶效应）
+# ---------------------------------------------------------------------------
+
+#: 口味维度（当前实际使用 spicy；结构支持任意维度扩展）
+TASTE_DIMENSIONS: Tuple[str, ...] = ("spicy",)
+
+#: 口味强度标尺：0 不辣 … 5 变态辣
+TASTE_SCALE_MAX = 5
+
+#: 自然语言 → 口味强度（顺序敏感：否定式必须先于泛化式，避免「不吃辣」误判为「吃辣」）
+_TASTE_RULES: Tuple[Tuple[str, int], ...] = (
+    (r"不吃辣|不能吃辣|忌辣|不要辣|别放辣|怕辣|不辣", 0),
+    (r"变态辣|特辣|非常辣|无辣不欢", 5),
+    (r"很辣|超辣|重辣|越辣越好", 4),
+    (r"中辣", 3),
+    (r"微辣|小辣|一点点辣", 2),
+    (r"能吃辣|喜欢辣|爱吃辣|要辣|吃辣", 3),
+)
+
+#: 中文词 → 标准标签（由 INGREDIENT_SYNONYMS + 常用口味词构建）
+_CN2TAG: Dict[str, str] = {}
+for _tag, _words in list(INGREDIENT_SYNONYMS.items()) + [
+    ("spicy", ("辣", "辣的", "麻辣", "香辣")), ("fried", ("油炸", "炸的", "煎炸")),
+]:
+    for _w in _words:
+        _CN2TAG.setdefault(_w, _tag)
+
+
+def _norm_tags(vals: Iterable[str]) -> List[str]:
+    """把中文口味/成分词归一为标准标签（辣→spicy、牛肉→beef…），去重排序。"""
+    out: set = set()
+    for v in vals or []:
+        v = str(v).strip()
+        if not v:
+            continue
+        out.add(_CN2TAG.get(v, v))
+    return sorted(out)
+
+
+def _infer_taste(text: str) -> Dict[str, int]:
+    """从自然语言推断口味强度（只推断有明确信号的维度）。"""
+    taste: Dict[str, int] = {}
+    if re.search(_TASTE_RULES[0][0], text):        # 否定式优先
+        taste["spicy"] = 0
+        return taste
+    for pat, lv in _TASTE_RULES[1:]:
+        if re.search(pat, text):
+            taste["spicy"] = lv
+            break
+    return taste
+
+
+def _member_name(text: str, idx: int) -> str:
+    """「小李：不吃辣」→ 小李；无前缀 → 成员N。"""
+    m = re.match(r"^\s*([\u4e00-\u9fa5A-Za-z0-9_]{1,12})\s*[:：]", text or "")
+    return m.group(1) if m else f"成员{idx}"
+
+
+def _normalize_member(member: Any, idx: int) -> Dict[str, Any]:
+    """成员输入归一：支持 dict（结构化）或 str（自然语言，走 parse_constraints）。"""
+    if isinstance(member, str):
+        c = parse_constraints(member)
+        hard, soft = c["hard"], c["soft"]
+        return {
+            "name": _member_name(member, idx),
+            "exclude_ingredients": sorted(set(hard["exclude_ingredients"] or [])),
+            "exclude_tags": sorted(set(hard["exclude_tags"] or [])),
+            "prefer_tags": sorted(set(soft["prefer_tags"] or [])),
+            "avoid_tags": sorted(set(soft["avoid_tags"] or [])),
+            "taste": _infer_taste(member),
+            "weight": c.get("weights") or {},
+            "budget_cny": (c.get("budget") or {}).get("amount_cny"),
+            "max_per_capita_cny": hard.get("max_per_capita_cny"),
+            "targets": c.get("targets") or {},
+        }
+    m = dict(member or {})
+    return {
+        "name": str(m.get("name") or f"成员{idx}"),
+        "exclude_ingredients": _norm_tags(m.get("exclude_ingredients") or []),
+        "exclude_tags": _norm_tags(m.get("exclude_tags") or []),
+        "prefer_tags": _norm_tags(m.get("prefer_tags") or []),
+        "avoid_tags": _norm_tags(m.get("avoid_tags") or []),
+        "taste": {str(k): int(v) for k, v in (m.get("taste") or {}).items()
+                  if v is not None},
+        "weight": m.get("weight") or {},
+        "budget_cny": m.get("budget_cny"),
+        "max_per_capita_cny": m.get("max_per_capita_cny"),
+        "targets": m.get("targets") or {},
+    }
+
+
+def _trimmed_mean(values: Sequence[float]) -> Optional[float]:
+    """自适应截尾均值：n≥4 时两端各去 ``n//4`` 个，n<4 不截尾。"""
+    n = len(values)
+    if n == 0:
+        return None
+    s = sorted(values)
+    k = n // 4 if n >= 4 else 0
+    core = s[k: n - k] if k else s
+    return round(sum(core) / len(core), 2)
+
+
+def _detect_taste_conflicts(members: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """检测口味维度的严重对立（无法用截尾均值调和的）。"""
+    conflicts: List[Dict[str, Any]] = []
+    for dim in TASTE_DIMENSIONS:
+        voted = [(m["name"], m["taste"][dim]) for m in members
+                 if dim in (m.get("taste") or {})]
+        if len(voted) < 2:
+            continue
+        hi = [(nm, lv) for nm, lv in voted if lv >= 3]
+        lo = [(nm, lv) for nm, lv in voted if lv <= 1]
+        if not hi or not lo:
+            continue
+        quota = max(1, (len(voted) + 2) // 3)      # ⌈n/3⌉
+        if len(hi) < quota or len(lo) < quota:
+            continue
+        mean_hi = sum(lv for _, lv in hi) / len(hi)
+        mean_lo = sum(lv for _, lv in lo) / len(lo)
+        if mean_hi - mean_lo < 3:
+            continue
+        conflicts.append({
+            "dimension": dim,
+            "camp_a": {"members": [nm for nm, _ in hi], "mean_level": round(mean_hi, 2),
+                        "stance": "要辣"},
+            "camp_b": {"members": [nm for nm, _ in lo], "mean_level": round(mean_lo, 2),
+                        "stance": "不要辣"},
+            "gap": round(mean_hi - mean_lo, 2),
+        })
+    return conflicts
+
+
+def _merge_targets(targets_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """营养目标聚合：max_* 取最小（最严），min_* 取最大（最严）。"""
+    merged: Dict[str, Any] = {}
+    for t in targets_list:
+        if not t:
+            continue
+        for k, v in t.items():
+            if not isinstance(v, (int, float)) or v is None:
+                merged.setdefault(k, v)
+                continue
+            if k.startswith("max_"):
+                merged[k] = min(merged.get(k, v), v)
+            elif k.startswith("min_"):
+                merged[k] = max(merged.get(k, v), v)
+            else:
+                merged.setdefault(k, v)
+    return merged
+
+
+def aggregate_preferences(members: List[Any]) -> Dict[str, Any]:
+    """多人偏好聚合：硬约束取交集（禁忌并集排除）、软约束自适应截尾均值、
+    严重冲突检测（标记「需协商」并给出 A/B 两套备选约束）。
+
+    Parameters
+    ----------
+    members : list
+        每项可为 dict（结构化，键 name/exclude_ingredients/exclude_tags/
+        prefer_tags/avoid_tags/taste{spicy:0-5}/weight/budget_cny/targets）
+        或 str（自然语言，如 ``"小李：不吃辣，减脂"``，自动解析+口味强度推断）。
+
+    Returns
+    -------
+    dict
+        ``{people_count, members_resolved, hard, soft, taste, taste_detail,
+        weights, budget, targets, conflicts, needs_negotiation,
+        alternatives, constraints, fairness_note}``。``constraints``
+        与 ``filter_menu`` / ``optimize_plans`` 直接兼容。
+    """
+    resolved = [_normalize_member(m, i) for i, m in enumerate(members or [])]
+    n = max(len(resolved), 1)
+
+    # ① 硬约束：全员禁忌并集（一票否决，不可被多数推翻）
+    exclude_ingredients = sorted({x for m in resolved for x in m["exclude_ingredients"]})
+    exclude_tags = sorted({x for m in resolved for x in m["exclude_tags"]})
+
+    # ② 软偏好：prefer 取多数（≥半数成员提到才进聚合偏好）；avoid 取并集（更保守）
+    prefer_counts: Dict[str, int] = {}
+    for m in resolved:
+        for t in m["prefer_tags"]:
+            prefer_counts[t] = prefer_counts.get(t, 0) + 1
+    prefer_tags = sorted(t for t, cnt in prefer_counts.items() if cnt * 2 >= len(resolved) and resolved)
+    avoid_tags = sorted({x for m in resolved for x in m["avoid_tags"]})
+
+    # 口味：截尾均值 + 明细（供公平性评分用）
+    taste: Dict[str, float] = {}
+    taste_detail: Dict[str, List[Tuple[str, int]]] = {}
+    for dim in TASTE_DIMENSIONS:
+        voted = [(m["name"], m["taste"][dim]) for m in resolved if dim in m["taste"]]
+        if voted:
+            tm = _trimmed_mean([lv for _, lv in voted])
+            if tm is not None:
+                taste[dim] = tm
+            taste_detail[dim] = voted
+
+    # 权重：成员均值；预算：取最严（最小）
+    weights: Dict[str, float] = {}
+    for key in ("cheap", "healthy", "speed", "pref"):
+        vals = [float(m["weight"][key]) for m in resolved
+                if isinstance(m.get("weight"), dict) and m["weight"].get(key) is not None]
+        if vals:
+            weights[key] = round(sum(vals) / len(vals), 4)
+    if not weights:
+        weights = {"cheap": 0.34, "healthy": 0.33, "speed": 0.18, "pref": 0.15}
+
+    budgets = [float(m["budget_cny"]) for m in resolved if m.get("budget_cny")]
+    per_caps = [float(m["max_per_capita_cny"]) for m in resolved if m.get("max_per_capita_cny")]
+    budget_amount = min(budgets) if budgets else None
+    max_per_capita = min(per_caps) if per_caps else (min(budgets) / n if budgets else None)
+    targets = _merge_targets([m["targets"] for m in resolved])
+
+    # ③ 严重冲突检测
+    conflicts = _detect_taste_conflicts(resolved)
+
+    def _base_constraints(**override: Any) -> Dict[str, Any]:
+        c: Dict[str, Any] = {
+            "people_count": len(resolved) or 1,
+            "scene": None, "beType": None, "orderType": None,
+            "budget": {"type": "total", "amount_cny": budget_amount},
+            "hard": {
+                "exclude_ingredients": list(exclude_ingredients),
+                "exclude_tags": list(exclude_tags),
+                "max_per_capita_cny": max_per_capita,
+                "max_single_item_cny": None,
+            },
+            "soft": {"prefer_tags": list(prefer_tags), "avoid_tags": list(avoid_tags)},
+            "targets": dict(targets),
+            "personas": ["群体聚合"],
+            "weights": dict(weights),
+            "taste": dict(taste),
+        }
+        c.update(override)
+        return c
+
+    constraints = _base_constraints()
+
+    # 冲突 → 两套备选（各自妥协点显式说明）
+    alternatives: List[Dict[str, Any]] = []
+    for cf in conflicts:
+        dim = cf["dimension"]
+        # 方案 A：满足「要辣」阵营 —— 口味维度不排除、计入偏好
+        ca = _base_constraints()
+        ca["hard"]["exclude_tags"] = [t for t in ca["hard"]["exclude_tags"] if t != dim]
+        ca["soft"]["prefer_tags"] = sorted(set(ca["soft"]["prefer_tags"]) | {dim})
+        ca["taste"][dim] = cf["camp_a"]["mean_level"]
+        alternatives.append({
+            "label": f"方案A（{cf['camp_a']['stance']}组）",
+            "serves": cf["camp_a"]["members"],
+            "constraints": ca,
+            "compromise": (f"{cf['camp_b']['stance']}的成员（{'、'.join(cf['camp_b']['members'])}）"
+                           f"需接受含{dim}菜品，可单独去掉酱料或换不辣单品"),
+        })
+        # 方案 B：满足「不要辣」阵营 —— 口味维度升级为硬排除
+        cb = _base_constraints()
+        cb["hard"]["exclude_tags"] = sorted(set(cb["hard"]["exclude_tags"]) | {dim})
+        cb["taste"].pop(dim, None)
+        alternatives.append({
+            "label": f"方案B（{cf['camp_b']['stance']}组）",
+            "serves": cf["camp_b"]["members"],
+            "constraints": cb,
+            "compromise": (f"{cf['camp_a']['stance']}的成员（{'、'.join(cf['camp_a']['members'])}）"
+                           f"需接受全单无{dim}，可自备辣酱"),
+        })
+
+    return {
+        "people_count": len(resolved),
+        "members_resolved": resolved,
+        "hard": constraints["hard"],
+        "soft": constraints["soft"],
+        "taste": taste,
+        "taste_detail": taste_detail,
+        "weights": weights,
+        "budget": constraints["budget"],
+        "targets": targets,
+        "conflicts": conflicts,
+        "needs_negotiation": bool(conflicts),
+        "alternatives": alternatives,
+        "constraints": constraints,
+        "fairness_note": "整体公平性取最低成员分（木桶效应）",
+    }
+
+
+def _plan_taste_level(plan: Dict[str, Any], dim: str) -> int:
+    """方案在口味维度上的代表强度：含该标签菜品 → 3（中辣档），否则 0。"""
+    if dim == "spicy":
+        has = any(dim in (ln.get("tags") or []) for ln in plan.get("items") or [])
+        return 3 if has else 0
+    return 3 if any(dim in (ln.get("tags") or []) for ln in plan.get("items") or []) else 0
+
+
+def fairness_score(plan: Dict[str, Any], aggregated: Dict[str, Any]) -> Dict[str, Any]:
+    """计算方案对每个成员的满足度（0-1）与整体公平性（取最低分，木桶效应）。
+
+    成员满足度构成：
+    * 硬约束被违反（成员个人禁忌出现在方案里）→ 直接 0；
+    * 表达过口味偏好：口味接近度 ``1-|方案强度-成员强度|/5``（权重 0.5）
+      + 偏好命中率（0.3）+ 避免命中率（0.2）；
+    * 未表达口味：偏好命中 0.6 + 避免命中 0.4。
+    """
+    members = aggregated.get("members_resolved") or []
+    per_member: List[Dict[str, Any]] = []
+    for m in members:
+        item_tags: set = set()
+        item_names = []
+        for ln in plan.get("items") or []:
+            item_tags.update(ln.get("tags") or [])
+            item_names.append(ln.get("name") or "")
+        names_text = " ".join(item_names)
+
+        # 硬约束门（成员个人禁忌）
+        hard_violations = sorted(
+            (set(m["exclude_tags"]) & item_tags)
+            | {t for t in m["exclude_ingredients"]
+               if any(k in names_text for k in INGREDIENT_SYNONYMS.get(t, (t,)))}
+        )
+        if hard_violations:
+            per_member.append({"name": m["name"], "score": 0.0,
+                                "reason": f"硬约束被违反：{hard_violations}"})
+            continue
+
+        # 口味接近度
+        taste_sat: Optional[float] = None
+        for dim, my_lv in (m.get("taste") or {}).items():
+            plan_lv = _plan_taste_level(plan, dim)
+            taste_sat = max(0.0, 1.0 - abs(plan_lv - my_lv) / TASTE_SCALE_MAX)
+
+        # 偏好命中 / 避免命中
+        prefs = set(m["prefer_tags"])
+        if prefs:
+            hit = sum(1 for t in prefs if t in item_tags)
+            prefer_sat = hit / len(prefs)
+        else:
+            prefer_sat = 0.5
+        avoids = set(m["avoid_tags"])
+        if avoids:
+            v = sum(1 for t in avoids if t in item_tags)
+            avoid_sat = max(0.0, 1.0 - v / len(avoids))
+        else:
+            avoid_sat = 1.0
+
+        if taste_sat is not None:
+            score = 0.5 * taste_sat + 0.3 * prefer_sat + 0.2 * avoid_sat
+        else:
+            score = 0.6 * prefer_sat + 0.4 * avoid_sat
+        per_member.append({
+            "name": m["name"],
+            "score": round(max(0.0, min(1.0, score)), 4),
+            "taste_sat": round(taste_sat, 4) if taste_sat is not None else None,
+            "prefer_sat": round(prefer_sat, 4),
+            "avoid_sat": round(avoid_sat, 4),
+        })
+
+    overall = min((pm["score"] for pm in per_member), default=1.0)
+    return {"overall": round(overall, 4), "per_member": per_member,
+            "note": aggregated.get("fairness_note") or "整体取最低成员分（木桶效应）"}
+
+
+def attach_fairness(plans: List[Dict[str, Any]], aggregated: Dict[str, Any]) -> None:
+    """给每个方案就地附加 ``fairness`` 字段（fairness_score 结果）。"""
+    for p in plans:
+        p["fairness"] = fairness_score(p, aggregated)
+
+
+def optimize_group_plans(
+    menu: List[Dict[str, Any]],
+    coupons: List[Dict[str, Any]],
+    members: List[Any],
+    promotions: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """群体决策入口：聚合偏好 → 无冲突走单方案集；有冲突输出 A/B 两套备选。
+
+    Returns
+    -------
+    dict
+        ``{needs_negotiation, aggregated, conflicts, plans | plan_sets}``。
+        每个方案均带 ``fairness`` 字段；冲突时 ``plan_sets[i]``
+        含 ``label / serves / compromise / plans``。
+    """
+    agg = aggregate_preferences(members)
+    if agg["needs_negotiation"]:
+        plan_sets: List[Dict[str, Any]] = []
+        for alt in agg["alternatives"]:
+            plans = optimize_plans(menu, coupons, alt["constraints"], promotions=promotions)
+            attach_fairness(plans, agg)
+            plan_sets.append({"label": alt["label"], "serves": alt["serves"],
+                               "compromise": alt["compromise"], "plans": plans})
+        return {"needs_negotiation": True, "aggregated": agg,
+                "conflicts": agg["conflicts"], "plan_sets": plan_sets}
+    plans = optimize_plans(menu, coupons, agg["constraints"], promotions=promotions)
+    attach_fairness(plans, agg)
+    return {"needs_negotiation": False, "aggregated": agg,
+            "conflicts": [], "plans": plans}
+
+
+def render_group_result(result: Dict[str, Any]) -> str:
+    """渲染群体决策结果：无冲突 → Top-3（带公平性）；有冲突 → 冲突说明 + A/B 双方案。"""
+    out: List[str] = []
+    agg = result["aggregated"]
+    if not result["needs_negotiation"]:
+        out.append(f"【群体偏好聚合】{agg['people_count']} 人｜硬约束并集："
+                   f"{'、'.join(agg['hard']['exclude_tags'] + agg['hard']['exclude_ingredients']) or '无'}"
+                   f"｜口味截尾均值：{agg['taste'] or '未表达'}")
+        out.append("")
+        out.append(render_plans(result["plans"]))
+        return "\n".join(out)
+
+    out.append("【偏好冲突 · 需协商】以下维度存在严重对立，已给出两套备选：")
+    for cf in result["conflicts"]:
+        out.append(f"  ⚠️ {cf['dimension']}：{cf['camp_a']['stance']}"
+                   f"（{'、'.join(cf['camp_a']['members'])}，均值 {cf['camp_a']['mean_level']}） vs "
+                   f"{cf['camp_b']['stance']}"
+                   f"（{'、'.join(cf['camp_b']['members'])}，均值 {cf['camp_b']['mean_level']}）")
+    out.append("")
+    for ps in result["plan_sets"]:
+        out.append(f"━━ {ps['label']}（服务：{'、'.join(ps['serves'])}）")
+        out.append(f"  妥协点：{ps['compromise']}")
+        out.append("")
+        out.append(render_plans(ps["plans"]))
+        out.append("")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # 2. 菜品标签
 # ---------------------------------------------------------------------------
 
@@ -1667,6 +2102,15 @@ def render_plans(plans: List[Dict[str, Any]]) -> str:
             f"├ 营养标签：总热量 {n['total_kcal']:.0f} kcal｜人均 {n['per_capita_kcal']:.0f} kcal"
             f"｜人均蛋白 {n['per_capita_protein_g']:.1f} g｜人均脂肪 {n['per_capita_fat_g']:.1f} g"
         )
+        if p.get("fairness"):
+            fr = p["fairness"]
+            parts = []
+            for pm in fr["per_member"]:
+                s = f"{pm['name']} {pm['score']:.2f}"
+                if pm.get("reason"):
+                    s += f"（{pm['reason']}）"
+                parts.append(s)
+            out.append(f"├ 公平性：整体 {fr['overall']:.2f}（木桶效应）｜成员满足度：{'｜'.join(parts)}")
         out.append(f"└ 体检：{'；'.join(p['nutrition_flags'])}（评分 {p['score']}）")
         out.append("")
     return "\n".join(out)
@@ -1902,6 +2346,31 @@ PLAN_OUTPUT_SCHEMA: Dict[str, Any] = {
                     "nutrition_flags": {"type": "array",
                                          "items": {"type": "string"},
                                          "description": "体检结论：营养达标/热量超标/脂肪超标/蛋白不足/主食不足"},
+                    "fairness": {
+                        "type": "object",
+                        "description": "公平性评分（群体决策时由 attach_fairness 附加）",
+                        "required": ["overall", "per_member"],
+                        "properties": {
+                            "overall": {"type": "number", "minimum": 0, "maximum": 1,
+                                         "description": "整体公平性 = 最低成员分（木桶效应）"},
+                            "per_member": {
+                                "type": "array", "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["name", "score"],
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "score": {"type": "number", "minimum": 0, "maximum": 1},
+                                        "reason": {"type": "string"},
+                                        "taste_sat": {"type": ["number", "null"]},
+                                        "prefer_sat": {"type": "number"},
+                                        "avoid_sat": {"type": "number"},
+                                    },
+                                },
+                            },
+                            "note": {"type": "string"},
+                        },
+                    },
                     "tradeoffs": {"type": "string",
                                    "description": "取舍说明：牺牲了什么、换来了什么"},
                     "price_note": {"type": "string",
@@ -2020,6 +2489,20 @@ def plans_to_doc(
             "tradeoffs": _plan_tradeoffs(p),
             "genui": _plan_genui(p),
         }
+        if p.get("fairness"):
+            fr = p["fairness"]
+            doc_plan["fairness"] = {
+                "overall": fr["overall"],
+                "per_member": [
+                    {"name": pm["name"], "score": pm["score"],
+                     **({"reason": pm["reason"]} if pm.get("reason") else {}),
+                     **({"taste_sat": pm.get("taste_sat")} if pm.get("taste_sat") is not None else {}),
+                     "prefer_sat": pm.get("prefer_sat", 1.0),
+                     "avoid_sat": pm.get("avoid_sat", 1.0)}
+                    for pm in fr["per_member"]
+                ],
+                "note": fr.get("note"),
+            }
         if not price_verified:
             # 契约：price_note 可选；仅在未核价时携带提示
             doc_plan["price_note"] = "价格为估算，未核价"
@@ -2410,6 +2893,81 @@ def _selftest() -> None:
     assert _kept12, "默认口味过滤后候选为空"
     assert any("main" in (m.get("tags") or []) for m in _kept12)
 
+    # 13) 群体决策公平性
+    #     a) 硬约束交集（禁忌并集排除）：A 不吃辣 + B 不吃牛肉 → 同时排除
+    agg = aggregate_preferences([
+        "小李：不吃辣",
+        "小王：不吃牛肉",
+    ])
+    assert set(agg["hard"]["exclude_tags"]) >= {"spicy"}, agg["hard"]
+    assert "beef" in agg["hard"]["exclude_ingredients"], agg["hard"]
+    assert agg["people_count"] == 2 and not agg["needs_negotiation"]
+
+    #     b) 截尾均值：很辣4/中辣2/不辣0/不辣0 → 去两端 [0,2] → 1.0，不判冲突
+    agg2 = aggregate_preferences([
+        {"name": "A", "taste": {"spicy": 4}},
+        {"name": "B", "taste": {"spicy": 2}},
+        {"name": "C", "taste": {"spicy": 0}},
+        {"name": "D", "taste": {"spicy": 0}},
+    ])
+    assert agg2["taste"]["spicy"] == 1.0, agg2["taste"]
+    assert not agg2["needs_negotiation"], agg2["conflicts"]
+
+    #     c) 严重冲突：一半要辣(4,5)一半不要(0,0) → 需协商 + 两套备选约束
+    agg3 = aggregate_preferences([
+        "小李：无辣不欢",
+        "小王：很辣",
+        "小张：不吃辣",
+        "小陈：不要辣",
+    ])
+    assert agg3["needs_negotiation"], agg3["conflicts"]
+    cf = agg3["conflicts"][0]
+    assert cf["dimension"] == "spicy" and cf["gap"] >= 3
+    assert set(cf["camp_a"]["members"]) == {"小李", "小王"}
+    assert set(cf["camp_b"]["members"]) == {"小张", "小陈"}
+    assert len(agg3["alternatives"]) == 2
+    ca, cb = agg3["alternatives"]
+    assert "spicy" not in ca["constraints"]["hard"]["exclude_tags"]       # A：不排除辣
+    assert "spicy" in ca["constraints"]["soft"]["prefer_tags"]
+    assert "spicy" in cb["constraints"]["hard"]["exclude_tags"]           # B：硬排除辣
+    assert ca["compromise"] and cb["compromise"]                          # 妥协点必须说明
+
+    #     d) 公平性评分：木桶效应（整体=最低分）；含辣方案对不吃辣成员扣口味分
+    _grp = optimize_group_plans(
+        _normalize_menu(SAMPLE_MENU), SAMPLE_COUPONS,
+        [{"name": "甲", "taste": {"spicy": 0}, "avoid_tags": ["spicy"]},
+         {"name": "乙", "taste": {"spicy": 5}}])
+    # 无硬排除辣 → 优化器可能选辣品 → 冲突检测命中（乙=5 要辣 vs 甲=0）→ 双方案
+    assert _grp["needs_negotiation"]
+    plans_b = next(ps for ps in _grp["plan_sets"] if "B" in ps["label"])["plans"]
+    fr_b = plans_b[0]["fairness"]
+    assert 0 <= fr_b["overall"] <= 1
+    assert fr_b["overall"] == min(pm["score"] for pm in fr_b["per_member"])
+    scores_b = {pm["name"]: pm["score"] for pm in fr_b["per_member"]}
+    assert scores_b["甲"] > scores_b["乙"]  # 无辣方案：不吃辣的甲更满足
+
+    #     e) 硬约束违反 → 该成员 0 分（构造一个违反个人禁忌的方案直接评）
+    _fake_plan = {"items": [{"name": "麦辣鸡腿汉堡", "tags": ["spicy", "main"],
+                              "quantity": 1, "unit_price_cny": 22.5, "subtotal_cny": 22.5}],
+                   "people_count": 1}
+    fr_v = fairness_score(_fake_plan, aggregate_preferences(["小李：不吃辣"]))
+    assert fr_v["per_member"][0]["score"] == 0.0
+    assert "硬约束被违反" in fr_v["per_member"][0]["reason"]
+
+    #     f) 群体结果走契约文档仍校验通过（fairness 为可选字段）
+    _doc13 = plans_to_doc(_grp["plan_sets"][0]["plans"], scene="群体冲突演示", people_count=2)
+    assert not validate_plans_doc(_doc13), validate_plans_doc(_doc13)
+    assert "fairness" in _doc13["plans"][0]
+
+    #     g) 截尾均值细节：n<4 不截尾（[0,5] → 2.5）
+    agg4 = aggregate_preferences([
+        {"name": "A", "taste": {"spicy": 0}},
+        {"name": "B", "taste": {"spicy": 5}},
+    ])
+    assert agg4["taste"]["spicy"] == 2.5, agg4["taste"]
+    # 两人 0 vs 5 也构成严重对立（双方阵营各 1 人 ≥ ⌈2/3⌉=1，gap=5）
+    assert agg4["needs_negotiation"]
+
     print("[selftest] 全部断言通过 ✅")
 
 
@@ -2532,6 +3090,27 @@ def main(argv: Sequence[str]) -> int:
             extra = f"，默认={a['default']}" if a["missing"] and a["default"] else ""
             ask = "，需追问" if a["ask"] else ""
             print(f"  {key:<13} {state}{extra}{ask}")
+        return 0
+
+    if argv and argv[0] == "--group":
+        # 群体决策演示：--group '[...members...]'（JSON，元素为 dict 或自然语言字符串）
+        # 不传参数则跑内置「一半要辣一半不要辣」冲突场景
+        demo_members = [
+            "小李：无辣不欢，要辣",
+            "小王：很辣，无辣不欢",
+            "小张：不吃辣，怕辣",
+            "小陈：不要辣，清淡",
+        ]
+        if len(argv) > 1 and not argv[1].startswith("-"):
+            try:
+                members = json.loads(argv[1])
+            except json.JSONDecodeError:
+                print("⚠️ --group 参数应为 JSON 数组", file=sys.stderr)
+                return 1
+        else:
+            members = demo_members
+        result = optimize_group_plans(_normalize_menu(SAMPLE_MENU), SAMPLE_COUPONS, members)
+        print(render_group_result(result))
         return 0
 
     if argv and argv[0] == "--dump-schema":
