@@ -6,8 +6,9 @@
 --------
 1. ``parse_constraints``  把用户的自然语言解析成结构化约束（硬约束 + 软偏好 + 画像）。
 2. ``filter_menu``        按硬约束过滤菜单，把解空间先压下来（一票否决）。
-3. ``optimize_plans``     多目标寻优：动态规划求最省钱方案，加权评分求最健康 / 最快方案，
-                          帕累托剪枝后输出 Top-3。
+3. ``optimize_plans``     多目标寻优（默认 NSGA-II）：四目标帕累托前沿（价格/热量/油炸/蛋白）
+                          上取「最省钱 / 最健康 / 最快」三个极值点；加权评分路径保留为回退
+                          （method="weighted"）。另有 ``optimize_calorie_budget`` 按热量预算配餐。
 4. ``verify_price``       调用 MCP 的 ``calculate-price`` 做官方核价（单位：分 → 元）。
 5. ``compare_channels``   渠道比价：同一篮子在 到店自取 / 麦乐送 / 得来速 三个**内部渠道**的
                           「到手成本」对比（商品 + 运费 + 打包费 + 餐具费 − 优惠）。
@@ -41,9 +42,11 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -1697,14 +1700,14 @@ def _count_mains(picked: Iterable[int], items: List[Dict[str, Any]]) -> int:
     return sum(1 for i in picked if "main" in (items[i].get("tags") or []))
 
 
-def optimize_plans(
+def _optimize_plans_weighted(
     menu: List[Dict[str, Any]],
     coupons: List[Dict[str, Any]],
     constraints: Dict[str, Any],
     weights: Optional[Dict[str, float]] = None,
     promotions: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """多目标寻优，返回 Top-3 方案。
+    """**加权评分路径**（原 optimize_plans 实现，保留作回退与对照）。
 
     * **最省钱**：动态规划（无界背包）+ 券组合 DP + 帕累托剪枝
     * **最健康**：按人均热量 / 脂肪 / 蛋白达标率加权
@@ -1713,8 +1716,8 @@ def optimize_plans(
     ``promotions``：来自 ``fetch_group_meal_promotions()`` 的团餐促销规则（beType=6 专用），
     会与 ``coupons`` 合并后一并参与券组合优化。
 
-    **预算硬约束（Task 1）**：同时支持总预算上限和每人预算上限。
-    若最优方案超出预算，自动生成降级方案（减配/分步下单，Task 3），
+    **预算硬约束**：同时支持总预算上限和每人预算上限。
+    若最优方案超出预算，自动生成降级方案（减配/分步下单），
     并明确告知预算差距。
     """
     items = _normalize_menu(menu)
@@ -1814,6 +1817,169 @@ def optimize_plans(
     ranked = sorted(feasible or dedup.values(),
                     key=lambda x: (-x["score"], x["final_price_cny"]))
     return ranked[:3]
+
+
+def optimize_plans(
+    menu: List[Dict[str, Any]],
+    coupons: List[Dict[str, Any]],
+    constraints: Dict[str, Any],
+    weights: Optional[Dict[str, float]] = None,
+    promotions: Optional[List[Dict[str, Any]]] = None,
+    method: str = "nsga2",
+) -> List[Dict[str, Any]]:
+    """**多目标寻优入口**（默认 NSGA-II，批 2 算法升级）。
+
+    * ``method="nsga2"``（默认）：NSGA-II 在四目标空间
+      （价格↓ / 人均热量↓ / 油炸份数↓ / 人均蛋白↑）中演化，
+      从**帕累托前沿**取三个极值点标注为「最省钱 / 最健康 / 最快」；
+      前沿退化（极值重合）时按拥挤距离补齐，仍不足时回退加权路径；
+    * ``method="weighted"``：原加权评分路径（对照与回退用）。
+
+    预算硬约束 / 主食底线 / 降级方案行为与加权路径完全一致；
+    每个方案附加 ``nsga2`` 字段（front / objectives）供透明展示。
+    """
+    if method == "weighted":
+        return _optimize_plans_weighted(menu, coupons, constraints,
+                                        weights, promotions)
+
+    items = _normalize_menu(menu)
+    if not items:
+        return []
+    all_coupons = list(coupons or []) + list(promotions or [])
+    w = weights or constraints.get("weights") or {
+        "cheap": 0.34, "healthy": 0.33, "speed": 0.18, "pref": 0.15,
+    }
+
+    people = max(int(constraints.get("people_count") or 1), 1)
+    targets = constraints.get("targets") or {}
+    kcal_per = targets.get("max_calories_kcal") or KCAL_PER_PERSON_MAX
+    kcal_min = KCAL_PER_PERSON_MIN * people
+    kcal_max = float(min(kcal_per, KCAL_PER_PERSON_MAX)) * people
+
+    baskets = _nsga2_evolve(items, people, kcal_min, kcal_max)
+    if not baskets:   # 无主食等极端情况 → 加权路径兜底（其内部有降级逻辑）
+        return _optimize_plans_weighted(menu, coupons, constraints,
+                                        weights, promotions)
+
+    plans = [_basket_to_plan(b, items, all_coupons, constraints, "候选")
+             for b in baskets]
+
+    # --- 预算硬约束（与加权路径同一套规则） -------------------------------
+    budget = constraints.get("budget") or {}
+    effective_max_cny: Optional[float] = None
+    if budget.get("total_cny") is not None:
+        effective_max_cny = float(budget["total_cny"])
+    if budget.get("per_person_cny") is not None:
+        pp_total = float(budget["per_person_cny"]) * people
+        if effective_max_cny is None or pp_total < effective_max_cny:
+            effective_max_cny = pp_total
+    if effective_max_cny is not None:
+        within = [p for p in plans
+                  if p["final_price_cny"] <= effective_max_cny + 0.01]
+        if within:
+            plans = within
+        else:
+            return _generate_degraded_plans(
+                items, people, effective_max_cny, all_coupons, constraints)
+
+    # --- 主食底线（拼单不可妥协） -----------------------------------------
+    feasible = [p for p in plans if p.get("mains", 0) >= people]
+    if not feasible:
+        return _optimize_plans_weighted(menu, coupons, constraints,
+                                        weights, promotions)
+    plans = feasible
+
+    # --- 热量硬上限（targets.max_calories_kcal）---------------------------
+    #     可行解存在时只保留达标者；全部超限（主餐热量天然超预算）时保留并
+    #     由 nutrition_flags 如实标注「人均热量超标」——不静默放宽也不断路。
+    kcal_ok = [p for p in plans
+               if p["nutrition"]["total_kcal"] <= kcal_max + 1e-6]
+    if kcal_ok:
+        plans = kcal_ok
+
+    # --- 券后价口径重新非支配分层，取第一前沿 -----------------------------
+    objs = [_plan_objectives(p) for p in plans]
+    fronts = _fast_non_dominated_sort(objs)
+    front1 = [plans[i] for i in fronts[0]]
+
+    dedup: Dict[tuple, Dict[str, Any]] = {}
+    for p in front1:
+        k = _basket_key(p)
+        if k not in dedup:
+            dedup[k] = p
+    cands = list(dedup.values())
+    if not cands:
+        return _optimize_plans_weighted(menu, coupons, constraints,
+                                        weights, promotions)
+    c_objs = [_plan_objectives(p) for p in cands]
+
+    # --- 三个极值点：min 价 / max 蛋白 / min 油炸 -------------------------
+    i_cheap = min(range(len(cands)), key=lambda i: (c_objs[i][0], c_objs[i][1]))
+    i_health = min(range(len(cands)), key=lambda i: (c_objs[i][3], c_objs[i][0]))
+    i_fast = min(range(len(cands)), key=lambda i: (c_objs[i][2], c_objs[i][0]))
+
+    result: List[Dict[str, Any]] = []
+    used: set = set()
+    for label, idx in (("最省钱", i_cheap), ("最健康", i_health), ("最快", i_fast)):
+        k = _basket_key(cands[idx])
+        if k not in used:
+            cands[idx]["label"] = label
+            result.append(cands[idx])
+            used.add(k)
+
+    # --- 极值重合 → 按拥挤距离补齐不同解，标签取其最擅长的目标 -------------
+    if len(result) < 3:
+        dist = _crowding_distance(list(range(len(cands))), c_objs)
+        order = sorted(range(len(cands)), key=lambda i: -dist[i])
+        for i in order:
+            if len(result) >= 3:
+                break
+            k = _basket_key(cands[i])
+            if k in used:
+                continue
+            have = {r["label"] for r in result}
+            remaining = [lb for lb in ("最省钱", "最健康", "最快") if lb not in have]
+            if not remaining:
+                break
+            o = c_objs[i]
+            scores = {"最省钱": -o[0], "最健康": o[3], "最快": -o[2]}
+            label = max(remaining, key=lambda lb: scores[lb])
+            cands[i]["label"] = label
+            result.append(cands[i])
+            used.add(k)
+
+    # --- 前沿退化仍不足 3 → 加权路径补齐缺失标签（保证 Top-3 语义） --------
+    if len(result) < 3:
+        weighted = _optimize_plans_weighted(menu, coupons, constraints,
+                                            weights, promotions)
+        have = {r["label"] for r in result}
+        for p in weighted:
+            if len(result) >= 3:
+                break
+            if (p.get("label") in ("最省钱", "最健康", "最快")
+                    and p["label"] not in have
+                    and _basket_key(p) not in used):
+                result.append(p)
+                used.add(_basket_key(p))
+                have.add(p["label"])
+
+    # --- 附加透明信息（front / objectives）与兼容 score --------------------
+    for p in result:
+        o = _plan_objectives(p)
+        p.setdefault("score", _score(p, constraints, w))
+        p["nsga2"] = {
+            "front": 1,
+            "objectives": {
+                "final_price_cny": o[0],
+                "per_capita_kcal": o[1],
+                "fried_count": o[2],
+                "per_capita_protein_g": -o[3],
+            },
+        }
+    label_order = ("最省钱", "最健康", "最快")
+    result.sort(key=lambda p: label_order.index(p["label"])
+                if p["label"] in label_order else 9)
+    return result[:3]
 
 
 def optimize_cost_curve(
@@ -2080,6 +2246,301 @@ def optimize_calorie_budget(
 
 
 # ---------------------------------------------------------------------------
+# 4.3 NSGA-II 多目标优化（批 2 算法升级）
+#
+#     替换原「加权评分」排序：以**帕累托支配关系**为主、拥挤距离为辅，
+#     直接在四目标空间（价格↓ / 人均热量↓ / 油炸份数↓ / 人均蛋白↑）中演化，
+#     产出**多样化**的帕累托最优解集，再从前沿上取三个极值点标注为
+#     「最省钱 / 最健康 / 最快」——三套方案的取舍关系由前沿结构自然给出，
+#     不再依赖主观权重。
+#
+#     * 演化期目标用「未扣券成本」快速评估；最终前沿用 _basket_to_plan
+#       （含券组合 DP）重建后**重新分层**，保证标签对应的极值点与券后价一致；
+#     * 个体可行性修复：主食份数 ≥ 人数（硬底线）、人均热量上限、单位上限；
+#     * 固定随机种子（NSGA2_SEED），结果可复现；
+#     * 原加权路径保留为 method="weighted"（回退与对照用）。
+# ---------------------------------------------------------------------------
+
+#: NSGA-II 参数（经验值：样例菜单 <1s，160 品真实菜单 ~2s）
+NSGA2_GENERATIONS = 20
+NSGA2_POP_SIZE = 40
+NSGA2_SEED = 20261010
+#: 单位上限：单人 ≤6 份、多人 ≤ 2×人数（防爆篮子）
+NSGA2_UNITS_CAP = lambda people: max(6, 2 * people)  # noqa: E731
+
+
+def _plan_objectives(plan: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    """方案四目标向量（**全部最小化**）：价格 / 人均热量 / 油炸份数 / 负人均蛋白。"""
+    n = plan.get("nutrition") or {}
+    fried = sum(1 for ln in plan.get("items") or []
+                if "fried" in (ln.get("tags") or []))
+    return (float(plan.get("final_price_cny") or 0.0),
+            float(n.get("per_capita_kcal") or 0.0),
+            float(fried),
+            -float(n.get("per_capita_protein_g") or 0.0))
+
+
+def _dominates(oa: Sequence[float], ob: Sequence[float]) -> bool:
+    """帕累托支配：oa 在所有目标上 ≤ ob，且至少一个严格 <（浮点容差 1e-9）。"""
+    return (all(a <= b + 1e-9 for a, b in zip(oa, ob))
+            and any(a < b - 1e-9 for a, b in zip(oa, ob)))
+
+
+def _fast_non_dominated_sort(objs: List[Sequence[float]]) -> List[List[int]]:
+    """NSGA-II 快速非支配排序：返回按层排列的索引分层 [[F1], [F2], ...]。"""
+    n = len(objs)
+    dominated_by: List[List[int]] = [[] for _ in range(n)]
+    dom_count = [0] * n
+    fronts: List[List[int]] = [[]]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _dominates(objs[i], objs[j]):
+                dominated_by[i].append(j)
+                dom_count[j] += 1
+            elif _dominates(objs[j], objs[i]):
+                dominated_by[j].append(i)
+                dom_count[i] += 1
+    for i in range(n):
+        if dom_count[i] == 0:
+            fronts[0].append(i)
+    k = 0
+    while fronts[k]:
+        nxt: List[int] = []
+        for i in fronts[k]:
+            for j in dominated_by[i]:
+                dom_count[j] -= 1
+                if dom_count[j] == 0:
+                    nxt.append(j)
+        k += 1
+        fronts.append(nxt)
+    return [f for f in fronts if f]
+
+
+def _crowding_distance(front: List[int],
+                       objs: List[Sequence[float]]) -> Dict[int, float]:
+    """NSGA-II 拥挤距离：边界点 inf，中间点为相邻解在各目标上的归一化间距之和。"""
+    dist = {i: 0.0 for i in front}
+    if len(front) <= 2:
+        return {i: float("inf") for i in front}
+    for obj_i in range(len(objs[front[0]])):
+        ordered = sorted(front, key=lambda i: objs[i][obj_i])
+        dist[ordered[0]] = float("inf")
+        dist[ordered[-1]] = float("inf")
+        span = objs[ordered[-1]][obj_i] - objs[ordered[0]][obj_i]
+        if span <= 1e-12:
+            continue
+        for a, b, c in zip(ordered, ordered[1:], ordered[2:]):
+            dist[b] = dist[b] + (objs[c][obj_i] - objs[a][obj_i]) / span
+    return dist
+
+
+def _basket_cost_cents(basket: List[int],
+                       items: List[Dict[str, Any]]) -> int:
+    """篮子未扣券成本（分）——演化期快速评估用。"""
+    return sum(items[i]["price"] for i in basket)
+
+
+def _repair_individual(basket: List[int], items: List[Dict[str, Any]],
+                       people: int, kcal_max: float) -> List[int]:
+    """可行性修复：主食 ≥ 人数 → 单位 ≤ 上限 → 热量 ≤ 上限（顺序执行）。
+
+    热量超限时：先删非主食；再删多余主食；只剩「每人 1 份主食」仍超时，
+    把热量最高的主食换成热量更低的主食（主食底线不可破，只能换）。
+    """
+    b = list(basket)
+    mains_idx = [i for i in range(len(items)) if "main" in items[i]["tags"]]
+    if not mains_idx:
+        return b
+    cheapest_main = min(mains_idx, key=lambda i: items[i]["price"])
+    while _count_mains(b, items) < people:
+        b.append(cheapest_main)
+    units_cap = NSGA2_UNITS_CAP(people)
+    while len(b) > units_cap:
+        non_mains = [i for i in b if "main" not in items[i]["tags"]]
+        if non_mains:
+            b.remove(max(non_mains, key=lambda i: items[i]["kcal"]))
+        else:
+            b.pop()
+    while _basket_kcal(b, items) > kcal_max:
+        non_mains = [i for i in b if "main" not in items[i]["tags"]]
+        if non_mains:
+            b.remove(max(non_mains, key=lambda i: items[i]["kcal"]))
+            continue
+        if len(b) > people:
+            b.pop()                       # 多余的主食先删
+            continue
+        # 只剩每人 1 份主食仍超 → 换成热量更低的主食
+        mains_in = [i for i in b if "main" in items[i]["tags"]]
+        worst = max(mains_in, key=lambda i: items[i]["kcal"])
+        best = min(mains_idx, key=lambda i: items[i]["kcal"])
+        if items[best]["kcal"] < items[worst]["kcal"]:
+            b[b.index(worst)] = best
+        else:
+            break    # 已是最低热量主食：约束本身不可满足，交给支配关系与 flags
+    return b
+
+
+def _random_individual(items: List[Dict[str, Any]], people: int,
+                       kcal_min: float, kcal_max: float,
+                       rng: random.Random) -> List[int]:
+    """随机可行个体：每人 1 份随机主食 + 随机补充至热量下限，再修复。"""
+    mains_idx = [i for i in range(len(items)) if "main" in items[i]["tags"]]
+    if not mains_idx:
+        return []
+    basket = [rng.choice(mains_idx) for _ in range(people)]
+    guard = 0
+    while _basket_kcal(basket, items) < kcal_min and guard < 50:
+        basket.append(rng.randrange(len(items)))
+        guard += 1
+    return _repair_individual(basket, items, people, kcal_max)
+
+
+def _nsga2_seed_population(items: List[Dict[str, Any]], people: int,
+                           kcal_min: float, kcal_max: float,
+                           pop_size: int, rng: random.Random) -> List[List[int]]:
+    """初始种群：DP 最省钱解 + 成本-热量曲线抽样 + 贪心健康/快 + 随机个体。"""
+    seeds: List[List[int]] = []
+    try:
+        for sol in _dp_min_cost(items, people, kcal_min, kcal_max)[:8]:
+            seeds.append(list(sol["indices"]))
+    except Exception:  # noqa: BLE001 —— DP 对极端区间可能无解，不影响 GA
+        pass
+    try:
+        for pt in price_kcal_candidates(items, people, kcal_min, kcal_max)[:8]:
+            seeds.append(list(pt["indices"]))
+    except Exception:  # noqa: BLE001
+        pass
+    # 贪心：最健康（蛋白密度优先）/ 最快（非油炸优先），与加权路径同思路
+    idx_of = {id(it): i for i, it in enumerate(items)}
+    for keyfn in (lambda x: (-(x["protein"] / max(x["kcal"], 1)), x["fat"], x["price"]),
+                  lambda x: (bool("fried" in x["tags"]), x["price"])):
+        ordered = sorted(items,
+                         key=lambda x: ((0 if "main" in x["tags"] else 1),) + keyfn(x))
+        pick: List[int] = []
+        acc = 0.0
+        for it in ordered:
+            if acc >= kcal_min and _count_mains(pick, items) >= people:
+                break
+            pick.append(idx_of[id(it)])
+            acc += it["kcal"]
+        if pick:
+            seeds.append(pick)
+    # 去重 + 修复
+    seen: set = set()
+    unique: List[List[int]] = []
+    for b in seeds:
+        rb = _repair_individual(b, items, people, kcal_max)
+        key = tuple(sorted(rb))
+        if key not in seen and rb:
+            seen.add(key)
+            unique.append(rb)
+    # 随机个体补齐
+    guard = 0
+    while len(unique) < pop_size and guard < pop_size * 10:
+        rb = _random_individual(items, people, kcal_min, kcal_max, rng)
+        guard += 1
+        if not rb:
+            break
+        key = tuple(sorted(rb))
+        if key not in seen:
+            seen.add(key)
+            unique.append(rb)
+    return unique[:pop_size]
+
+
+def _nsga2_evolve(items: List[Dict[str, Any]], people: int,
+                  kcal_min: float, kcal_max: float,
+                  generations: int = NSGA2_GENERATIONS,
+                  pop_size: int = NSGA2_POP_SIZE,
+                  seed: int = NSGA2_SEED) -> List[List[int]]:
+    """NSGA-II 主循环：锦标赛选择 + 均匀交叉 + 变异 + 环境选择（rank + 拥挤距离）。"""
+    rng = random.Random(seed)
+    pop = _nsga2_seed_population(items, people, kcal_min, kcal_max, pop_size, rng)
+    if not pop:
+        return []
+
+    def raw_objs(b: List[int]) -> Tuple[float, float, float, float]:
+        return (_basket_cost_cents(b, items) / 100.0,
+                _basket_kcal(b, items) / max(people, 1),
+                float(sum(1 for i in b if "fried" in items[i]["tags"])),
+                -sum(items[i]["protein"] for i in b) / max(people, 1))
+
+    def select(population: List[List[int]],
+               rank: Dict[int, int],
+               crowd: Dict[int, float]) -> List[int]:
+        """二元锦标赛：rank 小者胜，同 rank 拥挤距离大者胜。"""
+        a, b = rng.randrange(len(population)), rng.randrange(len(population))
+        if rank.get(a, 99) != rank.get(b, 99):
+            return population[a if rank.get(a, 99) < rank.get(b, 99) else b]
+        return population[a if crowd.get(a, 0.0) >= crowd.get(b, 0.0) else b]
+
+    for _ in range(max(generations, 1)):
+        objs = [raw_objs(b) for b in pop]
+        fronts = _fast_non_dominated_sort(objs)
+        rank: Dict[int, int] = {}
+        crowd: Dict[int, float] = {}
+        for r, front in enumerate(fronts):
+            for i in front:
+                rank[i] = r
+            for i, d in _crowding_distance(front, objs).items():
+                crowd[i] = d
+        # 产生子代
+        offspring: List[List[int]] = []
+        while len(offspring) < len(pop):
+            p1 = select(pop, rank, crowd)
+            p2 = select(pop, rank, crowd)
+            merged = list(p1) + list(p2)
+            rng.shuffle(merged)
+            child = merged[:max(len(p1), len(p2))]
+            child = _repair_individual(child, items, people, kcal_max)
+            # 变异（35% 替换 / 25% 添加 / 40% 删除非主食）
+            r = rng.random()
+            if r < 0.35 and child:
+                child[rng.randrange(len(child))] = rng.randrange(len(items))
+            elif r < 0.60:
+                child = child + [rng.randrange(len(items))]
+            else:
+                non_mains = [k for k, v in enumerate(child)
+                             if "main" not in items[v]["tags"]]
+                if non_mains:
+                    del child[rng.choice(non_mains)]
+                elif len(child) > people:
+                    child.pop()
+            child = _repair_individual(child, items, people, kcal_max)
+            if child:
+                offspring.append(child)
+        # 环境选择：父代+子代合并，按 (rank, 拥挤距离) 截断
+        combined = pop + offspring
+        c_objs = [raw_objs(b) for b in combined]
+        c_fronts = _fast_non_dominated_sort(c_objs)
+        new_pop: List[List[int]] = []
+        for front in c_fronts:
+            if len(new_pop) + len(front) <= len(pop):
+                new_pop.extend(combined[i] for i in front)
+            else:
+                dist = _crowding_distance(front, c_objs)
+                rest = sorted(front, key=lambda i: -dist[i])
+                new_pop.extend(combined[i] for i in rest[: len(pop) - len(new_pop)])
+                break
+        pop = new_pop if new_pop else pop
+    # 去重返回
+    seen: set = set()
+    out: List[List[int]] = []
+    for b in pop:
+        key = tuple(sorted(b))
+        if key not in seen:
+            seen.add(key)
+            out.append(b)
+    return out
+
+
+def _basket_key(plan: Dict[str, Any]) -> tuple:
+    """方案的内容键（用于去重，与加权路径同口径）。"""
+    return tuple(sorted((ln["productCode"] or ln["name"], ln["quantity"])
+                        for ln in plan["items"]))
+
+
+# ---------------------------------------------------------------------------
 # 4.5 健壮性基础设施：脱敏、JSONL 日志、指数退避重试、超时、幂等键
 #
 #     * 日志：每次 MCP 调用记录 工具名/耗时/状态(成功|失败|降级)/重试次数，
@@ -2171,6 +2632,144 @@ def _is_retryable_error(exc: Exception) -> bool:
     return False
 
 
+# --- ReflectCache：参数级 MCP 结果缓存（批 2 算法升级） --------------------
+#
+#     精确匹配「工具名 + 参数」复用只读工具的响应，减少 MCP 重复调用：
+#     * 键 = sha256(工具名 + 规范化参数 JSON)——参数级**精确匹配**，不做模糊匹配、
+#       不做语义归并（{"a":1} 与 {"a":1.0}、{"a":"1"} 视为不同参数）；
+#     * 只缓存**只读工具**（CACHEABLE_TOOLS 白名单），写操作一律穿透；
+#     * 只缓存**成功响应**（isError=false 且 structuredContent.success ≠ false）；
+#     * `now-time-info` 永不缓存（时间敏感）；
+#     * TTL 默认 300s（`MCD_CACHE_TTL_S` 可调）；`MCD_REFLECT_CACHE=0` 整体关闭；
+#     * 这也是规则 5「429 优先读本地缓存」的落地实现——限流时同参数调用直接命中缓存。
+# ---------------------------------------------------------------------------
+
+#: 默认缓存 TTL（秒）：菜单/券/营养数据的变化频率远低于该窗口
+REFLECT_CACHE_TTL_S = 300.0
+
+#: 只读工具白名单（可缓存）；写操作（create-order / cancel-order / mall-create-order /
+#: party-order-create / draw-lottery / auto-bind-coupons / delivery-create-address）一律不缓存
+CACHEABLE_TOOLS = frozenset({
+    "query-nearby-stores", "delivery-query-stores", "delivery-query-addresses",
+    "query-meals", "query-meal-detail", "calculate-price", "list-nutrition-foods",
+    "available-coupons", "query-my-coupons", "query-store-coupons", "query-promotions",
+    "query-meal-assistance", "query-survey-coupon", "order-list", "query-order",
+    "query-my-account", "mall-points-products", "mall-product-detail",
+    "mall-order-list", "mall-order-detail", "query-lottery-info", "query-my-prizes",
+    "campaign-calendar", "query-party-city", "query-party-store",
+    "query-party-store-date", "query-party-store-session",
+})
+
+#: 时间敏感工具：永不缓存
+NEVER_CACHE_TOOLS = frozenset({"now-time-info"})
+
+
+def _reflect_cache_enabled() -> bool:
+    """环境开关：MCD_REFLECT_CACHE=0 关闭缓存（默认开启）。"""
+    return os.environ.get("MCD_REFLECT_CACHE", "1") != "0"
+
+
+def _reflect_cache_ttl() -> float:
+    """TTL 读取：MCD_CACHE_TTL_S（秒），非法值回退默认。"""
+    raw = os.environ.get("MCD_CACHE_TTL_S")
+    try:
+        v = float(raw) if raw is not None else REFLECT_CACHE_TTL_S
+        return v if v >= 0 else REFLECT_CACHE_TTL_S
+    except (TypeError, ValueError):
+        return REFLECT_CACHE_TTL_S
+
+
+class ReflectCache:
+    """参数级 MCP 响应缓存。
+
+    键 = ``sha256(tool + "\\x00" + canonical_json(arguments))``；
+    值 = ``{"resp", "ts", "tool"}``。命中条件：键存在 **且** 未过 TTL。
+    统计：hits / misses / entries / hit_rate（供输出层透明展示）。
+    """
+
+    def __init__(self, ttl_s: Optional[float] = None, max_entries: int = 256):
+        self._ttl = ttl_s          # None → 每次读取环境变量（运行期可调）
+        self.max_entries = max_entries
+        self._store: Dict[str, Dict[str, Any]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def make_key(tool: str, arguments: Dict[str, Any]) -> str:
+        """参数级精确键：工具名 + 规范化 JSON（键排序、无空白、UTF-8）。"""
+        canon = json.dumps(arguments or {}, ensure_ascii=False,
+                           sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(f"{tool}\x00{canon}".encode("utf-8")).hexdigest()
+
+    def _ttl_now(self) -> Tuple[float, float]:
+        return (self._ttl if self._ttl is not None else _reflect_cache_ttl(),
+                time.time())
+
+    def lookup(self, tool: str, arguments: Dict[str, Any],
+               ) -> Optional[Dict[str, Any]]:
+        """命中返回响应的深拷贝（调用方可安全修改），未命中/过期返回 None。"""
+        key = self.make_key(tool, arguments)
+        ent = self._store.get(key)
+        ttl, now = self._ttl_now()
+        if ent is None or now - ent["ts"] > ttl:
+            if ent is not None and now - ent["ts"] > ttl:
+                del self._store[key]          # 惰性清理过期项
+            self.misses += 1
+            return None
+        self.hits += 1
+        return copy.deepcopy(ent["resp"])
+
+    def store(self, tool: str, arguments: Dict[str, Any],
+              resp: Dict[str, Any]) -> None:
+        """写入缓存；超过容量时按最旧淘汰（FIFO by ts）。"""
+        key = self.make_key(tool, arguments)
+        if len(self._store) >= self.max_entries and key not in self._store:
+            oldest = min(self._store, key=lambda k: self._store[k]["ts"])
+            del self._store[oldest]
+        self._store[key] = {"resp": copy.deepcopy(resp), "ts": time.time(),
+                            "tool": tool}
+
+    def stats(self) -> Dict[str, Any]:
+        total = self.hits + self.misses
+        return {"hits": self.hits, "misses": self.misses,
+                "entries": len(self._store),
+                "hit_rate": round(self.hits / total, 4) if total else 0.0}
+
+    def clear(self) -> None:
+        self._store.clear()
+        self.hits = 0
+        self.misses = 0
+
+
+#: 进程级单例（所有 _mcp_call 调用方自动共享）
+REFLECT_CACHE = ReflectCache()
+
+
+def _reflect_cache_lookup(tool: str, arguments: Dict[str, Any],
+                          ) -> Optional[Dict[str, Any]]:
+    """统一查询入口：非白名单 / 环境关闭 / 永不缓存工具 直接返回 None。"""
+    if (tool not in CACHEABLE_TOOLS or tool in NEVER_CACHE_TOOLS
+            or not _reflect_cache_enabled()):
+        return None
+    return REFLECT_CACHE.lookup(tool, arguments)
+
+
+def _reflect_cache_store(tool: str, arguments: Dict[str, Any],
+                         resp: Dict[str, Any]) -> None:
+    """统一写入入口：仅白名单工具且业务成功（success ≠ false 且 isError ≠ true）。"""
+    if tool not in CACHEABLE_TOOLS or tool in NEVER_CACHE_TOOLS:
+        return
+    if not _reflect_cache_enabled():
+        return
+    result = (resp or {}).get("result") or {}
+    if result.get("isError"):
+        return
+    sc = result.get("structuredContent")
+    if isinstance(sc, dict) and sc.get("success") is False:
+        return                      # 业务错误不缓存（重试语义不受影响）
+    REFLECT_CACHE.store(tool, arguments, resp)
+
+
 def _mcp_call_once(tool: str, arguments: Dict[str, Any], token: str,
                    timeout: int) -> Dict[str, Any]:
     """单次 MCP HTTP 调用（无重试），超时抛 TimeoutError。"""
@@ -2220,14 +2819,27 @@ def _mcp_call(tool: str, arguments: Dict[str, Any], token: Optional[str] = None,
               timeout: int = MCP_TIMEOUT_S,
               retries: Optional[int] = None,
               budget_s: float = MCP_TOTAL_BUDGET_S,
-              log: bool = True) -> Dict[str, Any]:
-    """带**指数退避重试 + 超时 + 日志**的 MCP 调用（统一入口）。
+              log: bool = True,
+              use_cache: bool = True) -> Dict[str, Any]:
+    """带**指数退避重试 + 超时 + 日志 + 参数级缓存**的 MCP 调用（统一入口）。
 
     * 重试条件：429 / 网络超时 / 5xx；间隔 1s→2s→4s，最多 3 次；
       每次重试前检查总预算 ``budget_s``，超预算立即放弃。
     * 不重试：401 / 400 / 其他 4xx / 业务错误（success=false，由调用方判读）。
-    * 全程记录 JSONL 日志（工具名/耗时/状态/重试次数，入参脱敏快照）。
+    * ReflectCache（``use_cache=True``）：只读工具按「工具名 + 参数」精确匹配
+      复用近期成功响应——同参数重复调用不再触网（规则 5「429 优先读本地缓存」
+      的落地实现）。写操作与 now-time-info 永不缓存。
+    * 全程记录 JSONL 日志（工具名/耗时/状态(含 cache)/重试次数，入参脱敏快照）。
     """
+    # --- ReflectCache：参数级缓存优先于网络（含重试） -----------------------
+    if use_cache:
+        cached = _reflect_cache_lookup(tool, arguments)
+        if cached is not None:
+            if log:
+                log_mcp_call(tool, 0, "cache", retries=0, arguments=arguments,
+                             detail="ReflectCache 命中（工具名+参数 精确匹配，未触网）")
+            return cached
+
     token = token or os.environ.get("MCD_MCP_TOKEN") or ""
     max_retry = MCP_RETRY_MAX if retries is None else int(retries)
     attempt = 0
@@ -2244,6 +2856,8 @@ def _mcp_call(tool: str, arguments: Dict[str, Any], token: Optional[str] = None,
                 log_mcp_call(tool, int((time.monotonic() - t0) * 1000), "success",
                              retries=attempt - 1, arguments=arguments,
                              trace_id=_tid if isinstance(_tid, str) else None)
+            if use_cache:
+                _reflect_cache_store(tool, arguments, resp)
             return resp
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
@@ -4515,7 +5129,7 @@ def _selftest() -> None:
     globals()["_mcp_call_once"] = _dispatch
     try:
         resp14 = _mcp_call("query-meals", {"storeCode": "1950936"},
-                           retries=3, budget_s=60.0, log=False)
+                           retries=3, budget_s=60.0, log=False, use_cache=False)
         assert (resp14.get("result") or {}).get(
             "structuredContent", {}).get("success") is True
         assert len(attempts14) == 3, f"429 应重试到成功，实际尝试 {len(attempts14)} 次"
@@ -4530,7 +5144,7 @@ def _selftest() -> None:
         _dispatch.fn = _unauthorized  # type: ignore[attr-defined]
         try:
             _mcp_call("query-meals", {"storeCode": "1950936"},
-                      retries=3, budget_s=60.0, log=False)
+                      retries=3, budget_s=60.0, log=False, use_cache=False)
             raise AssertionError("401 应当抛出异常")
         except _ue.HTTPError as e14:
             assert e14.code == 401
@@ -4546,7 +5160,7 @@ def _selftest() -> None:
         _dispatch.fn = _always_500  # type: ignore[attr-defined]
         try:
             _mcp_call("query-meals", {"storeCode": "1950936"},
-                      retries=2, budget_s=60.0, log=False)
+                      retries=2, budget_s=60.0, log=False, use_cache=False)
             raise AssertionError("5xx 重试耗尽应抛异常")
         except _ue.HTTPError as e14b:
             assert e14b.code == 500
@@ -4640,6 +5254,130 @@ def _selftest() -> None:
     cb_plans2 = optimize_calorie_budget(cb_kept2, SAMPLE_COUPONS, cb_hard)
     assert len(cb_plans2) == 1 and cb_plans2[0]["degraded"] is True
     assert "超出预算" in cb_plans2[0]["degrade_reason"]
+
+    # 16) NSGA-II 多目标优化（批 2 算法升级）
+    #     a) 支配关系与分层基础语义
+    assert _dominates((1, 1), (2, 2))
+    assert not _dominates((2, 2), (1, 1))
+    assert not _dominates((1, 2), (2, 1))          # 互不支配
+    _fronts = _fast_non_dominated_sort([(1, 1), (2, 2), (1.5, 1.5), (0, 2)])
+    assert _fronts == [[0, 3], [2], [1]]           # (1,1)与(0,2)互不支配；(2,2)被链式支配
+    _dist = _crowding_distance([0, 1, 2], [(0, 0), (1, 1), (2, 2)])
+    assert _dist[0] == float("inf") and _dist[2] == float("inf")
+    assert abs(_dist[1] - 2.0) < 1e-9              # 两目标各贡献 1.0
+    #     b) 默认路径输出：标签齐全 + 第一前沿 + 互不支配 + 极值方向
+    n_plans = optimize_plans(kept, SAMPLE_COUPONS, c)
+    assert 1 <= len(n_plans) <= 3, len(n_plans)
+    _labels16 = {p["label"] for p in n_plans}
+    assert _labels16 <= {"最省钱", "最健康", "最快"}, _labels16
+    for p in n_plans:
+        assert p["nsga2"]["front"] == 1
+        assert p["mains"] >= 4
+    _objs16 = [_plan_objectives(p) for p in n_plans]
+    for _i16 in range(len(_objs16)):
+        for _j16 in range(len(_objs16)):
+            if _i16 != _j16:
+                assert not _dominates(_objs16[_i16], _objs16[_j16]), "Top 方案必须互不支配"
+    _by16 = {p["label"]: p for p in n_plans}
+    if "最省钱" in _by16:
+        assert _by16["最省钱"]["final_price_cny"] == min(p["final_price_cny"] for p in n_plans)
+    if "最健康" in _by16:
+        assert _by16["最健康"]["nutrition"]["per_capita_protein_g"] == max(
+            p["nutrition"]["per_capita_protein_g"] for p in n_plans)
+    #     c) 确定性：固定种子，两次运行结果完全一致
+    _sig16 = [(p["label"], _basket_key(p)) for p in optimize_plans(kept, SAMPLE_COUPONS, c)]
+    _sig16b = [(p["label"], _basket_key(p)) for p in optimize_plans(kept, SAMPLE_COUPONS, c)]
+    assert _sig16 == _sig16b, "NSGA-II 必须可复现（固定随机种子）"
+    #     d) 加权路径保留可用（method="weighted"）
+    _w16 = optimize_plans(kept, SAMPLE_COUPONS, c, method="weighted")
+    assert _w16 and {p["label"] for p in _w16} <= {"最省钱", "最健康", "最快"}
+    #     e) 显式热量预算作为硬上限（可行解存在时必须全达标）
+    _c16 = parse_constraints("4个人，预算300，每人500大卡以内")
+    _kept16 = filter_menu(_normalize_menu(SAMPLE_MENU), _c16)
+    for p in optimize_plans(_kept16, SAMPLE_COUPONS, _c16):
+        assert p["nutrition"]["per_capita_kcal"] <= 500 + 1e-6, (
+            p["label"], p["nutrition"]["per_capita_kcal"])
+
+    # 17) ReflectCache 参数级缓存（批 2 算法升级）
+    #     a) 键的参数级精确性：参数顺序无关；值/类型不同即不同键；工具不同即不同键
+    _k1 = ReflectCache.make_key("query-meals", {"storeCode": "S1", "orderType": 1})
+    _k2 = ReflectCache.make_key("query-meals", {"orderType": 1, "storeCode": "S1"})
+    _k3 = ReflectCache.make_key("query-meals", {"storeCode": "S1", "orderType": 2})
+    _k4 = ReflectCache.make_key("query-store-coupons", {"storeCode": "S1", "orderType": 1})
+    _k5 = ReflectCache.make_key("query-meals", {"storeCode": "S1", "orderType": 1.0})
+    assert _k1 == _k2, "参数顺序不得影响键（规范化 JSON 键排序）"
+    assert _k1 != _k3 and _k1 != _k4, "参数值不同 / 工具不同 → 不同键"
+    assert _k1 != _k5, "类型不同（1 vs 1.0）视为不同参数（精确匹配语义）"
+
+    #     b) 集成：同参数只触网一次；参数不同再触网；深拷贝防污染
+    _net17: list = []
+
+    def _fake_once17(tool, arguments, token, timeout):
+        _net17.append((tool, json.dumps(arguments, sort_keys=True)))
+        return {"result": {"isError": False, "structuredContent": {
+            "success": True, "code": 200, "data": {"calls": len(_net17)}}}}
+
+    _orig_once17 = globals()["_mcp_call_once"]
+    globals()["_mcp_call_once"] = _fake_once17
+    REFLECT_CACHE.clear()
+    try:
+        _r1 = _mcp_call("query-meals", {"storeCode": "S1", "orderType": 1},
+                        token="t", log=False)
+        _r2 = _mcp_call("query-meals", {"orderType": 1, "storeCode": "S1"},
+                        token="t", log=False)
+        assert len(_net17) == 1, "同参数（含键顺序不同）必须命中缓存不触网"
+        assert _r1 == _r2
+        _mcp_call("query-meals", {"storeCode": "S2", "orderType": 1},
+                  token="t", log=False)
+        assert len(_net17) == 2, "参数不同必须重新触网"
+        _st17 = REFLECT_CACHE.stats()
+        assert _st17["hits"] == 1 and _st17["misses"] == 2, _st17
+        # 深拷贝：调用方修改响应不得污染缓存
+        _r1["result"]["structuredContent"]["data"]["calls"] = 999
+        _r5 = _mcp_call("query-meals", {"storeCode": "S1", "orderType": 1},
+                        token="t", log=False)
+        assert _r5["result"]["structuredContent"]["data"]["calls"] == 1, "缓存必须返回深拷贝"
+
+        #     c) 写操作 / now-time-info 一律穿透
+        _net17.clear()
+        REFLECT_CACHE.clear()
+        _mcp_call("create-order", {"storeCode": "S1"}, token="t", log=False)
+        _mcp_call("create-order", {"storeCode": "S1"}, token="t", log=False)
+        assert len(_net17) == 2, "写操作必须穿透缓存"
+        _net17.clear()
+        _mcp_call("now-time-info", {}, token="t", log=False)
+        _mcp_call("now-time-info", {}, token="t", log=False)
+        assert len(_net17) == 2, "时间敏感工具永不缓存"
+
+        #     d) 业务错误不缓存（重试语义不变）
+        def _fake_biz_err17(*_a, **_k):
+            _net17.append("biz")
+            return {"result": {"isError": False, "structuredContent": {
+                "success": False, "code": 60003, "message": "门店打烊"}}}
+
+        _net17.clear()
+        REFLECT_CACHE.clear()
+        globals()["_mcp_call_once"] = _fake_biz_err17
+        _mcp_call("query-meals", {"storeCode": "S9"}, token="t", log=False)
+        _mcp_call("query-meals", {"storeCode": "S9"}, token="t", log=False)
+        assert len(_net17) == 2, "业务错误不得缓存"
+
+        #     e) TTL 过期 → 重新触网
+        globals()["_mcp_call_once"] = _fake_once17
+        _net17.clear()
+        _ttl17 = ReflectCache(ttl_s=0)
+        _saved_rc17 = globals()["REFLECT_CACHE"]
+        globals()["REFLECT_CACHE"] = _ttl17
+        try:
+            _mcp_call("query-meals", {"storeCode": "S3"}, token="t", log=False)
+            time.sleep(0.01)
+            _mcp_call("query-meals", {"storeCode": "S3"}, token="t", log=False)
+            assert len(_net17) == 2, "TTL 过期后必须重新触网"
+        finally:
+            globals()["REFLECT_CACHE"] = _saved_rc17
+    finally:
+        globals()["_mcp_call_once"] = _orig_once17
+        REFLECT_CACHE.clear()
 
     print("[selftest] 全部断言通过 ✅")
 
@@ -4955,7 +5693,7 @@ def main(argv: Sequence[str]) -> int:
     print(f"\n[硬约束过滤] 保留 {len(kept)} 项：", "、".join(m["name"] for m in kept))
 
     plans = optimize_plans(kept, data["coupons"], constraints)
-    print("\n[Top-3 方案（加权评分）]")
+    print("\n[Top-3 方案（NSGA-II 帕累托前沿）]")
     if data["banner"]:
         print(data["banner"])
     print(render_plans(plans))

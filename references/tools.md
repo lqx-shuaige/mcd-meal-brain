@@ -184,11 +184,35 @@ create-order                    →  下单（需用户确认）
 ### 9.4 调用日志与脱敏
 
 - 每次 MCP 调用记录 JSON Lines 至 `logs/mcp_calls.log`：
-  `{"ts", "tool", "duration_ms", "status"(success|error|retry|degraded), "retries", "args", "detail"}`；
+  `{"ts", "tool", "duration_ms", "status"(success|error|retry|degraded|**cache**), "retries", "args", "detail"}`；
+  `status=cache` 表示 ReflectCache 命中（未触网，duration_ms=0）；
 - **脱敏规则**（写入前强制执行）：Token/Authorization → `[TOKEN]`、手机号（11 位）→ `[PHONE]`、
   address/addressDetail/fullAddress → `[ADDRESS]`；
 - `logs/` 目录已在 `.gitignore` 中排除，不入库；
 - 日志写失败**静默跳过**，绝不阻断业务主流程。
+
+### 9.5 ReflectCache 参数级缓存（批 2 算法升级）
+
+> 实现：`scripts/optimizer.py` 4.6 节（`ReflectCache` / `_reflect_cache_lookup` /
+> `_reflect_cache_store`）。已接入 `_mcp_call` 统一入口，所有调用方自动受益。
+
+**机制**：键 = `sha256(工具名 + 规范化参数 JSON)` —— **参数级精确匹配**：
+参数键顺序无关，但值或类型不同（`1` vs `1.0` vs `"1"`）即不同键，不做模糊匹配、
+不做语义归并。
+
+| 规则 | 内容 |
+|---|---|
+| **只缓存只读工具** | `CACHEABLE_TOOLS` 白名单（27 个查询类工具）；写操作（create-order / cancel-order / mall-create-order / party-order-create / draw-lottery / auto-bind-coupons / delivery-create-address）一律穿透 |
+| **只缓存成功响应** | `isError=false` 且 `structuredContent.success ≠ false`；业务错误不缓存（重试语义不变） |
+| **时间敏感排除** | `now-time-info` 永不缓存 |
+| **TTL** | 默认 300s（菜单/券/营养变化频率远低于该窗口）；`MCD_CACHE_TTL_S` 可调 |
+| **容量** | 256 条，超容按最旧淘汰（FIFO） |
+| **深拷贝** | 命中返回响应深拷贝，调用方修改不污染缓存 |
+| **统计** | `REFLECT_CACHE.stats()` → hits / misses / entries / hit_rate |
+| **开关** | `MCD_REFLECT_CACHE=0` 整体关闭；`_mcp_call(..., use_cache=False)` 单次关闭 |
+
+**与规则 5 的关系**：429 限流时「优先读本地缓存」由本机制落地——同参数调用直接命中，
+不触网、不重试。命中记录 `status=cache` 日志（duration_ms=0）。
 
 ---
 

@@ -621,3 +621,239 @@ class TestCalorieBudget:
         doc = opt.plans_to_doc(plans, scene="热量预算配餐", people_count=4)
         errs = opt.validate_plans_doc(doc)
         assert errs == [], errs
+
+
+# =========================================================================
+# 批 2 · NSGA-II 多目标优化
+# =========================================================================
+
+class TestNSGA2:
+    """optimize_plans 默认走 NSGA-II：四目标帕累托前沿取三个极值点。
+
+    目标（全部最小化）：价格 / 人均热量 / 油炸份数 / 负人均蛋白。
+    预期：
+    * Top-3 标签齐全（最省钱/最健康/最快），全部位于第一前沿
+    * 三套方案互不支配（帕累托最优）
+    * 标签方向正确（最省钱=最低价，最健康=最高蛋白）
+    * 固定种子可复现；加权路径 method="weighted" 保留可用
+    """
+
+    INPUT = "4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"
+
+    def test_three_extreme_plans(self, menu, coupons):
+        c = opt.parse_constraints(self.INPUT)
+        plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c)
+        assert len(plans) == 3
+        assert {p["label"] for p in plans} == {"最省钱", "最健康", "最快"}
+        for p in plans:
+            assert p["mains"] >= 4
+            assert p["final_price_cny"] <= 100.0 + 1e-6
+            assert p["nsga2"]["front"] == 1
+
+    def test_pareto_mutual_nondomination(self, menu, coupons):
+        """三套方案两两互不支配（均为帕累托最优解）。"""
+        c = opt.parse_constraints(self.INPUT)
+        plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c)
+        objs = [opt._plan_objectives(p) for p in plans]
+        for i in range(len(objs)):
+            for j in range(i + 1, len(objs)):
+                assert not opt._dominates(objs[i], objs[j]), (i, j)
+                assert not opt._dominates(objs[j], objs[i]), (i, j)
+
+    def test_label_extremes(self, menu, coupons):
+        """标签方向：最省钱=最低价；最健康=最高蛋白。"""
+        c = opt.parse_constraints(self.INPUT)
+        plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c)
+        by_label = {p["label"]: p for p in plans}
+        assert by_label["最省钱"]["final_price_cny"] == \
+            min(p["final_price_cny"] for p in plans)
+        assert by_label["最健康"]["nutrition"]["per_capita_protein_g"] == \
+            max(p["nutrition"]["per_capita_protein_g"] for p in plans)
+
+    def test_deterministic(self, menu, coupons):
+        """固定随机种子：两次运行输出完全一致。"""
+
+        def sig():
+            plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c)
+            return [(p["label"], opt._basket_key(p)) for p in plans]
+
+        c = opt.parse_constraints(self.INPUT)
+        assert sig() == sig()
+
+    def test_weighted_method_available(self, menu, coupons):
+        """原加权路径保留可用（对照与回退）。"""
+        c = opt.parse_constraints(self.INPUT)
+        plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c,
+                                   method="weighted")
+        assert plans
+        assert {p["label"] for p in plans} <= {"最省钱", "最健康", "最快"}
+
+    def test_dominates_and_front_sort(self):
+        """支配关系与非支配排序的基础语义。"""
+        assert opt._dominates((1, 1), (2, 2))
+        assert not opt._dominates((2, 2), (1, 1))
+        assert not opt._dominates((1, 2), (2, 1))
+        fronts = opt._fast_non_dominated_sort(
+            [(1, 1), (2, 2), (1.5, 1.5), (0, 2)])
+        assert fronts == [[0, 3], [2], [1]]  # (1,1)与(0,2)互不支配；(2,2)被链式支配
+
+    def test_crowding_distance(self):
+        """拥挤距离：边界点无穷大，中间点为归一化间距之和。"""
+        dist = opt._crowding_distance([0, 1, 2], [(0, 0), (1, 1), (2, 2)])
+        assert dist[0] == float("inf") and dist[2] == float("inf")
+        assert abs(dist[1] - 2.0) < 1e-9
+
+    def test_kcal_hard_cap_respected(self, menu, coupons):
+        """显式热量预算（每人 500 大卡）作为硬上限：可行解存在时全部达标。"""
+        c = opt.parse_constraints("4个人，预算300，每人500大卡以内")
+        kept = opt.filter_menu(menu, c)
+        plans = opt.optimize_plans(kept, coupons, c)
+        assert plans
+        for p in plans:
+            assert p["nutrition"]["per_capita_kcal"] <= 500 + 1e-6, (
+                p["label"], p["nutrition"]["per_capita_kcal"])
+
+
+# =========================================================================
+# 批 2 · ReflectCache 参数级缓存
+# =========================================================================
+
+class TestReflectCache:
+    """MCP 只读工具的参数级结果缓存。
+
+    预期：
+    * 键 = 工具名 + 规范化参数（顺序无关、精确匹配）
+    * 同参数重复调用只触网一次；参数不同重新触网
+    * 写操作 / now-time-info 穿透；业务错误不缓存；TTL 过期重新触网
+    * 返回深拷贝，调用方修改不污染缓存
+    """
+
+    def test_make_key_exact_match(self):
+        k1 = opt.ReflectCache.make_key("query-meals", {"storeCode": "S1", "orderType": 1})
+        k2 = opt.ReflectCache.make_key("query-meals", {"orderType": 1, "storeCode": "S1"})
+        k3 = opt.ReflectCache.make_key("query-meals", {"storeCode": "S1", "orderType": 2})
+        k4 = opt.ReflectCache.make_key("query-store-coupons",
+                                       {"storeCode": "S1", "orderType": 1})
+        assert k1 == k2, "参数顺序不得影响键"
+        assert k1 != k3, "参数值不同 → 不同键"
+        assert k1 != k4, "工具不同 → 不同键"
+
+    def test_integration_same_args_single_network_call(self):
+        net = []
+
+        def fake_once(tool, arguments, token, timeout):
+            net.append((tool, dict(arguments)))
+            return {"result": {"isError": False, "structuredContent": {
+                "success": True, "code": 200, "data": {"calls": len(net)}}}}
+
+        orig = opt.__dict__["_mcp_call_once"]
+        opt._mcp_call_once = fake_once
+        opt.REFLECT_CACHE.clear()
+        try:
+            r1 = opt._mcp_call("query-meals", {"storeCode": "S1", "orderType": 1},
+                               token="t", log=False)
+            r2 = opt._mcp_call("query-meals", {"orderType": 1, "storeCode": "S1"},
+                               token="t", log=False)
+            assert len(net) == 1, "同参数必须命中缓存"
+            assert r1 == r2
+            r3 = opt._mcp_call("query-meals", {"storeCode": "S2", "orderType": 1},
+                               token="t", log=False)
+            assert len(net) == 2, "参数不同必须重新触网"
+            assert r3["result"]["structuredContent"]["data"]["calls"] == 2
+            st = opt.REFLECT_CACHE.stats()
+            assert st["hits"] == 1 and st["misses"] == 2
+        finally:
+            opt._mcp_call_once = orig
+            opt.REFLECT_CACHE.clear()
+
+    def test_deep_copy_isolation(self):
+        net = []
+
+        def fake_once(tool, arguments, token, timeout):
+            net.append(1)
+            return {"result": {"structuredContent": {"success": True,
+                                                     "data": {"n": len(net)}}}}
+
+        orig = opt.__dict__["_mcp_call_once"]
+        opt._mcp_call_once = fake_once
+        opt.REFLECT_CACHE.clear()
+        try:
+            r1 = opt._mcp_call("list-nutrition-foods", {}, token="t", log=False)
+            r1["result"]["structuredContent"]["data"]["n"] = 999
+            r2 = opt._mcp_call("list-nutrition-foods", {}, token="t", log=False)
+            assert r2["result"]["structuredContent"]["data"]["n"] == 1, \
+                "缓存必须返回深拷贝"
+        finally:
+            opt._mcp_call_once = orig
+            opt.REFLECT_CACHE.clear()
+
+    def test_write_tools_and_time_bypass(self):
+        net = []
+
+        def fake_once(tool, arguments, token, timeout):
+            net.append(tool)
+            return {"result": {"structuredContent": {"success": True, "data": {}}}}
+
+        orig = opt.__dict__["_mcp_call_once"]
+        opt._mcp_call_once = fake_once
+        opt.REFLECT_CACHE.clear()
+        try:
+            opt._mcp_call("create-order", {"storeCode": "S1"}, token="t", log=False)
+            opt._mcp_call("create-order", {"storeCode": "S1"}, token="t", log=False)
+            assert net.count("create-order") == 2, "写操作必须穿透缓存"
+            opt._mcp_call("now-time-info", {}, token="t", log=False)
+            opt._mcp_call("now-time-info", {}, token="t", log=False)
+            assert net.count("now-time-info") == 2, "时间敏感工具永不缓存"
+        finally:
+            opt._mcp_call_once = orig
+            opt.REFLECT_CACHE.clear()
+
+    def test_business_error_not_cached(self):
+        net = []
+
+        def fake_once(tool, arguments, token, timeout):
+            net.append(tool)
+            return {"result": {"isError": False, "structuredContent": {
+                "success": False, "code": 60003, "message": "门店打烊"}}}
+
+        orig = opt.__dict__["_mcp_call_once"]
+        opt._mcp_call_once = fake_once
+        opt.REFLECT_CACHE.clear()
+        try:
+            opt._mcp_call("query-meals", {"storeCode": "S9"}, token="t", log=False)
+            opt._mcp_call("query-meals", {"storeCode": "S9"}, token="t", log=False)
+            assert len(net) == 2, "业务错误不得缓存"
+        finally:
+            opt._mcp_call_once = orig
+            opt.REFLECT_CACHE.clear()
+
+    def test_ttl_expiry_refetches(self):
+        import time as _time
+        net = []
+
+        def fake_once(tool, arguments, token, timeout):
+            net.append(tool)
+            return {"result": {"structuredContent": {"success": True, "data": {}}}}
+
+        orig = opt.__dict__["_mcp_call_once"]
+        orig_cache = opt.__dict__["REFLECT_CACHE"]
+        opt._mcp_call_once = fake_once
+        opt.REFLECT_CACHE = opt.ReflectCache(ttl_s=0)
+        try:
+            opt._mcp_call("query-meals", {"storeCode": "S3"}, token="t", log=False)
+            _time.sleep(0.01)
+            opt._mcp_call("query-meals", {"storeCode": "S3"}, token="t", log=False)
+            assert len(net) == 2, "TTL 过期后必须重新触网"
+        finally:
+            opt._mcp_call_once = orig
+            opt.REFLECT_CACHE = orig_cache
+            opt.REFLECT_CACHE.clear()
+
+    def test_capacity_eviction(self):
+        cache = opt.ReflectCache(ttl_s=60, max_entries=2)
+        for i in range(3):
+            cache.store("query-meals", {"storeCode": f"S{i}"}, {"i": i})
+        assert cache.stats()["entries"] == 2, "超容量必须淘汰最旧项"
+        # 最旧的 S0 已被淘汰 → miss；S1/S2 命中
+        assert cache.lookup("query-meals", {"storeCode": "S0"}) is None
+        assert cache.lookup("query-meals", {"storeCode": "S2"}) == {"i": 2}

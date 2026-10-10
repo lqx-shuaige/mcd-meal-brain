@@ -37,7 +37,7 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 3. **菜单与偏好采集** —— `query-meals` 拉在售餐品，`list-nutrition-foods` 拿营养，把每位参与者转成画像 JSON。
 4. **硬约束过滤** —— `optimizer.py::filter_menu()` 一票否决违规商品；被剔除项要能解释「为什么没有它」。
 5. **券与促销盘点** —— `query-store-coupons` 是唯一权威；团餐另查 `query-promotions` / `query-meal-assistance`。
-6. **组合优化** —— `optimizer.py::optimize_plans()` 动态规划 + 帕累托剪枝输出 Top-3；结构化输出遵循 `references/schema.json` 契约。
+6. **组合优化** —— `optimizer.py::optimize_plans()`（默认 **NSGA-II 多目标优化**）：四目标帕累托前沿（价格↓/人均热量↓/油炸份数↓/人均蛋白↑）上取「最省钱/最健康/最快」三个极值点，固定种子可复现；原加权评分保留为回退（`method="weighted"`）；结构化输出遵循 `references/schema.json` 契约。
 7. **核价校验** —— 候选方案逐个过 `calculate-price` 官方核价；偏差 >5% 以官方价为准并如实标注。
 8. **确认下单** —— 展示方案 → 等用户明确确认 → `create-order`；下单后用 `query-order` 跟踪支付状态。
 
@@ -254,7 +254,9 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 5. 同一订单内容隔 5 分钟后再点 = 新窗口 = 允许再下一单（正常复购不受影响）。
 
 ### 规则 5 · 限流与鉴权异常处理
-- **429 / 「操作太频繁」**：优先读本地缓存；缓存未命中则友好提示「请求太频繁，请稍后再试」，不连续重试。
+- **429 / 「操作太频繁」**：优先读本地缓存——`optimizer.py` 的 **ReflectCache** 已在
+  `_mcp_call` 统一入口实现参数级缓存（工具名 + 参数精确匹配，只读工具、成功响应、
+  TTL 300s，`MCD_REFLECT_CACHE=0` 可关）；缓存未命中则友好提示「请求太频繁，请稍后再试」，不连续重试。
   （`draw-lottery` 有频控，重复调用返回「操作太频繁」，**不扣积分**。）
 - **401**：提示用户重新获取 Token，并检查 MCP 配置中的 `Authorization` 是否正确注入。
 - **通用**：失败后指数退避重试（1s → 2s → 4s），最多 3 次；禁止并发轰炸；仍失败则暂停并报告错误原文。
@@ -283,7 +285,8 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 7. **不越权操作** —— 只操作当前登录用户本人的账户、订单与地址，不查询、不推测他人数据。
 8. **不输出专业建议** —— 营养与热量数据仅供参考，不构成医疗、健康或膳食处方建议。
 9. **不混淆订单体系** —— 餐饮订单用 `order-list` / `query-order` / `create-order`，商城订单用 `mall-*`，不可交叉。
-10. **不重复拉取** —— 同一轮对话内菜单、券、门店结果复用，不反复调同一接口。
+10. **不重复拉取** —— 同一轮对话内菜单、券、门店结果复用，不反复调同一接口
+    （`optimizer.py::ReflectCache` 参数级缓存已在 `_mcp_call` 层自动去重：同工具同参数直接复用）。
 11. **不折算积分货币价值** —— MCP 不提供积分 ↔ 现金汇率；兑换比价只并列「省钱额 + 积分消耗」，不编造折算率。
 12. **不编造预约时段** —— 可预约时间以门店返回的 `reservationTimeOptions` 为准；不在窗口内的时间不硬塞。
 
@@ -297,4 +300,4 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 | `references/schema.json` | 结构化输出契约（JSON Schema draft-07，`plans` 数组：name / items / coupons / original_total / final_total / per_person / nutrition / genui） |
 | `references/tools.md` | 35 个 MCP 工具的参数与返回值注意事项 |
 | `references/strategy.md` | 菜品标签字典、营养约束映射、软硬约束处理逻辑 |
-| `scripts/optimizer.py` | 约束解析 · 硬约束过滤 · 组合优化 · 热量预算配餐 · 核价校验 · 渠道比价 · Schema 校验 |
+| `scripts/optimizer.py` | 约束解析 · 硬约束过滤 · NSGA-II 多目标优化 · 热量预算配餐 · 核价校验 · 渠道比价 · ReflectCache 参数级缓存 · Schema 校验 |

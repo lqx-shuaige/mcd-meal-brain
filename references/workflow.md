@@ -54,9 +54,10 @@
 
 ### 第 6 步 · 组合优化
 
-`scripts/optimizer.py::optimize_plans()`：
-- 最省钱 → 动态规划（无界背包 + 券组合 DP）+ 帕累托剪枝
-- 最健康 / 最快 → 加权评分
+`scripts/optimizer.py::optimize_plans()`（默认 **NSGA-II 多目标优化**，批 2 升级）：
+- 四目标帕累托前沿（价格↓/人均热量↓/油炸份数↓/人均蛋白↑）演化，
+  从第一前沿取「最省钱 / 最健康 / 最快」三个极值点；
+- 固定随机种子，结果可复现；原加权评分路径保留（`method="weighted"`）；
 - 输出 **Top-3** 方案；结构化输出遵循 `references/schema.json` 契约
   （`optimizer.py::plans_to_doc()` 生成、`validate_plans_doc()` 校验）。
 
