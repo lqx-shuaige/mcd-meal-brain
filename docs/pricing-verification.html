@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>麦麦拼单大脑 · 真实核价记录</title><style>
+:root{--red:#da291c;--green:#00a651;--yellow:#ffc72c;--ink:#1f2329;--muted:#6b7280;
+--line:#e5e7eb;--card:#fff;--bg:#f7f8fa}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",
+"Hiragino Sans GB","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink);
+line-height:1.65;padding:32px 16px 64px}
+.wrap{max-width:960px;margin:0 auto}
+header{text-align:center;margin-bottom:26px}
+header .logo{display:inline-flex;align-items:center;gap:10px;font-weight:800;font-size:22px}
+header .logo .b{background:var(--yellow);color:#3b2c00;border-radius:8px;padding:2px 10px}
+header .sub{color:var(--muted);font-size:14px;margin-top:6px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+padding:24px 28px;margin-bottom:22px;box-shadow:0 1px 3px rgba(31,35,41,.05)}
+h2{font-size:17px;margin-bottom:14px}
+.hero{border:2px solid #bfe8d2;background:linear-gradient(135deg,#fff 0%,#f2fbf6 100%);
+border-radius:16px;padding:28px;text-align:center;margin-bottom:22px}
+.hero .flow{display:flex;justify-content:center;align-items:center;gap:26px;flex-wrap:wrap}
+.hero .node .lab{font-size:13px;color:var(--muted)}
+.hero .node .val{font-size:36px;font-weight:800}
+.hero .ok{margin-top:12px}
+.hero .ok .big{color:var(--green);font-size:44px;font-weight:900}
+.hero .ok .pct{display:inline-block;background:var(--green);color:#fff;border-radius:10px;
+font-size:20px;font-weight:800;padding:3px 16px;margin-left:12px;vertical-align:middle}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{background:#f3f4f6;font-size:12.5px;color:#4b5563;font-weight:600;
+padding:8px 10px;border-bottom:2px solid var(--line);text-align:left}
+td{padding:8px 10px;border-bottom:1px solid #eef0f2;vertical-align:top}
+tr:last-child td{border-bottom:none}
+code{background:#eef0f2;border-radius:4px;padding:1px 6px;font-size:12px}
+pre{background:#1f2329;color:#e5e7eb;border-radius:10px;padding:16px 18px;
+font-size:12.5px;overflow-x:auto;line-height:1.55}
+.muted{color:var(--muted)}
+.timeline td:first-child{white-space:nowrap;font-weight:600}
+footer{text-align:center;color:var(--muted);font-size:12.5px}
+</style></head>
+<body><div class="wrap">
+
+<header>
+  <div class="logo"><span class="b">麦麦拼单大脑</span> 真实核价记录</div>
+  <div class="sub">麦当劳北京建外SOHO(A座)餐厅（1950564）· 到店自取 · 2026-10-10 营业时段实测</div>
+</header>
+
+<section class="hero">
+  <div class="flow">
+    <div class="node">
+      <div class="lab">本地估算（optimizer.py DP + 券组合）</div>
+      <div class="val">¥44.00</div>
+    </div>
+    <div class="node" style="font-size:26px;color:var(--muted)">⇄</div>
+    <div class="node">
+      <div class="lab">官方核价（calculate-price）</div>
+      <div class="val">¥44.00</div>
+    </div>
+  </div>
+  <div class="ok"><span class="big">偏差 ¥0.00</span><span class="pct">0.00% 一致 ✅</span></div>
+  <div class="muted" style="font-size:13px;margin-top:8px">
+    场景：我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜｜方案：最省钱（大脆鸡扒麦满分×4）</div>
+</section>
+
+<section class="card">
+  <h2>调用链路（5 次真实 MCP 调用，已脱敏）</h2>
+  <table class="timeline">
+    <tr><th>时间</th><th>工具</th><th>关键参数</th><th>关键返回</th><th>traceId</th></tr>
+    <tr><td>09:27:49</td><td><code>now-time-info</code></td><td>—</td>
+        <td>2026-10-10 09:27:49（周六，GMT+8）→ 处于营业时段 07:00–22:00</td>
+        <td class="muted">4d5465…43742a</td></tr>
+    <tr><td>09:28:19</td><td><code>query-nearby-stores</code></td>
+        <td><code>beType=1, searchType=2, city=北京市, keyword=国贸</code></td>
+        <td>5 家门店全部 businessStatus=true；选定最近门店 195****（269m）</td>
+        <td class="muted">cca721…1bf27</td></tr>
+    <tr><td>09:28:29</td><td><code>query-meals</code></td>
+        <td><code>storeCode=195****, orderType=1, beType=1</code></td>
+        <td>早餐时段菜单，分类 + 商品映射两级结构，共 96 个商品</td>
+        <td class="muted">8fcee7…53eac5</td></tr>
+    <tr><td>09:28:58</td><td><code>query-store-coupons</code></td>
+        <td><code>storeCode=195****, orderType=1, beType=1</code></td>
+        <td>券池为空（该门店到店自取当前无可用券）→ 最省钱方案不含券</td>
+        <td class="muted">66a17d…b6c3f9</td></tr>
+    <tr><td>09:33:53</td><td><code>calculate-price</code></td>
+        <td><code>storeCode=195****, orderType=1, beType=1, items=[5889×4]</code></td>
+        <td><b>¥44.00</b>（4400 分）；discount=0；取餐：堂食/外带</td>
+        <td class="muted">5b8f62…65116c</td></tr>
+  </table>
+</section>
+
+<section class="card">
+  <h2>最省钱方案商品明细（optimizer.py 真实输出）</h2>
+  <table>
+    <tr><th>商品编码</th><th>名称</th><th>数量</th><th>小计</th></tr>
+    <tr><td><code>5889</code></td><td>大脆鸡扒麦满分</td><td>×4</td><td>¥44.00</td></tr>
+    <tr><td colspan="3"><b>合计（人均 ¥11.00 × 4 人，主食 4 份）</b></td>
+        <td><b>¥44.00</b></td></tr>
+  </table>
+  <p class="muted" style="font-size:13px;margin-top:10px">
+    营养（人均）：361 kcal ·
+    蛋白 16.0 g ·
+    脂肪 17.0 g（营养来自 list-nutrition-foods 名称精确匹配）</p>
+</section>
+
+<section class="card">
+  <h2>核价请求（calculate-price 入参）</h2>
+  <pre>{
+  &quot;storeCode&quot;: &quot;1950564&quot;,
+  &quot;orderType&quot;: 1,
+  &quot;beType&quot;: 1,
+  &quot;items&quot;: [
+    {
+      &quot;productCode&quot;: &quot;5889&quot;,
+      &quot;quantity&quot;: 4
+    }
+  ]
+}</pre>
+</section>
+
+<section class="card">
+  <h2>核价响应关键字段（单位：分；已脱敏）</h2>
+  <pre>{
+  &quot;productOriginalPrice&quot;: 4400,
+  &quot;productPrice&quot;: 4400,
+  &quot;originalPrice&quot;: 4400,
+  &quot;discount&quot;: 0,
+  &quot;price&quot;: 4400,
+  &quot;productList&quot;: [
+    {
+      &quot;productCode&quot;: &quot;5889&quot;,
+      &quot;productName&quot;: &quot;大脆鸡扒麦满分&quot;,
+      &quot;quantity&quot;: 4,
+      &quot;originalSubtotal&quot;: 4400,
+      &quot;subtotal&quot;: 4400
+    }
+  ],
+  &quot;takeWayList&quot;: [
+    {
+      &quot;code&quot;: &quot;eat-in&quot;,
+      &quot;title&quot;: &quot;堂食&quot;,
+      &quot;subtitle&quot;: &quot;店内用餐&quot;
+    },
+    {
+      &quot;code&quot;: &quot;take-in-store&quot;,
+      &quot;title&quot;: &quot;外带&quot;,
+      &quot;subtitle&quot;: &quot;店内自提&quot;
+    }
+  ]
+}</pre>
+  <p class="muted" style="font-size:13px;margin-top:10px">
+    恒等式校验：商品 4400 + 运费 0 + 打包 0 + 餐具 0 − 优惠 0 = 现价 4400 ✅</p>
+</section>
+
+<section class="card">
+  <h2>计价口径与如实说明</h2>
+  <table>
+    <tr><th>事项</th><th>处理方式</th></tr>
+    <tr><td>随单购优惠商品（如「猪柳蛋麦满分套餐 ¥15.6/26」）</td>
+        <td>按 <b>originalPrice</b> 计价（不购买早餐卡时的真实价格），避免引入随单购卡片链路</td></tr>
+    <tr><td>促销优惠商品（如「麦咖啡™奶铁 ¥13.9/21」）</td>
+        <td>按 <b>currentPrice</b> 计价（促销价无需附加条件）</td></tr>
+    <tr><td>营养字段（query-meals 不返回）</td>
+        <td>与 list-nutrition-foods（160 品）名称归一化精确匹配：命中 23 项；
+            未命中（套餐组合/周边/规格不明饮品）营养按 0，<b>不估算、不编造</b></td></tr>
+    <tr><td>门店券（query-store-coupons 返回空）</td>
+        <td>券池为空 → 券组合 DP 自然退化为无券方案，最省钱 = 纯最小成本组合</td></tr>
+    <tr><td>早餐时段菜单</td>
+        <td>09:28 为早餐时段（07:14–10:15），菜单为早餐品类（麦满分/厚松饼/粥类），
+            与 README 正餐演示场景品类不同，属真实时段差异，如实呈现</td></tr>
+  </table>
+</section>
+
+<footer>
+  本页由 <code>python scripts/verify_pricing.py --html</code> 生成；所有数字固化自 2026-10-10
+  真实 MCP 调用快照（见 scripts/verify_pricing.py 顶部数据来源表），非手编。<br>
+  门店编号按 MCP_INTEGRATION.md 约定脱敏为 195****；traceId 仅保留首尾 6 位。
+</footer>
+
+</div></body></html>

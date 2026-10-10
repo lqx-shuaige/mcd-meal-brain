@@ -65,6 +65,22 @@ curl -s -X POST "https://mcp.mcd.cn/mcp-servers/mcd-mcp" \
 **本轮结论**：9 次调用全部按预期返回（1 次负向测试被正确拒绝）。得来速链路端到端跑通；
 渠道比价可做内部三渠道，外部平台接口不存在。
 
+### 2026-10-10 09:27–09:33 方向2 真实核价专项（建外SOHO A座，到店自取）
+
+| 时间（GMT+8） | 工具 | 关键入参 | 结果 | traceId |
+|---|---|---|---|---|
+| 09:27:49 | `now-time-info` | 无 | ✅ 服务器时间 09:27:49 → 判定营业时段 | `4d5465…43742a` |
+| 09:28:19 | `query-nearby-stores` | `beType=1, searchType=2, city=北京市, keyword=国贸` | ✅ 5 家门店全部营业；选定最近门店 195****（269m） | `cca721…1bf27` |
+| 09:28:29 | `query-meals` | `storeCode=195****, orderType=1, beType=1` | ✅ 早餐时段菜单，**96 个商品**（两级结构，价格为字符串元） | `8fcee7…53eac5` |
+| 09:28:58 | `query-store-coupons` | `storeCode=195****, orderType=1, beType=1` | ✅ 券池为空（门店无可用券） | `66a17d…b6c3f9` |
+| 09:29:45 | `list-nutrition-foods` | 无 | ✅ 160 品营养数据（用于按名称精确匹配营养） | `8991e9…1e85e3` |
+| 09:33:53 | `calculate-price` | `beType=1, items=[5889×4]`（optimizer 最省钱方案） | ✅ **¥44.00**（4400 分）＝本地估算，**偏差 0.00%** | `5b8f62…65116c` |
+
+**本轮结论**：README 演示场景（4 人预算 100）在真实门店端到端跑通；
+optimizer 本地估算与官方核价**分毫不差**（¥44.00 = ¥44.00）。
+完整脱敏记录与可执行复现见 `docs/pricing-verification.md` 与
+`scripts/verify_pricing.py`（快照固化 + 一键重放）。
+
 **成功率**：8 次调用中 5 次成功、3 次因**门店非营业时段**返回业务错误。服务端本身连通性正常。
 
 **客户端侧连接日志（WorkBuddy 应用）**
@@ -214,6 +230,8 @@ python scripts/optimizer.py --selftest
 
 # 3) 核价联调（需在门店营业时段 07:00–22:00）
 #    见 scripts/optimizer.py::verify_price(plan, store_code, token=...)
+#    ✅ 已于 2026-10-10 09:33 完成端到端实测（¥44.00 = ¥44.00，偏差 0%），
+#       脱敏记录：docs/pricing-verification.md；快照重放：python scripts/verify_pricing.py
 ```
 
 ---
@@ -224,4 +242,7 @@ python scripts/optimizer.py --selftest
 - 主要接入风险集中在 **错误判定方式（偏差 1、2）** 与 **价格单位（偏差 4）**，二者均已代码化处理并附回归断言。
 - 得来速（beType=5）与渠道比价链路已于 2026-10-10 端到端实测通过（偏差 11–15）；
   渠道比价仅限内部渠道，外部平台接口不存在。
+- README 演示场景真实核价已于 2026-10-10 完成端到端实测：本地估算 ¥44.00 与官方
+  `calculate-price` 核价 ¥44.00 **完全一致（偏差 0%）**，详见
+  `docs/pricing-verification.md`。
 - 全部偏差均可在 `scripts/optimizer.py` 与 `SKILL.md` 中找到对应处理逻辑。
