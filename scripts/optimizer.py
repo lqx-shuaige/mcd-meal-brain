@@ -7,7 +7,7 @@
 1. ``parse_constraints``  把用户的自然语言解析成结构化约束（硬约束 + 软偏好 + 画像）。
 2. ``filter_menu``        按硬约束过滤菜单，把解空间先压下来（一票否决）。
 3. ``optimize_plans``     多目标寻优（默认 NSGA-II）：四目标帕累托前沿（价格/热量/油炸/蛋白）
-                          上取「最省钱 / 最健康 / 最快」三个极值点；加权评分路径保留为回退
+                          上取「最省钱 / 最健康 / 最快」极值并按前沿有效多样性自适应补席；加权评分路径保留为回退
                           （method="weighted"）。另有 ``optimize_calorie_budget`` 按热量预算配餐。
 4. ``verify_price``       调用 MCP 的 ``calculate-price`` 做官方核价（单位：分 → 元）。
 5. ``compare_channels``   渠道比价：同一篮子在 到店自取 / 麦乐送 / 得来速 三个**内部渠道**的
@@ -1163,7 +1163,7 @@ def optimize_group_plans(
 
 
 def render_group_result(result: Dict[str, Any]) -> str:
-    """渲染群体决策结果：无冲突 → Top-3（带公平性）；有冲突 → 冲突说明 + A/B 双方案。"""
+    """渲染群体决策结果：无冲突 → 方案集（带公平性）；有冲突 → 冲突说明 + A/B 双方案。"""
     out: List[str] = []
     agg = result["aggregated"]
     if not result["needs_negotiation"]:
@@ -1862,7 +1862,50 @@ def _optimize_plans_weighted(
     feasible = [p for p in dedup.values() if p.get("mains", 0) >= people]
     ranked = sorted(feasible or dedup.values(),
                     key=lambda x: (-x["score"], x["final_price_cny"]))
-    return ranked[:3]
+    # 自适应席位（与 NSGA-II 主路径同一原则）：先按标签各取一席（最优），
+    # 再用次优解补足；近重复解折叠，不凑数——有几席算几席。
+    picked: List[Dict[str, Any]] = []
+    seen_labels: set = set()
+    for p in ranked:
+        if len(picked) >= 3:
+            break
+        if p["label"] in seen_labels:
+            continue
+        if any(not _plans_distinct(p, q) for q in picked):
+            continue
+        picked.append(p)
+        seen_labels.add(p["label"])
+    for p in ranked:
+        if len(picked) >= 3:
+            break
+        if p in picked or any(not _plans_distinct(p, q) for q in picked):
+            continue
+        p["label"] = "均衡"
+        picked.append(p)
+    return picked
+
+
+def _plans_distinct(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """两方案是否构成**明显不同**的取舍档位（自适应席位的判据）。
+
+    「对比表里肉眼能看出差异」才算不同，四条判据任一命中即视为不同：
+    价格差 ≥ max(¥1.00, 便宜者的 5%)，或人均热量差 ≥ 75 kcal、
+    人均蛋白差 ≥ 6 g、人均脂肪差 ≥ 6 g。
+
+    帕累托前沿上大量「换个小食」级别的近重复解会被此判据折叠——
+    它们数学上互不支配，决策上是同一个方案。
+    """
+    pa, pb = float(a["final_price_cny"]), float(b["final_price_cny"])
+    if abs(pa - pb) >= max(1.0, 0.05 * min(pa, pb)):
+        return True
+    na = a.get("nutrition") or {}
+    nb = b.get("nutrition") or {}
+    return (abs(float(na.get("per_capita_kcal") or 0)
+                - float(nb.get("per_capita_kcal") or 0)) >= 75
+            or abs(float(na.get("per_capita_protein_g") or 0)
+                   - float(nb.get("per_capita_protein_g") or 0)) >= 6
+            or abs(float(na.get("per_capita_fat_g") or 0)
+                   - float(nb.get("per_capita_fat_g") or 0)) >= 6)
 
 
 def optimize_plans(
@@ -1872,13 +1915,20 @@ def optimize_plans(
     weights: Optional[Dict[str, float]] = None,
     promotions: Optional[List[Dict[str, Any]]] = None,
     method: str = "nsga2",
+    top_n: int = 5,
 ) -> List[Dict[str, Any]]:
     """**多目标寻优入口**（默认 NSGA-II，批 2 算法升级）。
 
     * ``method="nsga2"``（默认）：NSGA-II 在四目标空间
       （价格↓ / 人均热量↓ / 油炸份数↓ / 人均蛋白↑）中演化，
-      从**帕累托前沿**取三个极值点标注为「最省钱 / 最健康 / 最快」；
-      前沿退化（极值重合）时按拥挤距离补齐，仍不足时回退加权路径；
+      从**帕累托前沿**取「最省钱 / 最健康 / 最快」极值并**自适应补席**：
+      席位数跟随前沿的**有效多样性**（1–``top_n``），而非固定 3——
+      * 前沿丰富 → 极值之外按拥挤距离补「均衡」代表，每席与已选
+        方案在 :func:`_plans_distinct` 判据下**明显不同**（价格/热量/蛋白/脂肪
+        至少一项差异可见）；
+      * 前沿退化 → 有几席算几席，**不凑数**（不再借加权路径补标签）；
+      * 近重复解（「换个小食」级别）被判据折叠，不占席位；
+      * 完整非支配解集需求请用 :func:`optimize_pareto`。
     * ``method="weighted"``：原加权评分路径（对照与回退用）。
 
     预算硬约束 / 主食底线 / 降级方案行为与加权路径完全一致；
@@ -1959,68 +2009,71 @@ def optimize_plans(
                                         weights, promotions)
     c_objs = [_plan_objectives(p) for p in cands]
 
-    # --- 三个极值点：min 价 / max 蛋白 / min 油炸 -------------------------
+    # --- 三个命名极值：min 价 / max 蛋白 / min 油炸 ------------------------
+    #     极值对应可预期的用户意图（省钱/营养/速度），无论席位多少都保留。
     #     「最健康」额外尊重显式营养目标：用户给了 targets.max_fat_g 时，
     #     若前沿中存在脂肪达标者，则只在达标子集里选蛋白最高者——避免
     #     「蛋白冠军但脂肪超标」的方案顶着「最健康」标签（2026-10 实测缺陷：
     #     脂肪 30.5g > 目标 25g 曾被选为最健康）。全部超标则回退全局极值，
     #     由 nutrition_flags 如实标注，不静默放宽。
-    i_cheap = min(range(len(cands)), key=lambda i: (c_objs[i][0], c_objs[i][1]))
+    #     极值撞篮（如「最省钱」与「最快」同为 0 油炸最低价）时，在未选
+    #     池中找**同目标值**的并列极值顶替标签；没有并列者该标签空缺，
+    #     不用更差的方案冒名。
     fat_cap = targets.get("max_fat_g")
-    health_pool = range(len(cands))
+    health_pool: List[int] = list(range(len(cands)))
     if fat_cap is not None:
         fat_ok = [i for i in range(len(cands))
                   if (cands[i]["nutrition"].get("per_capita_fat_g") or 0)
                   <= float(fat_cap) + 1e-6]
         if fat_ok:
             health_pool = fat_ok
-    i_health = min(health_pool, key=lambda i: (c_objs[i][3], c_objs[i][0]))
-    i_fast = min(range(len(cands)), key=lambda i: (c_objs[i][2], c_objs[i][0]))
+    _extreme_key = {
+        "最省钱": lambda i: (c_objs[i][0], c_objs[i][1]),   # 价格 min
+        "最健康": lambda i: (c_objs[i][3], c_objs[i][0]),   # 蛋白 max（达标池内）
+        "最快":   lambda i: (c_objs[i][2], c_objs[i][0]),   # 油炸 min
+    }
+    _extreme_obj = {"最省钱": 0, "最健康": 3, "最快": 2}
+    _extreme_pool = {"最省钱": range(len(cands)),
+                     "最健康": health_pool,
+                     "最快": range(len(cands))}
 
     result: List[Dict[str, Any]] = []
     used: set = set()
-    for label, idx in (("最省钱", i_cheap), ("最健康", i_health), ("最快", i_fast)):
-        k = _basket_key(cands[idx])
-        if k not in used:
-            cands[idx]["label"] = label
-            result.append(cands[idx])
-            used.add(k)
-
-    # --- 极值重合 → 按拥挤距离补齐不同解，标签取其最擅长的目标 -------------
-    if len(result) < 3:
-        dist = _crowding_distance(list(range(len(cands))), c_objs)
-        order = sorted(range(len(cands)), key=lambda i: -dist[i])
-        for i in order:
-            if len(result) >= 3:
-                break
-            k = _basket_key(cands[i])
-            if k in used:
+    for label in ("最省钱", "最健康", "最快"):
+        pool = sorted(_extreme_pool[label], key=_extreme_key[label])
+        best_v = c_objs[pool[0]][_extreme_obj[label]]
+        for i in pool:
+            if _basket_key(cands[i]) in used:
                 continue
-            have = {r["label"] for r in result}
-            remaining = [lb for lb in ("最省钱", "最健康", "最快") if lb not in have]
-            if not remaining:
+            if c_objs[i][_extreme_obj[label]] <= best_v + 1e-9:
+                cands[i]["label"] = label
+                result.append(cands[i])
+                used.add(_basket_key(cands[i]))
                 break
-            o = c_objs[i]
-            scores = {"最省钱": -o[0], "最健康": o[3], "最快": -o[2]}
-            label = max(remaining, key=lambda lb: scores[lb])
-            cands[i]["label"] = label
-            result.append(cands[i])
-            used.add(k)
 
-    # --- 前沿退化仍不足 3 → 加权路径补齐缺失标签（保证 Top-3 语义） --------
-    if len(result) < 3:
-        weighted = _optimize_plans_weighted(menu, coupons, constraints,
-                                            weights, promotions)
-        have = {r["label"] for r in result}
-        for p in weighted:
-            if len(result) >= 3:
+    # --- 自适应补席：拥挤距离降序，只收「明显不同」的均衡档位 --------------
+    #     席位跟随前沿有效多样性（1–top_n），两个方向都不硬凑：
+    #     * 向上：前沿丰富时极值之外补「均衡」代表，每席与已选方案在
+    #       _plans_distinct 下至少一项差异肉眼可见（近重复解不占席位）；
+    #     * 向下：前沿退化（极值重合/菜单极小）时输出 1–2 套即止，
+    #       不再借加权路径补齐「Top-3」格式——有几席算几席。
+    #     补席与「最健康」同一达标口径：脂肪目标存在且有达标者时，超标
+    #     方案不占席位——其蛋白优势以违反群体健康目标为代价，且会反超
+    #     「最健康」的蛋白、破坏命名极值的标签语义。
+    extra_pool = health_pool
+    avail = [i for i in extra_pool if _basket_key(cands[i]) not in used]
+    if len(result) < top_n and avail:
+        dist = _crowding_distance(list(range(len(cands))), c_objs)
+        order = sorted(avail, key=lambda i: -dist[i])
+        for i in order:
+            if len(result) >= top_n:
                 break
-            if (p.get("label") in ("最省钱", "最健康", "最快")
-                    and p["label"] not in have
-                    and _basket_key(p) not in used):
-                result.append(p)
-                used.add(_basket_key(p))
-                have.add(p["label"])
+            cand = cands[i]
+            if any(not _plans_distinct(cand, sel) for sel in result):
+                continue
+            cand["label"] = "均衡"
+            result.append(cand)
+            used.add(_basket_key(cand))
 
     # --- 附加透明信息（front / objectives）与兼容 score --------------------
     for p in result:
@@ -2035,10 +2088,10 @@ def optimize_plans(
                 "per_capita_protein_g": -o[3],
             },
         }
-    label_order = ("最省钱", "最健康", "最快")
+    label_order = ("最省钱", "最健康", "最快", "均衡")
     result.sort(key=lambda p: label_order.index(p["label"])
                 if p["label"] in label_order else 9)
-    return result[:3]
+    return result[:top_n]
 
 
 def optimize_cost_curve(
@@ -2100,7 +2153,7 @@ def optimize_pareto(
     """**价格 × 热量双目标帕累托解集**（不走加权评分）。
 
     与 :func:`optimize_plans` 的区别：
-      - ``optimize_plans`` 用加权评分给出「最省钱 / 最健康 / 最快」三个代表解，适合直接推荐；
+      - ``optimize_plans`` 给出「最省钱 / 最健康 / 最快」极值 + 均衡补席的**自适应方案集**，适合直接推荐；
       - ``optimize_pareto`` 给出**完整的非支配解集**，适合让用户自己看到"多花 X 元能少吃 Y 千卡"
         的完整权衡曲线，不做任何主观加权。
 
@@ -2221,13 +2274,15 @@ def optimize_calorie_budget(
     constraints: Dict[str, Any],
     top_n: int = 3,
 ) -> List[Dict[str, Any]]:
-    """**按热量预算配餐**（扩展分支 D）：输出人均热量 ≤ 预算的主餐+小食+饮品 Top-3。
+    """**按热量预算配餐**（扩展分支 D）：输出人均热量 ≤ 预算的主餐+小食+饮品方案。
 
     * 热量预算：``targets.max_calories_kcal``（**人均硬上限**，由「每人 X 大卡」解析；
       未显式给出时按减脂档位 tier 推断，默认 standard=600 kcal）；
     * 方案 1「最省」：预算内成本最低的单人组合 × 人数；
-    * 方案 2「高蛋白」：蛋白质最高的单人组合 × 人数；
+    * 方案 2「高蛋白」：蛋白质最高的单人组合 × 人数（与「最省」同篮子时**不重复输出**）；
     * 方案 3「均衡混搭」：不同主餐的最省组合轮流分配（多样性最好）；
+    * 席位自适应：可行组合少（如仅 1 套）时输出 1–2 套即止，不凑数；
+      ``top_n`` 为上限（角色固定三类，默认 3）；
     * 无解（热量最低的主餐也超预算）：**不静默放宽**，输出差距说明 + 调整建议。
 
     每套方案附 ``calorie_budget`` 字段：
@@ -2271,11 +2326,15 @@ def optimize_calorie_budget(
     if protein_best == cheapest:
         protein_best = next((cb for cb in ranked_protein if cb != cheapest), cheapest)
 
-    plans: List[Dict[str, Any]] = []
-    for label, combo in ((CALORIE_BUDGET_LABELS[0], cheapest),
-                         (CALORIE_BUDGET_LABELS[1], protein_best)):
-        plans.append(_basket_to_plan(list(combo) * people, items, coupons,
-                                     constraints, label))
+    # 席位不凑数：可行组合唯一时「高蛋白」与「最省」是同一篮子，
+    # 只输出一套（不再复制一份换个标签充数）。
+    plans: List[Dict[str, Any]] = [
+        _basket_to_plan(list(cheapest) * people, items, coupons,
+                        constraints, CALORIE_BUDGET_LABELS[0])]
+    if protein_best != cheapest:
+        plans.append(_basket_to_plan(list(protein_best) * people, items,
+                                     coupons, constraints,
+                                     CALORIE_BUDGET_LABELS[1]))
 
     # 方案 3：均衡混搭——每个主餐保留其最省组合，取 ≤3 个不同主餐轮流分配到人。
     # 优先「主餐+小食+饮品」完整结构（更贴合配餐语义），无完整结构时退化为任意组合。
@@ -2309,7 +2368,7 @@ def optimize_calorie_budget(
 #
 #     替换原「加权评分」排序：以**帕累托支配关系**为主、拥挤距离为辅，
 #     直接在四目标空间（价格↓ / 人均热量↓ / 油炸份数↓ / 人均蛋白↑）中演化，
-#     产出**多样化**的帕累托最优解集，再从前沿上取三个极值点标注为
+#     产出**多样化**的帕累托最优解集，再从前沿上取命名极值并自适应补席标注为
 #     「最省钱 / 最健康 / 最快」——三套方案的取舍关系由前沿结构自然给出，
 #     不再依赖主观权重。
 #
@@ -2541,7 +2600,7 @@ def _nsga2_evolve(items: List[Dict[str, Any]], people: int,
     for _ in range(max(generations, 1)):
         objs = [raw_objs(b) for b in pop]
         fronts = _fast_non_dominated_sort(objs)
-        # 早停：前沿四目标极值点（价格min/热量min/油炸min/蛋白max，即三方案
+        # 早停：前沿四目标极值点（价格min/热量min/油炸min/蛋白max，即核心方案
         # 极值的来源）连续 N 代不变 → 输出已收敛，剩余代数只填充前沿中部
         fo = [objs[i] for i in fronts[0]]
         sig = (min(o[0] for o in fo), min(o[1] for o in fo),
@@ -4286,12 +4345,16 @@ def constraints_brief(constraints: Dict[str, Any]) -> str:
 
 def recommend_plan(plans: List[Dict[str, Any]],
                    constraints: Dict[str, Any]) -> str:
-    """三方案对比总表 + 一句话推荐（含取舍理由，不把选择权甩给用户）。"""
+    """N 方案对比总表 + 一句话推荐（含取舍理由，不把选择权甩给用户）。
+
+    席位少于 3 时附一行说明：前沿只有这么多**明显不同**的取舍档位，
+    其余候选与已选方案差异可忽略——诚实少于凑数。
+    """
     if not plans:
         return ""
     w = constraints.get("weights") or {"cheap": 0.34, "healthy": 0.33,
                                        "speed": 0.18, "pref": 0.15}
-    out: List[str] = ["【三方案对比】"]
+    out: List[str] = [f"【方案对比（{len(plans)} 套）】"]
     out.append(_pad("方案", 10) + _pad("最终价", 10) + _pad("人均", 9)
                + _pad("人均kcal", 9) + _pad("蛋白g", 7) + _pad("脂肪g", 7)
                + _pad("券优惠", 9) + "体检")
@@ -4317,20 +4380,26 @@ def recommend_plan(plans: List[Dict[str, Any]],
         "最省钱": f"在「{_budget_brief(constraints)}」下综合得分最高，价格最稳",
         "最健康": "营养目标满足度最好（蛋白/脂肪/kcal 均衡）",
         "最快": "主食结构最简单、非油炸，出餐最快",
+        "均衡": "价格/营养/速度折中，无明显短板",
     }.get(best.get("label"), "与你们的人数/预算/画像约束最匹配")
+    _focus = {"最省钱": "省钱", "最健康": "营养", "最快": "速度", "均衡": "均衡"}
     alt = ""
     if others:
         o = others[0]
         oi = plans.index(o) + 1
-        alt = f"；若更在意{'省钱' if o.get('label') == '最省钱' else '营养' if o.get('label') == '最健康' else '速度'}可看方案 {chr(64 + oi)}"
+        alt = (f"；若更在意{_focus.get(o.get('label'), '别的取舍')}"
+               f"可看方案 {chr(64 + oi)}")
     out.append(f"💡 推荐方案 {chr(64 + bi)}（{best.get('label')}）：{reason}{alt}")
+    if len(plans) < 3:
+        out.append(f"📌 仅 {len(plans)} 套：当前菜单/约束下只有这么多明显不同的"
+                   "取舍档位，其余候选差异可忽略（席位自适应，不凑数展示）")
     return "\n".join(out)
 
 
 def render_plans(plans: List[Dict[str, Any]]) -> str:
-    """把 Top-3 方案渲染成可读文本（金额一律「元」，列按显示宽度对齐）。"""
+    """把方案集渲染成可读文本（金额一律「元」，列按显示宽度对齐）。"""
     icon = {"最省钱": "🍔", "最健康": "🥗", "最快": "⚡",
-            "减配方案": "🥶", "分步下单方案": "📝",
+            "均衡": "🍱", "减配方案": "🥶", "分步下单方案": "📝",
             "热量预算·最省": "🔥", "热量预算·高蛋白": "💪",
             "热量预算·均衡混搭": "🥗", "热量预算无解": "🚫"}
     out: List[str] = []
@@ -4780,14 +4849,17 @@ PLAN_OUTPUT_SCHEMA: Dict[str, Any] = {
         "price_verified": {"type": "boolean",
                             "description": "方案价格是否已过 calculate-price 官方核价"},
         "plans": {
-            "type": "array", "minItems": 1, "maxItems": 3,
+            "type": "array", "minItems": 1, "maxItems": 5,
+            "description": (
+                "方案席位自适应：命名极值（最省钱/最健康/最快）+ 按前沿有效"
+                "多样性补的「均衡」席；前沿退化时可以只有 1–2 套，不凑数"),
             "items": {
                 "type": "object",
                 "required": ["name", "items", "coupons", "original_total",
                              "final_total", "per_person", "nutrition", "genui"],
                 "properties": {
                     "name": {"type": "string",
-                              "description": "方案定位：最省钱/最健康/最快"},
+                              "description": "方案定位：最省钱/最健康/最快/均衡"},
                     "degraded": {"type": "boolean",
                                  "description": "降级建议型方案标记（如「预算不足/分步下单」）；为 true 时 items 允许为空数组"},
                     "degrade_reason": {"type": "string",
@@ -5161,9 +5233,10 @@ def _selftest() -> None:
     # 未达门槛的券不应被选中
     assert _coupon_dp(1000, SAMPLE_COUPONS)["discount"] == 0, _coupon_dp(1000, SAMPLE_COUPONS)
 
-    # 5) 组合优化
+    # 5) 组合优化（席位自适应：1–5，篮子唯一）
     plans = optimize_plans(kept, SAMPLE_COUPONS, c)
-    assert 1 <= len(plans) <= 3, len(plans)
+    assert 1 <= len(plans) <= 5, len(plans)
+    assert len({_basket_key(p) for p in plans}) == len(plans), "篮子必须唯一"
     for p in plans:
         assert p["people_count"] == 4
         assert p["final_price_cny"] <= p["subtotal_cny"] + 1e-9
@@ -5712,11 +5785,13 @@ def _selftest() -> None:
     _dist = _crowding_distance([0, 1, 2], [(0, 0), (1, 1), (2, 2)])
     assert _dist[0] == float("inf") and _dist[2] == float("inf")
     assert abs(_dist[1] - 2.0) < 1e-9              # 两目标各贡献 1.0
-    #     b) 默认路径输出：标签齐全 + 第一前沿 + 互不支配 + 极值方向
+    #     b) 默认路径输出：命名极值齐全 + 第一前沿 + 互不支配 + 极值方向
+    #        席位自适应（1–5）：近重复解折叠、篮子唯一、补席不反超命名极值
     n_plans = optimize_plans(kept, SAMPLE_COUPONS, c)
-    assert 1 <= len(n_plans) <= 3, len(n_plans)
+    assert 1 <= len(n_plans) <= 5, len(n_plans)
+    assert len({_basket_key(p) for p in n_plans}) == len(n_plans), "篮子必须唯一"
     _labels16 = {p["label"] for p in n_plans}
-    assert _labels16 <= {"最省钱", "最健康", "最快"}, _labels16
+    assert _labels16 <= {"最省钱", "最健康", "最快", "均衡"}, _labels16
     for p in n_plans:
         assert p["nsga2"]["front"] == 1
         assert p["mains"] >= 4
@@ -5735,9 +5810,9 @@ def _selftest() -> None:
     _sig16 = [(p["label"], _basket_key(p)) for p in optimize_plans(kept, SAMPLE_COUPONS, c)]
     _sig16b = [(p["label"], _basket_key(p)) for p in optimize_plans(kept, SAMPLE_COUPONS, c)]
     assert _sig16 == _sig16b, "NSGA-II 必须可复现（固定随机种子）"
-    #     d) 加权路径保留可用（method="weighted"）
+    #     d) 加权路径保留可用（method="weighted"，同样不凑数）
     _w16 = optimize_plans(kept, SAMPLE_COUPONS, c, method="weighted")
-    assert _w16 and {p["label"] for p in _w16} <= {"最省钱", "最健康", "最快"}
+    assert _w16 and {p["label"] for p in _w16} <= {"最省钱", "最健康", "最快", "均衡"}
     #     e) 显式热量预算作为硬上限（可行解存在时必须全达标）
     _c16 = parse_constraints("4个人，预算300，每人500大卡以内")
     _kept16 = filter_menu(_normalize_menu(SAMPLE_MENU), _c16)
@@ -6120,7 +6195,7 @@ def main(argv: Sequence[str]) -> int:
             return 1
         plans = optimize_calorie_budget(kept, data["coupons"], constraints)
         # banner 已由 _print_data_source 统一输出，此处不重复
-        print("\n[热量预算配餐 · 主餐+小食+饮品 Top-3]")
+        print(f"\n[热量预算配餐 · 主餐+小食+饮品（{len(plans)} 套，席位自适应）]")
         print(render_plans(plans))
         return 0
 
@@ -6218,7 +6293,7 @@ def main(argv: Sequence[str]) -> int:
 
     plans = optimize_plans(kept, data["coupons"], constraints)
     # banner 已由 _print_data_source 统一输出（demo/fallback 必显式标注），此处不重复
-    print("\n[Top-3 方案（NSGA-II 帕累托前沿）]")
+    print(f"\n[方案（NSGA-II 帕累托前沿，{len(plans)} 套自适应席位）]")
     print(render_plans(plans))
     if plans:
         print(recommend_plan(plans, constraints))

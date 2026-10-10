@@ -13,7 +13,7 @@
 3. 营养雷达图（人均 热量/蛋白/脂肪/钠 四维，SVG 手绘）
 4. 券组合明细表（每套方案用了哪些券、省了多少）
 5. 分摊账单表（每人应付多少，均摊口径）
-6. 三方案商品明细对比表
+6. 方案商品明细对比表（席位自适应：跟随前沿有效多样性，1–5 套）
 
 数据真实性
 ----------
@@ -56,14 +56,15 @@ DEMO_INPUT = "我们4个人，预算100，一个减脂，一个不吃辣，一�
 #: 基线商品编码：朴素点法 = 每人 1 份板烧鸡腿堡，不用任何券
 BASELINE_PRODUCT_CODE = "P001"
 
-#: 方案展示顺序（用户视角：省钱 → 健康 → 快）
-PLAN_ORDER = ("最省钱", "最健康", "最快")
+#: 方案展示顺序（用户视角：省钱 → 健康 → 快 → 均衡补席）
+PLAN_ORDER = ("最省钱", "最健康", "最快", "均衡")
 
 #: 方案配色（麦当劳主题色系）
 PLAN_COLORS: Dict[str, Dict[str, str]] = {
     "最省钱": {"main": "#da291c", "light": "#fdecea"},   # 麦当劳红
     "最健康": {"main": "#00a651", "light": "#e8f7ef"},   # 绿
-    "最快": {"main": "#f59e0b", "light": "#fef5e7"},     # 琥珀
+    "最快":   {"main": "#f59e0b", "light": "#fef5e7"},   # 琥珀
+    "均衡":   {"main": "#2f6fed", "light": "#eef3fe"},   # 蓝（补席）
 }
 BASELINE_COLOR = "#8a8f98"
 
@@ -86,9 +87,9 @@ def run_scenario(user_input: str) -> Dict[str, Any]:
     if not plans:
         raise SystemExit("优化器未返回任何方案，无法生成报告")
 
-    by_label = {p["label"]: p for p in plans}
-    ordered = [by_label[lb] for lb in PLAN_ORDER if lb in by_label]
-    ordered += [p for p in plans if p["label"] not in PLAN_ORDER]  # 兜底：未知标签排后
+    # 席位全量保留（同标签可能有多套，如两个「均衡」），按展示顺序排
+    order_rank = {lb: i for i, lb in enumerate(PLAN_ORDER)}
+    ordered = sorted(plans, key=lambda p: order_rank.get(p["label"], len(PLAN_ORDER)))
 
     # 基线：朴素点法（每人 1 份基准单品，不用券），价格取自 SAMPLE_MENU 真实单价
     base_item = next(
@@ -180,7 +181,7 @@ def _nutrition_matrix(plans: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def bar_chart_svg(baseline_total: float, plans: Sequence[Dict[str, Any]]) -> str:
-    """价格对比柱状图：基线 + 三方案最终价（含原价参考刻线）。"""
+    """价格对比柱状图：基线 + 各方案最终价（含原价参考刻线）。"""
     W, H = 680, 420
     plot_l, plot_r, plot_t, plot_b = 70, 650, 50, 350
     plot_h = plot_b - plot_t
@@ -240,9 +241,9 @@ def bar_chart_svg(baseline_total: float, plans: Sequence[Dict[str, Any]]) -> str
 
 
 def radar_chart_svg(matrix: Sequence[Dict[str, Any]]) -> str:
-    """营养雷达图：人均 热量/蛋白/脂肪/钠 四维，三方案叠加对比。
+    """营养雷达图：人均 热量/蛋白/脂肪/钠 四维，各方案叠加对比。
 
-    每个维度以三方案中的最大值为 100%（外圈），真实数值标注在顶点旁。
+    每个维度以各方案中的最大值为 100%（外圈），真实数值标注在顶点旁。
     """
     W, H = 680, 540
     cx, cy, R = 340, 280, 190
@@ -257,7 +258,7 @@ def radar_chart_svg(matrix: Sequence[Dict[str, Any]]) -> str:
         a = math.radians(angle_deg)
         return cx + r * math.cos(a), cy + r * math.sin(a)
 
-    # 各维度归一化分母（三方案最大值，防零）
+    # 各维度归一化分母（各方案最大值，防零）
     denoms = {}
     for _, _, key, _ in axes:
         denoms[key] = max((row[key] for row in matrix), default=0.0) or 1.0
@@ -477,6 +478,7 @@ def render_report(data: Dict[str, Any]) -> str:
         "{{SAVED}}": f"{saved:.2f}",
         "{{SAVED_PCT}}": f"{saved_pct:.1f}",
         "{{BUDGET_PP}}": esc(budget_pp_note),
+        "{{PLAN_COUNT}}": len(plans),
         "{{BAR_SVG}}": bar_svg,
         "{{RADAR_SVG}}": radar_svg,
         "{{RADAR_TABLE}}": radar_table_rows,
@@ -585,7 +587,7 @@ TEMPLATE = """<!DOCTYPE html>
 
 <header class="hd">
   <div class="logo"><span class="b">麦麦拼单大脑</span> 演示报告</div>
-  <div class="sub">{{PEOPLE}} 人拼单 · 三套方案对比 · 券组合优化 · 营养达标</div>
+  <div class="sub">{{PEOPLE}} 人拼单 · {{PLAN_COUNT}} 套方案对比 · 券组合优化 · 营养达标</div>
   <div class="meta">数据来源：optimizer.py 真实运行输出（未核价，价格为估算）｜生成时间 {{GENERATED_AT}}</div>
 </header>
 
@@ -621,7 +623,7 @@ TEMPLATE = """<!DOCTYPE html>
   <div class="save">
     <span class="big">省 ¥{{SAVED}}</span><span class="pct">↓ {{SAVED_PCT}}%</span>
   </div>
-  <div class="note">降幅按基线总价计算：¥{{SAVED}} ÷ 基线总价。三套方案最终价均低于基线。</div>
+  <div class="note">降幅按基线总价计算：¥{{SAVED}} ÷ 基线总价。各方案最终价均低于基线。</div>
 </section>
 
 <section class="card chart-box">
@@ -644,7 +646,7 @@ TEMPLATE = """<!DOCTYPE html>
       <th>蛋白 g</th><th>脂肪 g</th><th>钠 mg</th></tr></thead>
       <tbody>{{RADAR_TABLE}}</tbody>
     </table>
-    <div class="tbl-note">雷达图各维度以三方案中的最大值为外圈（100%）。
+    <div class="tbl-note">雷达图各维度以各方案中的最大值为外圈（100%）。
     减脂目标（标准档）：单餐 ≤600 kcal、脂肪 ≤25 g、蛋白 ≥20 g。</div>
   </section>
 </div>
@@ -668,11 +670,11 @@ TEMPLATE = """<!DOCTYPE html>
     <tbody>{{BILL_ROWS}}</tbody>
   </table>
   <div class="tbl-note">均摊口径：每人应付 = 券后总价 ÷ {{PEOPLE}}（与 README 口径一致）。
-  三套方案人均均在预算（{{BUDGET_PP}}）之内。</div>
+  各方案人均均在预算（{{BUDGET_PP}}）之内。</div>
 </section>
 
 <section class="card">
-  <h2><span class="no">表格 3</span>三方案商品明细对比</h2>
+  <h2><span class="no">表格 3</span>方案商品明细对比（{{PLAN_COUNT}} 套，席位自适应）</h2>
   <table>
     <thead><tr><th style="text-align:left">方案</th><th style="text-align:left">商品清单</th>
     <th>原价</th><th>券优惠</th><th>券后价</th><th>人均</th><th>用券 / 体检</th></tr></thead>

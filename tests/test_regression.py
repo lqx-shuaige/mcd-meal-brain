@@ -46,10 +46,11 @@ class TestStandardFourPeople:
     """输入：4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜。
 
     预期：
-    * 输出 3 套方案（Top-3：最省钱/最健康/最快）
+    * 输出 3–5 套方案（席位自适应：命名极值 + 均衡补席，不凑数）
+    * 命名极值标签齐全（最省钱/最健康/最快），补席标「均衡」
     * 每套方案主食份数 ≥ 4（拼单底线：每人至少 1 份主食）
     * 约束解析正确命中忌辣硬约束
-    * 三套方案标签齐全、总量预算达标
+    * 总量预算达标
     """
 
     INPUT = "4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"
@@ -61,14 +62,18 @@ class TestStandardFourPeople:
         assert "spicy" in c["hard"]["exclude_tags"], "「不吃辣」必须进硬约束"
         assert "减脂" in c["personas"] and "要赠品" in c["personas"]
 
-    def test_three_plans(self, menu, coupons):
+    def test_adaptive_plans(self, menu, coupons):
         c = opt.parse_constraints(self.INPUT)
         kept = opt.filter_menu(menu, c)
         assert kept, "过滤后候选集不得为空"
         plans = opt.optimize_plans(kept, coupons, c)
-        assert len(plans) == 3, f"应输出 3 套方案，实际 {len(plans)}"
+        assert 3 <= len(plans) <= 5, f"应输出 3–5 套方案，实际 {len(plans)}"
         labels = {p["label"] for p in plans}
-        assert labels == {"最省钱", "最健康", "最快"}, labels
+        assert {"最省钱", "最健康", "最快"} <= labels, labels
+        assert labels <= {"最省钱", "最健康", "最快", "均衡"}, labels
+        # 每套方案篮子唯一（不复制同一篮子换标签充数）
+        keys = [opt._basket_key(p) for p in plans]
+        assert len(keys) == len(set(keys)), "方案篮子必须互不相同"
 
     def test_mains_at_least_people(self, menu, coupons):
         c = opt.parse_constraints(self.INPUT)
@@ -117,7 +122,7 @@ class TestSinglePerson:
     """输入：1个人，想吃板烧鸡腿堡。
 
     预期：
-    * 仍输出 3 套方案（单人也有省钱/健康/快的取舍）
+    * 输出 3–5 套方案（单人也有省钱/健康/快的取舍，席位自适应）
     * 方案简洁：主食 1 份、总份数小（不硬塞凑单）
     * 人数解析为 1，人均 = 总价
     """
@@ -128,10 +133,10 @@ class TestSinglePerson:
         c = opt.parse_constraints(self.INPUT)
         assert c["people_count"] == 1
 
-    def test_three_plans_compact(self, menu, coupons):
+    def test_plans_compact(self, menu, coupons):
         c = opt.parse_constraints(self.INPUT)
         plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c)
-        assert len(plans) == 3
+        assert 3 <= len(plans) <= 5
         for p in plans:
             assert p["people_count"] == 1
             assert p["mains"] >= 1, "单人至少 1 份主食"
@@ -628,30 +633,34 @@ class TestCalorieBudget:
 # =========================================================================
 
 class TestNSGA2:
-    """optimize_plans 默认走 NSGA-II：四目标帕累托前沿取三个极值点。
+    """optimize_plans 默认走 NSGA-II：四目标帕累托前沿取命名极值并自适应补席。
 
     目标（全部最小化）：价格 / 人均热量 / 油炸份数 / 负人均蛋白。
     预期：
-    * Top-3 标签齐全（最省钱/最健康/最快），全部位于第一前沿
-    * 三套方案互不支配（帕累托最优）
+    * 命名极值标签齐全（最省钱/最健康/最快），补席标「均衡」，共 3–5 套
+    * 各方案互不支配（帕累托最优）；篮子唯一（不复制篮子换标签充数）
     * 标签方向正确（最省钱=最低价，最健康=最高蛋白）
     * 固定种子可复现；加权路径 method="weighted" 保留可用
     """
 
     INPUT = "4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"
 
-    def test_three_extreme_plans(self, menu, coupons):
+    def test_adaptive_seats(self, menu, coupons):
         c = opt.parse_constraints(self.INPUT)
         plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c)
-        assert len(plans) == 3
-        assert {p["label"] for p in plans} == {"最省钱", "最健康", "最快"}
+        assert 3 <= len(plans) <= 5
+        labels = {p["label"] for p in plans}
+        assert {"最省钱", "最健康", "最快"} <= labels, labels
+        assert labels <= {"最省钱", "最健康", "最快", "均衡"}, labels
         for p in plans:
             assert p["mains"] >= 4
             assert p["final_price_cny"] <= 100.0 + 1e-6
             assert p["nsga2"]["front"] == 1
+        keys = [opt._basket_key(p) for p in plans]
+        assert len(keys) == len(set(keys)), "方案篮子必须互不相同"
 
     def test_pareto_mutual_nondomination(self, menu, coupons):
-        """三套方案两两互不支配（均为帕累托最优解）。"""
+        """各方案两两互不支配（均为帕累托最优解，含均衡补席）。"""
         c = opt.parse_constraints(self.INPUT)
         plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c)
         objs = [opt._plan_objectives(p) for p in plans]
@@ -681,12 +690,14 @@ class TestNSGA2:
         assert sig() == sig()
 
     def test_weighted_method_available(self, menu, coupons):
-        """原加权路径保留可用（对照与回退）。"""
+        """原加权路径保留可用（对照与回退，同样不凑数）。"""
         c = opt.parse_constraints(self.INPUT)
         plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c,
                                    method="weighted")
         assert plans
-        assert {p["label"] for p in plans} <= {"最省钱", "最健康", "最快"}
+        assert {p["label"] for p in plans} <= {"最省钱", "最健康", "最快", "均衡"}
+        keys = [opt._basket_key(p) for p in plans]
+        assert len(keys) == len(set(keys)), "加权路径也不复制篮子充数"
 
     def test_dominates_and_front_sort(self):
         """支配关系与非支配排序的基础语义。"""
@@ -712,6 +723,113 @@ class TestNSGA2:
         for p in plans:
             assert p["nutrition"]["per_capita_kcal"] <= 500 + 1e-6, (
                 p["label"], p["nutrition"]["per_capita_kcal"])
+
+
+# =========================================================================
+# 批 2+ · 方案席位自适应（不凑数 / 不倒噪声）
+# =========================================================================
+
+class TestAdaptiveSeats:
+    """席位数跟随前沿**有效多样性**（1–5），而非固定 3：
+
+    * 有明显不同的取舍档位才占席位（近重复解折叠）；
+    * 前沿退化时输出 1–2 套即止，不复制篮子换标签充数；
+    * 补席与「最健康」同一达标口径，不反超命名极值的标签语义。
+    """
+
+    INPUT = "4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"
+
+    @staticmethod
+    def _vary(base, price=0, kcal=0, protein=0, fat=0):
+        p = {"final_price_cny": base["final_price_cny"] + price,
+             "nutrition": dict(base["nutrition"])}
+        p["nutrition"]["per_capita_kcal"] += kcal
+        p["nutrition"]["per_capita_protein_g"] += protein
+        p["nutrition"]["per_capita_fat_g"] += fat
+        return p
+
+    BASE = {"final_price_cny": 100.0,
+            "nutrition": {"per_capita_kcal": 500.0,
+                          "per_capita_protein_g": 25.0,
+                          "per_capita_fat_g": 20.0}}
+
+    def test_plans_distinct_thresholds(self):
+        """明显差异判据：价差 ≥ max(¥1, 5%)、热量 75、蛋白/脂肪 6。"""
+        b = self.BASE
+        cheap = dict(b, final_price_cny=15.0)   # 5% 仅 ¥0.75 → ¥1 下限生效
+        assert not opt._plans_distinct(cheap, self._vary(cheap, price=0.99))
+        assert opt._plans_distinct(cheap, self._vary(cheap, price=1.00))
+        assert not opt._plans_distinct(b, self._vary(b, price=4.99))   # < 5%
+        assert opt._plans_distinct(b, self._vary(b, price=5.00))       # = 5%
+        assert not opt._plans_distinct(b, self._vary(b, kcal=74))
+        assert opt._plans_distinct(b, self._vary(b, kcal=75))
+        assert not opt._plans_distinct(b, self._vary(b, protein=5.9))
+        assert opt._plans_distinct(b, self._vary(b, protein=6.0))
+        assert not opt._plans_distinct(b, self._vary(b, fat=5.9))
+        assert opt._plans_distinct(b, self._vary(b, fat=6.0))
+
+    def test_degenerate_menu_no_padding(self):
+        """菜单极小：有几席算几席，不借加权路径凑满 3 套。"""
+        tiny = [
+            {"productCode": "T1", "name": "麦香鱼", "price": 1750, "kcal": 325,
+             "protein": 16, "fat": 13, "sodium": 556, "carb": 35},
+            {"productCode": "T2", "name": "中薯条", "price": 1200, "kcal": 289,
+             "protein": 4, "fat": 12, "sodium": 165, "carb": 38},
+        ]
+        c = opt.parse_constraints("1个人")
+        plans = opt.optimize_plans(tiny, [], c)
+        assert 1 <= len(plans) <= 2, f"微型菜单应输出 1–2 套，实际 {len(plans)}"
+        keys = [opt._basket_key(p) for p in plans]
+        assert len(keys) == len(set(keys)), "不得复制篮子换标签充数"
+
+    def test_top_n_cap(self, menu, coupons):
+        """top_n 上限生效（席位只少不多）。"""
+        c = opt.parse_constraints(self.INPUT)
+        plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c, top_n=2)
+        assert len(plans) <= 2
+
+    def test_extras_respect_fat_target(self, menu, coupons):
+        """脂肪目标存在且有达标者时：补席不超标，且不反超「最健康」蛋白。"""
+        c = opt.parse_constraints(self.INPUT)          # 减脂 → max_fat_g
+        fat_cap = c["targets"]["max_fat_g"]
+        assert fat_cap, "该输入应解析出脂肪目标"
+        plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c)
+        assert plans
+        for p in plans:
+            if p["label"] == "均衡":
+                assert p["nutrition"]["per_capita_fat_g"] <= fat_cap + 1e-6, (
+                    "补席违反脂肪目标", p["nutrition"]["per_capita_fat_g"])
+        health = next(p for p in plans if p["label"] == "最健康")
+        assert health["nutrition"]["per_capita_protein_g"] == \
+            max(p["nutrition"]["per_capita_protein_g"] for p in plans), (
+                "「最健康」必须仍是全场蛋白最高（标签语义不被补席反超）")
+
+    def test_calorie_budget_single_combo(self):
+        """热量预算分支：可行组合唯一时不复制篮子换标签。"""
+        tiny = [
+            {"productCode": "T1", "name": "麦香鱼", "price": 1750, "kcal": 325,
+             "protein": 16, "fat": 13, "sodium": 556, "carb": 35},
+        ]
+        c = opt.parse_constraints("2个人，每人330大卡以内")
+        plans = opt.optimize_calorie_budget(tiny, [], c)
+        assert len(plans) == 1, f"唯一可行组合应只输出 1 套，实际 {len(plans)}"
+        assert plans[0]["label"] == "热量预算·最省"
+
+    def test_recommend_header_adapts(self, menu, coupons):
+        """对比总表标题跟随实际席位数；不足 3 套时附不凑数说明。"""
+        c = opt.parse_constraints(self.INPUT)
+        text = opt.recommend_plan(
+            opt.optimize_plans(opt.filter_menu(menu, c), coupons, c), c)
+        assert text.startswith("【方案对比")
+        tiny = [
+            {"productCode": "T1", "name": "麦香鱼", "price": 1750, "kcal": 325,
+             "protein": 16, "fat": 13, "sodium": 556, "carb": 35},
+        ]
+        c1 = opt.parse_constraints("1个人")
+        few = opt.optimize_plans(tiny, [], c1)
+        text1 = opt.recommend_plan(few, c1)
+        if len(few) < 3:
+            assert "不凑数" in text1
 
 
 # =========================================================================
