@@ -500,9 +500,24 @@ def parse_constraints(user_input: str) -> Dict[str, Any]:
             "max_sodium_mg": t["sodium"],
             "tier": tier,
         }
-    kcal_cap = _find_number(text, [r"(\d+)\s*(?:大卡|千卡|kcal|卡)"])
+    # 热量预算（扩展分支 D）：
+    #   「每人500大卡以内」→ 人均硬上限；「总热量2000大卡」→ 按人数换算为人均；
+    #   其余「500大卡」类表达沿用既有语义（人均上限）。
+    kcal_pp = _find_number(text, [
+        r"(?:每人|人均|平均|一个人)\s*(?:不超过|最多|至多|上限|控制在)?\s*(\d+(?:\.\d+)?)\s*(?:大卡|千卡|kcal|卡)",
+    ])
+    kcal_total = _find_number(text, [
+        r"(?:总热量|总卡路里|总共|一共)\s*(?:不超过|最多|至多)?\s*(\d+(?:\.\d+)?)\s*(?:大卡|千卡|kcal|卡)",
+    ])
+    if kcal_pp:
+        kcal_cap = kcal_pp
+    elif kcal_total:
+        kcal_cap = kcal_total / max(people_count, 1)
+    else:
+        kcal_cap = _find_number(text, [r"(\d+(?:\.\d+)?)\s*(?:大卡|千卡|kcal|卡)"])
     if kcal_cap:
         targets["max_calories_kcal"] = kcal_cap
+        targets["kcal_scope"] = "per_person"
         targets.setdefault("tier", "custom")
     fat_cap = _find_number(text, [r"脂肪\s*(?:不超过|低于|少于)?\s*(\d+)", r"(\d+)\s*g?\s*脂肪"])
     if fat_cap:
@@ -1902,6 +1917,166 @@ def optimize_pareto(
             p["price_vs_next_cny"] = None
             p["kcal_saved_vs_next"] = None
     return plans
+
+
+# ---------------------------------------------------------------------------
+# 4.2 按热量预算配餐（扩展分支 D）：主餐 + 小食 + 饮品，人均热量 ≤ 预算
+#
+#     与 optimize_plans 的区别：
+#     * optimize_plans 在「篮子总量」层面优化（总热量上限 = 人均上限 × 人数），
+#       允许成员之间热量分布不均；
+#     * optimize_calorie_budget 在「每人组合」层面构造：1 主餐 + 0–1 小食 + 0–1 饮品，
+#       人均热量 ≤ 预算由构造保证——直接回答「4 个人每人 500 大卡以内怎么点」。
+# ---------------------------------------------------------------------------
+
+#: 热量预算配餐的三个方案定位
+CALORIE_BUDGET_LABELS = ("热量预算·最省", "热量预算·高蛋白", "热量预算·均衡混搭")
+
+
+def _meal_role(item: Dict[str, Any]) -> str:
+    """主餐 / 小食 / 饮品 三分法（标签来自 infer_tags，与 strategy.md 字典同步）。"""
+    tags = item.get("tags") or []
+    if "main" in tags:
+        return "main"
+    if "drink" in tags:
+        return "drink"
+    return "side"
+
+
+def _calorie_budget_combos(items: List[Dict[str, Any]],
+                           cap_kcal: float) -> List[Tuple[int, ...]]:
+    """枚举「1 主餐 + 0–1 小食 + 0–1 饮品」且组合热量 ≤ cap 的单人组合。
+
+    主餐是硬结构（每人至少 1 份）；小食/饮品可缺省（预算紧张时只点主餐 + 零卡饮）。
+    """
+    mains: List[int] = []
+    sides: List[int] = []
+    drinks: List[int] = []
+    for i, it in enumerate(items):
+        role = _meal_role(it)
+        if role == "main":
+            mains.append(i)
+        elif role == "side":
+            sides.append(i)
+        else:
+            drinks.append(i)
+
+    combos: List[Tuple[int, ...]] = []
+    for m in mains:
+        m_kcal = items[m]["kcal"]
+        if m_kcal > cap_kcal:
+            continue                     # 主餐本身超预算 → 该主餐无解
+        rem = cap_kcal - m_kcal
+        combos.append((m,))              # 仅主餐
+        for s in sides:
+            s_kcal = items[s]["kcal"]
+            if s_kcal > rem:
+                continue
+            combos.append((m, s))        # 主餐 + 小食
+            for d in drinks:
+                if s_kcal + items[d]["kcal"] <= rem:
+                    combos.append((m, s, d))   # 主餐 + 小食 + 饮品（完整结构）
+        for d in drinks:
+            if items[d]["kcal"] <= rem:
+                combos.append((m, d))    # 主餐 + 饮品
+    return combos
+
+
+def _combo_stats(combo: Tuple[int, ...],
+                 items: List[Dict[str, Any]]) -> Tuple[float, int, float]:
+    """单人组合的 (热量, 成本/分, 蛋白质)。"""
+    return (sum(items[i]["kcal"] for i in combo),
+            sum(items[i]["price"] for i in combo),
+            sum(items[i]["protein"] for i in combo))
+
+
+def optimize_calorie_budget(
+    menu: List[Dict[str, Any]],
+    coupons: List[Dict[str, Any]],
+    constraints: Dict[str, Any],
+    top_n: int = 3,
+) -> List[Dict[str, Any]]:
+    """**按热量预算配餐**（扩展分支 D）：输出人均热量 ≤ 预算的主餐+小食+饮品 Top-3。
+
+    * 热量预算：``targets.max_calories_kcal``（**人均硬上限**，由「每人 X 大卡」解析；
+      未显式给出时按减脂档位 tier 推断，默认 standard=600 kcal）；
+    * 方案 1「最省」：预算内成本最低的单人组合 × 人数；
+    * 方案 2「高蛋白」：蛋白质最高的单人组合 × 人数；
+    * 方案 3「均衡混搭」：不同主餐的最省组合轮流分配（多样性最好）；
+    * 无解（热量最低的主餐也超预算）：**不静默放宽**，输出差距说明 + 调整建议。
+
+    每套方案附 ``calorie_budget`` 字段：
+    ``{"cap_per_person_kcal", "per_capita_kcal", "headroom_kcal", "mode"}``。
+    """
+    items = _normalize_menu(menu)
+    people = max(int(constraints.get("people_count") or 1), 1)
+    targets = constraints.get("targets") or {}
+    tier = targets.get("tier") or "standard"
+    cap = targets.get("max_calories_kcal") or DIET_TIERS.get(tier, DIET_TIERS["standard"])["kcal"]
+    cap = float(cap)
+
+    combos = _calorie_budget_combos(items, cap)
+    if not combos:
+        mains = [it for it in items if _meal_role(it) == "main"]
+        if mains:
+            best = min(mains, key=lambda x: (x["kcal"], x["price"]))
+            gap = best["kcal"] - cap
+            reason = (
+                f"热量预算 {cap:.0f} kcal/人 内无可行组合：热量最低的主餐「{best['name']}」"
+                f"已有 {best['kcal']:.0f} kcal，超出预算 {gap:.0f} kcal。"
+                f"建议：1) 将热量预算上调至 ≥ {best['kcal']:.0f} kcal/人；"
+                f"2) 或接受不含主餐的轻食组合（小食+饮品）。"
+            )
+        else:
+            reason = "菜单中没有任何主餐，无法按「每人 1 份主餐」的底线配餐。"
+        return [{
+            "label": "热量预算无解", "degraded": True, "degrade_reason": reason,
+            "items": [], "coupons": [], "subtotal_cny": 0, "discount_cny": 0,
+            "final_price_cny": 0, "per_capita_cny": 0, "people_count": people,
+            "mains": 0, "units": 0, "nutrition": {},
+            "nutrition_flags": ["热量预算内无解，详见说明"],
+            "coupon_availability": None,
+        }]
+
+    cheapest = min(combos, key=lambda cb: (_combo_stats(cb, items)[1],
+                                           _combo_stats(cb, items)[0]))
+    ranked_protein = sorted(combos, key=lambda cb: (-_combo_stats(cb, items)[2],
+                                                    _combo_stats(cb, items)[1]))
+    protein_best = ranked_protein[0]
+    if protein_best == cheapest:
+        protein_best = next((cb for cb in ranked_protein if cb != cheapest), cheapest)
+
+    plans: List[Dict[str, Any]] = []
+    for label, combo in ((CALORIE_BUDGET_LABELS[0], cheapest),
+                         (CALORIE_BUDGET_LABELS[1], protein_best)):
+        plans.append(_basket_to_plan(list(combo) * people, items, coupons,
+                                     constraints, label))
+
+    # 方案 3：均衡混搭——每个主餐保留其最省组合，取 ≤3 个不同主餐轮流分配到人。
+    # 优先「主餐+小食+饮品」完整结构（更贴合配餐语义），无完整结构时退化为任意组合。
+    full_struct = [cb for cb in combos if len(cb) == 3]
+    mix_pool = full_struct if full_struct else combos
+    best_per_main: Dict[int, Tuple[int, ...]] = {}
+    for cb in sorted(mix_pool, key=lambda cb: _combo_stats(cb, items)[1]):
+        best_per_main.setdefault(cb[0], cb)
+    distinct = list(best_per_main.values())[:min(3, people)]
+    if len(distinct) > 1:
+        base, extra = divmod(people, len(distinct))
+        basket: List[int] = []
+        for j, cb in enumerate(distinct):
+            basket.extend(list(cb) * (base + (1 if j < extra else 0)))
+        plans.append(_basket_to_plan(basket, items, coupons, constraints,
+                                     CALORIE_BUDGET_LABELS[2]))
+
+    for p in plans:
+        per_kcal = float((p.get("nutrition") or {}).get("per_capita_kcal") or 0.0)
+        p["calorie_budget"] = {
+            "cap_per_person_kcal": cap,
+            "per_capita_kcal": per_kcal,
+            "headroom_kcal": round(cap - per_kcal, 1),
+            "mode": "per_person",
+        }
+    return plans[:top_n]
 
 
 # ---------------------------------------------------------------------------
@@ -3349,7 +3524,9 @@ def compare_channels(
 def render_plans(plans: List[Dict[str, Any]]) -> str:
     """把 Top-3 方案渲染成可读文本（金额一律「元」）。"""
     icon = {"最省钱": "🍔", "最健康": "🥗", "最快": "⚡",
-            "减配方案": "🥶", "分步下单方案": "📝"}
+            "减配方案": "🥶", "分步下单方案": "📝",
+            "热量预算·最省": "🔥", "热量预算·高蛋白": "💪",
+            "热量预算·均衡混搭": "🥗", "热量预算无解": "🚫"}
     out: List[str] = []
     for i, p in enumerate(plans, 1):
         out.append(f"{icon.get(p['label'], '🍟')} 方案 {chr(64 + i)}｜{p['label']}")
@@ -3374,6 +3551,12 @@ def render_plans(plans: List[Dict[str, Any]]) -> str:
             out.append(
                 f"├ 营养标签：总热量 {n['total_kcal']:.0f} kcal｜人均 {n['per_capita_kcal']:.0f} kcal"
                 f"｜人均蛋白 {n['per_capita_protein_g']:.1f} g｜人均脂肪 {n['per_capita_fat_g']:.1f} g"
+            )
+        cb = p.get("calorie_budget")
+        if cb:
+            out.append(
+                f"├ 热量预算：人均 {cb['per_capita_kcal']:.0f} / {cb['cap_per_person_kcal']:.0f} kcal"
+                f"（余 {cb['headroom_kcal']:.0f} kcal）"
             )
         if p.get("fairness"):
             fr = p["fairness"]
@@ -4428,6 +4611,36 @@ def _selftest() -> None:
     assert _is_retryable_error(_ue.HTTPError(MCP_URL, 400, "Bad Request", None, None)) is False
     assert _is_retryable_error(TimeoutError("timeout")) is True
 
+    # 15) 热量预算配餐（扩展分支 D）
+    cb_c = parse_constraints("4个人，每人500大卡以内")
+    assert cb_c["targets"]["max_calories_kcal"] == 500, cb_c["targets"]
+    assert cb_c["targets"]["kcal_scope"] == "per_person"
+    assert cb_c["people_count"] == 4
+    # 总热量口径换算：4 人总热量 2000 大卡 → 人均 500
+    cb_t = parse_constraints("4个人，总热量2000大卡")
+    assert cb_t["targets"]["max_calories_kcal"] == 500, cb_t["targets"]
+    # 无「每人/总」前缀的既有语义不回归：仍按人均上限
+    cb_plain = parse_constraints("500大卡以内")
+    assert cb_plain["targets"]["max_calories_kcal"] == 500
+    # 样例菜单 + 500 kcal/人：可行组合存在且人均不超预算
+    cb_kept = filter_menu(_normalize_menu(SAMPLE_MENU), cb_c)
+    cb_plans = optimize_calorie_budget(cb_kept, SAMPLE_COUPONS, cb_c)
+    assert 2 <= len(cb_plans) <= 3, len(cb_plans)
+    for p in cb_plans:
+        assert p["mains"] >= 4, "每人 1 份主餐的底线必须守住"
+        assert p["nutrition"]["per_capita_kcal"] <= 500 + 1e-6, (
+            p["label"], p["nutrition"]["per_capita_kcal"])
+        assert "calorie_budget" in p and p["calorie_budget"]["headroom_kcal"] >= -1e-6
+    # 高蛋白方案蛋白 ≥ 最省方案（同一可行域内）
+    prot = {p["label"]: p["nutrition"]["per_capita_protein_g"] for p in cb_plans}
+    assert prot["热量预算·高蛋白"] >= prot["热量预算·最省"] - 1e-6, prot
+    # 预算过低（连热量最低的主餐都装不下）→ 显式无解说明，不崩溃、不静默放宽
+    cb_hard = parse_constraints("4个人，每人50大卡以内")
+    cb_kept2 = filter_menu(_normalize_menu(SAMPLE_MENU), cb_hard)
+    cb_plans2 = optimize_calorie_budget(cb_kept2, SAMPLE_COUPONS, cb_hard)
+    assert len(cb_plans2) == 1 and cb_plans2[0]["degraded"] is True
+    assert "超出预算" in cb_plans2[0]["degrade_reason"]
+
     print("[selftest] 全部断言通过 ✅")
 
 
@@ -4615,6 +4828,43 @@ def main(argv: Sequence[str]) -> int:
         _print_data_source(data)
         result = optimize_group_plans(data["menu"], data["coupons"], members)
         print(render_group_result(result))
+        return 0
+
+    if argv and argv[0] == "--calorie-budget":
+        # 热量预算配餐（扩展分支 D）：--calorie-budget "4个人，每人500大卡以内" [--demo|--strict]
+        user_input = next((a for a in argv[1:] if not a.startswith("-")),
+                          "4个人，每人500大卡以内")
+        print("=" * 68)
+        print("用户输入：", user_input)
+        print("=" * 68)
+        constraints = parse_constraints(user_input)
+        cap = (constraints.get("targets") or {}).get("max_calories_kcal")
+        if not cap:
+            print("❌ 未识别到热量预算。示例输入：「4个人，每人500大卡以内」", file=sys.stderr)
+            return 1
+        print(f"[解析结果] 人数 {constraints['people_count']}"
+              f"｜人均热量上限 {cap:.0f} kcal（tier="
+              f"{(constraints.get('targets') or {}).get('tier', 'custom')}）")
+        data = acquire_planning_data(
+            constraints, demo="--demo" in argv, strict="--strict" in argv,
+            store_code=_arg_value(argv, "--store"), be_code=_arg_value(argv, "--becode"))
+        if data["source"] == "error":
+            for line in _mcp_unavailable_hint(data["error"]):
+                print(line, file=sys.stderr)
+            return 1
+        _print_data_source(data)
+        try:
+            kept = filter_menu(data["menu"], constraints)
+        except ValueError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+        plans = optimize_calorie_budget(kept, data["coupons"], constraints)
+        print("\n[热量预算配餐 · 主餐+小食+饮品 Top-3]")
+        if data["banner"]:
+            print(data["banner"])
+        print(render_plans(plans))
+        if data["banner"]:
+            print(data["banner"])
         return 0
 
     if argv and argv[0] == "--dump-schema":

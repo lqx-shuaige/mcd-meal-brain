@@ -1,6 +1,6 @@
 ---
 name: mcd-meal-brain
-description: 面向多人场景的麦当劳智能点餐决策引擎。当用户需要多人拼单、优化点餐组合、在预算/口味/健康/活动之间做取舍时使用。
+description: 面向多人场景的麦当劳智能点餐决策引擎。当用户需要多人拼单、优化点餐组合、在预算/口味/健康/活动之间做取舍，或积分换好物、预约取餐、按热量预算配餐时使用。
 ---
 
 # 麦麦拼单大脑
@@ -19,8 +19,12 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 - 用户询问「怎么点最省」「有什么活动」「怎么凑满减」
 - 用户提到「得来速」「车道取餐」「开车去取」「DT」「Drive Through」等驾车取餐场景
 - 用户询问「哪个渠道便宜」「到手多少钱」「自取和外卖差多少」等渠道比价场景
+- 用户提到「积分」「兑换」「积分商城」「麦麦商城」「积分有什么用」等积分场景（→ 扩展分支 A）
+- 用户提到「预约」「预定」「明天中午取」「提前点」等预约取餐场景（→ 扩展分支 B）
+- 用户询问「有什么活动」「能抽奖吗」「抽奖有什么奖品」等活动/抽奖场景（→ 扩展分支 C）
+- 用户给出热量目标（「每人 500 大卡以内」「控制热量」「低卡配餐」）（→ 扩展分支 D）
 
-**不触发**：单人单品简单点餐；纯查询（「我有什么券」「订单到哪了」）；用户直接指定了订单内容。
+**不触发**：单人单品简单点餐；用户直接指定了订单内容。
 
 ---
 
@@ -41,6 +45,95 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 `optimizer.py::compare_channels()`；范围仅限麦当劳内部渠道，外部平台不做（详见 workflow.md 专题）。
 
 ---
+
+## 扩展分支（主链路之外的增值场景）
+
+主链路（8 步）产出 Top-3 方案之外，以下分支按需启用。分支复用主链路的硬约束、
+写操作确认与异常处理规则，不另起炉灶。
+
+### 分支 A · 积分换好物（积分商城）
+
+**触发**：「积分怎么用」「积分商城有什么」「兑换什么划算」「积分换好物」「查下我的积分」。
+
+1. **查余额**：`query-my-account` → `availablePoint`（可用）/ `currentMouthExpirePoint`
+   （本月将过期，> 0 时优先提醒消耗快过期积分）；
+2. **查商品**：`mall-points-products`（`catRuleIds=1>4` 商品券、`2` 实物、`2>8` 周边、
+   `1>6>20` 生日派对等；不传查全部）——逐项核对 `status`（**仅 2=上架 可兑**，3 售罄/4 下架/5 预热
+   要说明）与 `upTime`/`downTime`（不在兑换窗口内的跳过并注明原因）；
+3. **兑换比价**（同一餐品「积分券 vs 现金点餐」）：
+   - 券后到手价 = `price`（兑换时还需支付的现金，多为 0）+ `point`（所需积分）；
+   - 用 `query-meals` 查同款/同组合的**现金单价** → 输出对比「券后到手价 vs 现金价，
+     省 ¥X、需 Y 积分」；
+   - ⚠️ MCP 不提供「积分 ↔ 现金」折算率：**不折算积分的货币价值**，只并列呈现
+     「省钱额」与「积分消耗」两个量纲，取舍留给用户；
+4. **余额不足**：如实告知「积分不够，还差 Z 分」，提示点餐可攒积分；**不**为凑积分推荐
+   超预算点单（预算是更高优先级约束，见冲突优先级）；
+5. **兑换下单**：用户选具体商品 → `mall-product-detail(spuId)` 展示 SKU → 用户选定 SKU 并
+   **明确确认** → `mall-create-order`（写操作，走规则 4：spuCategory=2 实物必传 `addressId`；
+   多件兑换分别下单且**串行排队**）。
+
+> 实测锚点（2026-10-10）：账户可用积分 73.9；商品券在架 24 款，最低 50 积分（6.9 元派/麦炫酷），
+> 最高 800 积分（28.8 元巨无霸四件套 / 28.9 元板烧四件套）。
+
+### 分支 B · 预约取餐
+
+**触发**：「明天中午取」「预约周六 11 点」「提前预定」「后天到了直接拿」。
+
+1. `now-time-info` 取服务器时间确定「今天」；用户给的取餐时间先与其对齐，至少精确到分钟；
+2. `query-nearby-stores(beType=1)` 查门店：返回中 `reservation=true` 的门店**完整展示**
+   `reservationTimeOptions`（可预约时段），`today=true` 标注「(今天)」——
+   **可预约时段以门店返回为准，不自行编造时间**；
+3. `query-meals(storeCode, orderType, beType, reservationDate="yyyy-MM-dd HH:mm")` 拉取
+   **预约时段菜单**（预约场景 `reservationDate` 必传；同一门店不同时段的菜单/价格可能不同，
+   预约菜单与实时菜单不可混用）；
+4. 走主链路第 4–7 步（过滤 / 券盘点 / 优化 / 核价）：`calculate-price` **同样传
+   `reservationDate`**，保证核价口径与预约时段一致；
+5. **方案输出增加「预约取餐」选项**：与「立即取餐」并排展示，标注预约时间；
+   预约菜单与当前菜单有差异（缺货/价格变动）时如实说明；
+6. 用户确认预约方案后 `create-order(..., reservationDate=...)`（写操作，规则 4；
+   得来速/团餐按各自 beCode 规则传参）。
+
+### 分支 C · 活动抽奖提示
+
+**触发**：方案输出 / 下单完成后**追加提示**；用户问「有什么活动」「能抽奖吗」时主动查询。
+
+1. `query-lottery-info` 查当前抽奖活动（**只查不抽**）：读 `activityStatusText`（仅「进行中」
+   才提示）、`activityName`、`drawDecision.nextConsumption`（本次实际消耗，如「本次将消耗
+   24 积分」）、`prizes`（挑 2–3 个代表性奖品展示）；
+2. 在方案末尾追加：「🎰 点餐后可参与抽奖：{活动名}，单次消耗 {nextConsumption.text}，
+   有机会抽 {奖品示例}」；
+3. **禁止**未经用户明确确认调用 `draw-lottery`（写操作，规则 4——「试试看」不算确认）；
+   `drawDecision.resourceEligible=false` 时不引导抽奖，如实转述 `reason`（如积分不足）；
+4. **严禁**用 `availableTimes=0/null` 自行推断不能抽——资格与消耗一律以 `drawDecision` 为准
+   （混合规则下 `availableTimes=0` 且 `nextConsumption.type=POINTS` 仍可积分抽）。
+
+> 实测锚点（2026-10-10）：活动「周六麦金喜抽奖」进行中，单次 24 积分
+> （`drawDecision.nextConsumption` = POINTS 24），奖品含积分霸王餐、麦金卡 7 天、
+> 麦辣鸡腿堡 5 折券、立减 3 元券等。
+
+### 分支 D · 按热量预算配餐模式
+
+**触发**：用户输入热量目标，如「4 个人，每人 500 大卡以内」「每人控制在 600 千卡」。
+
+1. `optimizer.py::parse_constraints` 解析「每人 X 大卡 / 千卡 / kcal」→
+   `targets.max_calories_kcal`（**人均硬上限**，tier=custom）；
+2. 走主链路第 2–3 步拿真实菜单与营养表（`list-nutrition-foods`，名称精确匹配，不估算）；
+3. `optimizer.py::optimize_calorie_budget()` 生成**主餐 + 小食 + 饮品**组合：
+   - 每人组合 = 1 份主餐 + 0–1 份小食 + 0–1 份饮品，**人均热量 ≤ 预算**由构造保证
+     （不是事后过滤）；
+   - 输出 Top-3：最省（预算内成本最低）/ 高蛋白（蛋白密度最高）/ 均衡混搭（多样性）；
+   - 预算过低（最便宜主餐都装不下）时：**不静默放宽**，输出最低热量主餐 + 差距说明，
+     建议调整预算或减少人数；
+4. 每套方案标注人均热量与预算余量（如「人均 444 / 500 kcal，余 56 kcal」）；
+5. 验证：`python scripts/optimizer.py --calorie-budget "4个人，每人500大卡以内" [--demo]`。
+
+### 分支 E · 满意度评价领券（下单后闭环）
+
+1. 下单支付完成后（`query-order` 确认已支付），追加提示：「💬 完成本单满意度评价可领奖券」；
+2. 用户询问答卷结果 / 奖券内容 / 核销状态时：`query-survey-coupon(orderId)`——
+   `orderId` 只能来自用户本人提供或上游订单查询返回，**不得自行生成**；
+3. 返回的满意度描述、奖券标题、核销时间 / 核销状态、点餐方式**原样转述**；
+   未返回的原始答卷、会员号、couponId / couponCode 不猜测。
 
 ## 模糊输入处理（三层询问机制）
 
@@ -116,6 +209,7 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 | `addressId` | `delivery-query-addresses` / `delivery-create-address` |
 | `spuId` / `skuId` | `mall-points-products` 或 `mall-product-detail` |
 | `dateStr` / 场次 `id` | `query-party-store-date` / `query-party-store-session` |
+| `reservationDate` | 用户明确指定的未来取餐时间（先与 `now-time-info` 对齐）；可预约时段以 `query-nearby-stores` 返回的 `reservationTimeOptions` 为准 |
 | `orderId` | 用户提供，或上游订单查询返回 |
 
 拿不到就回到对应步骤重新获取，**不许编**。
@@ -190,6 +284,8 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 8. **不输出专业建议** —— 营养与热量数据仅供参考，不构成医疗、健康或膳食处方建议。
 9. **不混淆订单体系** —— 餐饮订单用 `order-list` / `query-order` / `create-order`，商城订单用 `mall-*`，不可交叉。
 10. **不重复拉取** —— 同一轮对话内菜单、券、门店结果复用，不反复调同一接口。
+11. **不折算积分货币价值** —— MCP 不提供积分 ↔ 现金汇率；兑换比价只并列「省钱额 + 积分消耗」，不编造折算率。
+12. **不编造预约时段** —— 可预约时间以门店返回的 `reservationTimeOptions` 为准；不在窗口内的时间不硬塞。
 
 ---
 
@@ -197,8 +293,8 @@ description: 面向多人场景的麦当劳智能点餐决策引擎。当用户�
 
 | 文件 | 内容 |
 |---|---|
-| `references/workflow.md` | 八步工作流详解 · 得来速场景要点 · 渠道比价专题 · 多人偏好解析 JSON · 输出字段细则 |
+| `references/workflow.md` | 八步工作流详解 · 得来速场景要点 · 渠道比价专题 · 多人偏好解析 JSON · 输出字段细则 · 积分商城/预约取餐/热量预算/抽奖与评价领餐券专题 |
 | `references/schema.json` | 结构化输出契约（JSON Schema draft-07，`plans` 数组：name / items / coupons / original_total / final_total / per_person / nutrition / genui） |
 | `references/tools.md` | 35 个 MCP 工具的参数与返回值注意事项 |
 | `references/strategy.md` | 菜品标签字典、营养约束映射、软硬约束处理逻辑 |
-| `scripts/optimizer.py` | 约束解析 · 硬约束过滤 · 组合优化 · 核价校验 · 渠道比价 · Schema 校验 |
+| `scripts/optimizer.py` | 约束解析 · 硬约束过滤 · 组合优化 · 热量预算配餐 · 核价校验 · 渠道比价 · Schema 校验 |

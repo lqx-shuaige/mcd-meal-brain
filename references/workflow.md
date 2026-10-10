@@ -247,3 +247,79 @@ create-order(..., takeWayCode)                             → 下单（需用�
 
 最后附**对比表**与**推荐结论**（含取舍理由），不要把选择权完全甩给用户。
 未通过官方核价的方案，必须标注「价格为估算，未核价」。
+
+---
+
+## 6. 扩展分支专题
+
+### 6.1 积分商城（积分换好物）
+
+**编排顺序**：`query-my-account`（余额）→ `mall-points-products`（商品）→
+`query-meals`（同款现金价，用于比价）→ `mall-product-detail`（SKU）→
+用户确认 → `mall-create-order`（写操作）。
+
+**兑换比价算法**（分支 A 第 3 步的展开）：
+
+| 量 | 来源 | 说明 |
+|---|---|---|
+| 券后到手价 | `mall-points-products` 的 `price` | 兑换时还需支付的现金（元字符串，多为 0） |
+| 积分消耗 | `mall-points-products` 的 `point` | 所需积分（字符串） |
+| 现金对比价 | `query-meals` 同款商品 `currentPrice` | 不含券直接点餐的价格 |
+| 输出 | 上述三项并列 | 「省 ¥X、需 Y 积分」，**不折算积分货币价值**（MCP 无汇率） |
+
+示例（2026-10-10 实测数据）：「18.8 元 2 份麦辣鸡翅」券需 **200 积分**；
+「3.9 元圆筒冰淇淋」券需 **100 积分**；「28.8 元巨无霸四件套」券需 **800 积分**。
+比价输出形如：「巨无霸四件套：现金点餐 ¥28.8 起，积分券后 ¥28.8 + 800 积分——
+该券实际是『积分兑换购买资格』，是否划算取决于你对积分价值的心理定价。」
+
+**边界**：
+- `status ≠ 2`（售罄/下架/预热）一律不推荐，如实说明状态；
+- 兑换窗口（`upTime`/`downTime`）外的不推荐；
+- 积分不足：告知差额，提示点餐攒积分；不为凑积分推荐超预算点单（预算优先级更高）。
+
+### 6.2 预约取餐
+
+**完整链路**：
+
+```
+now-time-info                     →  服务器时间基准（确定「今天」/可预约范围）
+query-nearby-stores(beType=1)     →  门店 + reservationTimeOptions（可预约时段）
+query-meals(..., reservationDate) →  预约时段菜单（必传 yyyy-MM-dd HH:mm）
+query-store-coupons(...)          →  券池（与预约场景同参数口径）
+calculate-price(..., reservationDate) →  预约口径核价（单位仍为「分」）
+create-order(..., reservationDate)    →  预约下单（写操作，需确认）
+```
+
+**要点**：
+- `reservationDate` 格式 `yyyy-MM-dd HH:mm`，仅预约场景传（`query-meals` /
+  `calculate-price` / `create-order` / `query-promotions` 四个工具一致）；
+- 可预约时段**只认门店返回**的 `reservationTimeOptions`，`today=true` 标「(今天)」；
+- 预约菜单与实时菜单**不可混用**——预约时段可能缺货或价格不同；
+- 方案输出时「预约取餐」与「立即取餐」并排展示，预约差异（缺货/价格变动）如实标注。
+
+### 6.3 按热量预算配餐
+
+**算法**（`optimizer.py::optimize_calorie_budget()`）：
+1. 解析「每人 X 大卡/千卡/kcal」→ 人均热量硬上限（tier=custom）；
+2. 菜单按 **主餐（main）/ 小食（非主非饮）/ 饮品（drink）** 三类划分（标签来自
+   `infer_tags`，与 strategy.md 字典同步）；
+3. 枚举每人组合「1 主餐 + 0–1 小食 + 0–1 饮品」，仅保留 **组合热量 ≤ 人均预算** 的；
+4. Top-3：**最省**（预算内成本最低）→ **高蛋白**（蛋白质最高）→ **均衡混搭**
+   （多种组合分配到人，多样性最好）；
+5. 每套方案标注「人均 kcal / 预算 kcal，余量」；
+6. 无解（最便宜主餐也超预算）：不静默放宽，输出最低热量主餐 + 差距说明 + 调整建议。
+
+**输出仍走 schema.json 契约**（`plans_to_doc()`），模式名为「热量预算配餐」。
+
+### 6.4 活动抽奖与满意度评价领券
+
+**抽奖提示**（方案/下单后追加，只查不抽）：
+- `query-lottery-info` → `activityStatusText`「进行中」才提示；
+- 提示模板：「🎰 点餐后可参与抽奖：{activityName}，单次消耗 {drawDecision.nextConsumption.text}，
+  有机会抽 {prizes 挑 2–3 个代表奖品}」；
+- 抽奖资格与消耗一律以 `drawDecision` 为准；未经明确确认不调 `draw-lottery`。
+
+**满意度评价领券**（下单后闭环）：
+- 支付完成后提示：「💬 完成本单满意度评价可领奖券」；
+- 查询：`query-survey-coupon(orderId)`——orderId 仅来自用户本人或上游订单查询；
+- 满意度描述 / 奖券标题 / 核销时间 / 核销状态 / 点餐方式**原样转述**，未返回字段不猜测。

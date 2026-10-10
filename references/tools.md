@@ -19,6 +19,10 @@
 > 直接拒绝）。得来速 = **beType=5**，不是 3。
 
 - `reservationDate`：仅预约场景传，格式 `yyyy-MM-dd HH:mm`；非预约不传。
+  **四个工具一致支持**：`query-meals` / `calculate-price` / `create-order` / `query-promotions`
+  （2026-10-10 schema 实测确认）。预约链路：可预约时段以 `query-nearby-stores` 返回的
+  `reservationTimeOptions` 为准；预约菜单/核价/下单三步的 `reservationDate` 必须同一值，
+  不可混用实时菜单。
 - `storeCode`：门店编码，绝大多数业务工具的必填项。
 - 团餐场景（beType=6）额外链路：`delivery-query-stores` → `query-meals` →（可选 `query-promotions` / `query-meal-assistance`）→ `calculate-price` → `create-order`。
 - 得来速场景（beType=5）链路：`query-nearby-stores(beType=5)` → `query-meals` / `query-store-coupons` / `calculate-price`（均 orderType=1 + beCode）→ `create-order`（`takeWayCode=take-dt-quick`）。
@@ -27,7 +31,7 @@
 
 | 工具名 | 用途 | 关键参数 | 返回值注意点 |
 |---|---|---|---|
-| `query-nearby-stores` | 到店场景查可点餐门店 | `beType`(1/5)、`searchType`(1=收藏,2=位置，默认1)；searchType=2 时 `city`+`keyword` 必填 | beType=1 返回门店**无 beCode**，后续不传；beType=5 返回**有 beCode**，后续必传。`reservation=true` 时需完整展示 `reservationTimeOptions`，`today=true` 标「(今天)」 |
+| `query-nearby-stores` | 到店场景查可点餐门店 | `beType`(1/5)、`searchType`(1=收藏,2=位置，默认1)；searchType=2 时 `city`+`keyword` 必填 | beType=1 返回门店**无 beCode**，后续不传；beType=5 返回**有 beCode**，后续必传。`reservation=true` 时需完整展示 `reservationTimeOptions`，`today=true` 标「(今天)」——**预约场景的取餐时段只认这里，不编造** |
 | `delivery-query-stores` | 外送场景按地址查可配送门店 | `addressId`、`beType`(2=麦乐送 / 6=团餐) | 返回 `storeCode` + `beCode`，团餐链路起点 |
 | `delivery-query-addresses` | 查用户配送地址列表 | 无 | 无地址时引导创建；团餐需再引导用户提供**预算金额与人数**以算人均 |
 | `delivery-create-address` | 新建配送地址（写操作） | `city`/`contactName`/`phone`(11位纯数字)/`address`/`addressDetail` 必填，`gender` | 返回 `addressId`，供外送/团餐下单使用 |
@@ -57,13 +61,13 @@
 | `query-my-coupons` | 查**用户卡包**里的券资产 | `page`(默认1，最多5)、`pageSize`(默认200，最大200) | **不做门店/渠道/配送校验，不承诺可用于当前订单** |
 | `query-store-coupons` | 查**【指定门店+订单类型】真实可用券** ★ | `storeCode`(必须全数字)+`orderType`+`beType`；`beCode` 按上表 | **这才是下单可用券的权威来源**。算券组合必须用它，不能用 `available-coupons`/`query-my-coupons` 代替 |
 | `query-promotions` | 查门店促销规则（满减/满折） | `storeCode`+`beCode`+`orderType=2`+`beType=6`；预约传 `reservationDate` | **仅企业团餐(beType=6)可用**。返回规则原始数据：`promotionType` 31=满额减 / 33=订单折扣；`ruleCategory` 30=满折、40=满减；`products.type` 1=包含/2=不包含/3=全部。**工具不做最优推荐，需模型自行解读计算** |
-| `query-survey-coupon` | 按订单号查 CSAT 满意度答卷与关联奖券 | `orderId`（用户提供，勿自行生成） | 仅可查本人订单；未返回的原始答卷/会员号/couponId 等**不要猜测** |
+| `query-survey-coupon` | 按订单号查 CSAT 满意度答卷与关联奖券 | `orderId`（用户提供，勿自行生成） | 仅可查本人订单；未返回的原始答卷/会员号/couponId 等**不要猜测**。**下单后闭环**（扩展分支 E）：支付完成后主动提示「完成本单满意度评价可领奖券」；用户询问答卷/奖券/核销状态时用本工具查询，返回字段**原样转述** |
 
 ## 4. 下单与订单（写操作，必须用户确认）
 
 | 工具名 | 用途 | 关键参数 | 返回值注意点 |
 |---|---|---|---|
-| `create-order` | **创建餐品订单**（写操作）★ | `storeCode`+`orderType`+`beType`；`orderType=2` 必传 `addressId`；`orderType=1` 必传 `takeWayCode`（来自 calculate-price 的 takeWayList）；团餐(beType=6)必传 `gmServiceCode`（来自 query-meal-assistance）；`items[]`、`remark`(≤50字，仅外送)、`needTableware` | 返回支付链接；需引导用户扫码/APP 支付，之后用 `query-order` 查状态 |
+| `create-order` | **创建餐品订单**（写操作）★ | `storeCode`+`orderType`+`beType`；`orderType=2` 必传 `addressId`；`orderType=1` 必传 `takeWayCode`（来自 calculate-price 的 takeWayList）；团餐(beType=6)必传 `gmServiceCode`（来自 query-meal-assistance）；`items[]`、`remark`(≤50字，仅外送)、`needTableware`、**`reservationDate`(预约场景必传，yyyy-MM-dd HH:mm)** | 返回支付链接；需引导用户扫码/APP 支付，之后用 `query-order` 查状态 |
 | `cancel-order` | 取消订单（写操作） | `orderId`+`cancelReasonCode`(1=改主意/2=重复/3=点错/4=地址电话错/5=时间错/-1=其它) | 成功后提示「订单已取消」 |
 | `query-order` | 查订单详情/状态 | `orderId` | 用户说「已支付/支付失败」时用它刷新状态 |
 | `order-list` | 查**快餐历史订单** | 无 | 商城订单要用 `mall-order-list`，勿混用 |
@@ -73,13 +77,13 @@
 
 | 工具名 | 用途 | 关键参数 | 返回值注意点 |
 |---|---|---|---|
-| `query-my-account` | 查积分账户详情 | 无 | 含余额与过期积分 |
-| `mall-points-products` | 查可兑换商品/券列表 | `catRuleIds`（多选逗号分隔） | 类目规则：1>4 商品券、2 实物、2>8 周边、2>9 实物礼品卡、1>6>20 生日派对、1>6>21 主题派对、1>6>22 麦麦体验营、1>6>25 品鉴会、1>6>34 读书会、1>6>40 积分兑换活动 |
-| `mall-product-detail` | 查兑换商品详情与 SKU | `spuId` | 用户选具体 SKU 后才能下单 |
+| `query-my-account` | 查积分账户详情 | 无 | 字段均为**字符串**：`availablePoint`(可用)/`accumulativePoint`(累计)/`usedPoint`(已用)/`currentMouthExpirePoint`(本月将过期)/`nextMouthExpirePoint`(下月将过期)/`expiredPoint`(已过期)/`frozenPoint`(冻结)。**本月将过期 > 0 时必须提醒用户优先消耗**。实测锚点(2026-10-10)：可用 73.9 麦享会积分 |
+| `mall-points-products` | 查可兑换商品/券列表 | `catRuleIds`（多选逗号分隔） | 类目规则：1>4 商品券、2 实物、2>8 周边、2>9 实物礼品卡、1>6>20 生日派对、1>6>21 主题派对、1>6>22 麦麦体验营、1>6>25 品鉴会、1>6>34 读书会、1>6>40 积分兑换活动。**兑换前必须核对**：`status` 枚举（1 仓库中/2 上架/**3 售罄/4 下架/5 预热**，仅 2 可兑）；`upTime`/`downTime` 兑换窗口（窗口外跳过并说明）；`point`(所需积分)与 `price`(还需支付的现金，元字符串，多为 0)均为**字符串**。**兑换比价**：`query-meals` 查同款现金单价 → 对比「券后到手价 vs 现金价」，输出省 ¥X + 需 Y 积分；MCP 无积分↔现金汇率，**不折算积分货币价值**。实测锚点(2026-10-10)：商品券在架 24 款，50–800 积分档 |
+| `mall-product-detail` | 查兑换商品详情与 SKU | `spuId` | 返回所有 SKU 规格信息，用户选择具体 SKU 后才能下单兑换。**前提**：spuId 必须来自 `mall-points-products` |
 | `mall-create-order` | 创建**积分兑换订单**（写操作） | `skuId`+`spuCategory`(1虚拟/2实物)；spuCategory=2 必传 `addressId`；`count` | 仅 `shopId=2`。**必须真实调用下单，禁止直接编造「下单成功」**。多商品必须**分别下单且串行排队**。不适用派对/活动类 → 用 `party-order-create` |
 | `mall-order-list` | 查商城订单列表 | `lastId`、`size`(默认10，>10 按10) | — |
 | `mall-order-detail` | 查商城订单详情 | `orderId` | 引导去麦当劳 APP 看凭证 |
-| `query-lottery-info` | 查积分抽奖活动信息（不抽） | 无 | 必须看 `drawDecision`：`resourceEligible` 判资格、`nextConsumption` 是本次实际消耗。**严禁**用 `availableTimes=0/null` 自行推断能否抽 |
+| `query-lottery-info` | 查积分抽奖活动信息（不抽） | 无 | 必须看 `drawDecision`：`resourceEligible` 判资格、`nextConsumption` 是本次实际消耗。**严禁**用 `availableTimes=0/null` 自行推断能否抽。**方案输出/下单后追加提示**（只查不抽）：`activityStatusText`「进行中」才提示「点餐后可参与抽奖：{activityName}，单次消耗 {nextConsumption.text}」。实测锚点(2026-10-10)：「周六麦金喜抽奖」进行中，单次 24 积分（POINTS），奖品含积分霸王餐/麦金卡7天/麦辣鸡腿堡5折券等 |
 | `draw-lottery` | **执行抽奖**（写操作） | 无 | 必须先展示 `nextConsumption` 并获用户**明确确认**（"试试看"不算）。有频控，短时间重复调用返回「操作太频繁」，不扣积分 |
 | `query-my-prizes` | 查抽奖所得奖品 | `pageNum`、`pageSize`(默认10，最大50) | 按中奖时间倒序；含可用/已用/过期等状态 |
 

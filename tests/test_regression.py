@@ -532,3 +532,92 @@ class TestExtremeBudgetDegrade:
         # 应至少包含减配方案或分步下单建议
         assert any(l in ("减配方案", "分步下单方案") for l in labels), \
             f"应包含降级方案，实际: {labels}"
+
+
+# =========================================================================
+# 扩展分支 D · 按热量预算配餐（每人 X 大卡以内）
+# =========================================================================
+
+class TestCalorieBudget:
+    """输入：4个人，每人500大卡以内。
+
+    预期：
+    * 「每人 X 大卡」解析为人均硬上限（kcal_scope=per_person）
+    * 输出 2–3 套「主餐+小食+饮品」组合，人均热量 ≤ 预算（构造保证）
+    * 每人 1 份主餐底线（mains ≥ 人数）
+    * 预算过低时显式无解说明，不崩溃、不静默放宽
+    """
+
+    INPUT = "4个人，每人500大卡以内"
+
+    def test_parse_per_person_kcal(self):
+        c = opt.parse_constraints(self.INPUT)
+        assert c["people_count"] == 4
+        assert c["targets"]["max_calories_kcal"] == 500
+        assert c["targets"]["kcal_scope"] == "per_person"
+        assert c["targets"]["tier"] == "custom"
+
+    def test_parse_total_kcal_converted(self):
+        """总热量口径按人数换算为人均。"""
+        c = opt.parse_constraints("4个人，总热量2000大卡")
+        assert c["targets"]["max_calories_kcal"] == 500
+
+    def test_parse_bare_kcal_no_regression(self):
+        """无「每人/总」前缀的既有语义不回归：仍按人均上限。"""
+        c = opt.parse_constraints("500大卡以内")
+        assert c["targets"]["max_calories_kcal"] == 500
+
+    def test_plans_within_budget(self, menu, coupons):
+        c = opt.parse_constraints(self.INPUT)
+        kept = opt.filter_menu(menu, c)
+        plans = opt.optimize_calorie_budget(kept, coupons, c)
+        assert 2 <= len(plans) <= 3, f"应输出 2–3 套方案，实际 {len(plans)}"
+        for p in plans:
+            assert p["mains"] >= 4, f"「{p['label']}」主餐 {p['mains']} 份 < 4 人"
+            assert p["nutrition"]["per_capita_kcal"] <= 500 + 1e-6, (
+                f"「{p['label']}」人均热量 {p['nutrition']['per_capita_kcal']} 超预算 500")
+            cb = p["calorie_budget"]
+            assert cb["cap_per_person_kcal"] == 500
+            assert cb["headroom_kcal"] >= -1e-6
+
+    def test_combo_structure(self, menu, coupons):
+        """单人组合结构 = 1 主餐 + 0–1 小食 + 0–1 饮品（角色划分正确）。"""
+        c = opt.parse_constraints(self.INPUT)
+        items = opt._normalize_menu(menu)
+        combos = opt._calorie_budget_combos(items, 500)
+        assert combos, "500 kcal/人 下应存在可行组合"
+        mains_idx = {i for i, it in enumerate(items) if opt._meal_role(it) == "main"}
+        for cb in combos:
+            assert len(cb) <= 3
+            assert sum(1 for i in cb if i in mains_idx) == 1, "每人组合恰含 1 份主餐"
+            assert sum(it["kcal"] for it in (items[i] for i in cb)) <= 500 + 1e-6
+
+    def test_protein_plan_beats_budget_plan(self, menu, coupons):
+        """高蛋白方案的人均蛋白 ≥ 最省方案（同一可行域内）。"""
+        c = opt.parse_constraints(self.INPUT)
+        kept = opt.filter_menu(menu, c)
+        plans = opt.optimize_calorie_budget(kept, coupons, c)
+        by_label = {p["label"]: p for p in plans}
+        assert by_label["热量预算·高蛋白"]["nutrition"]["per_capita_protein_g"] \
+            >= by_label["热量预算·最省"]["nutrition"]["per_capita_protein_g"] - 1e-6
+
+    def test_tight_cap_explicit_infeasible(self, menu, coupons):
+        """预算过低（每人 50 大卡）：显式无解说明，不崩溃。"""
+        c = opt.parse_constraints("4个人，每人50大卡以内")
+        kept = opt.filter_menu(menu, c)
+        plans = opt.optimize_calorie_budget(kept, coupons, c)
+        assert len(plans) == 1
+        p = plans[0]
+        assert p["degraded"] is True
+        assert "热量预算无解" in p["label"]
+        assert "超出预算" in p["degrade_reason"]
+        assert "建议" in p["degrade_reason"]
+
+    def test_doc_validates(self, menu, coupons):
+        """热量预算方案同样满足输出契约。"""
+        c = opt.parse_constraints(self.INPUT)
+        kept = opt.filter_menu(menu, c)
+        plans = opt.optimize_calorie_budget(kept, coupons, c)
+        doc = opt.plans_to_doc(plans, scene="热量预算配餐", people_count=4)
+        errs = opt.validate_plans_doc(doc)
+        assert errs == [], errs
