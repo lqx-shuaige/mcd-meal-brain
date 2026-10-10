@@ -157,6 +157,229 @@ def _extract_ingredients(text: str) -> List[str]:
     return found
 
 
+def _estimate_coupon_availability(coupon: Dict[str, Any]) -> Dict[str, Any]:
+    """估算单张券的当前可用性（有真实历史数据 → 用数据；无 → 特征推断）。
+    
+    Returns
+    -------
+    dict
+        ``{"level": "高"/"中"/"低"/"未知", "reason": str,
+           "historical": Optional[float]}`` —— ``historical`` 是 MCP 历史可用率
+        （0~1），仅当 MCP 券数据中确实存在该字段时才填充；**绝不编造**。
+    """
+    # ① MCP 历史可用数据：字段名兼容多种可能的 schema 命名
+    for k in ("successRate", "availabilityRate", "historicalSuccessRate",
+              "usageRate", "usableRate", "historical"):
+        v = coupon.get(k)
+        if isinstance(v, (int, float)) and 0 <= v <= 1:
+            rate = float(v)
+            level = "高" if rate >= 0.75 else ("中" if rate >= 0.4 else "低")
+            return {
+                "level": level,
+                "reason": f"历史可用率 {rate * 100:.0f}%（MCP 实测数据）",
+                "historical": rate,
+            }
+    # MCP 有时返回带百分号的字符串（如 "82%"）
+    for k in ("successRate", "availabilityRate", "historicalSuccessRate"):
+        v = coupon.get(k)
+        if isinstance(v, str) and v.endswith("%"):
+            try:
+                rate = float(v.rstrip("%")) / 100.0
+                if 0 <= rate <= 1:
+                    level = "高" if rate >= 0.75 else ("中" if rate >= 0.4 else "低")
+                    return {
+                        "level": level,
+                        "reason": f"历史可用率 {rate * 100:.0f}%（MCP 实测数据）",
+                        "historical": rate,
+                    }
+            except ValueError:
+                pass
+    # ② 无历史数据 → 基于券特征推断（门槛 / 时段限制 / 门店限制）
+    min_spend_yuan = float(coupon.get("minSpend") or 0) / 100.0
+    time_restricted = bool(coupon.get("timeRestriction")
+                           or coupon.get("timeLimited")
+                           or coupon.get("validTimeSlot"))
+    store_restricted = bool(coupon.get("storeRestriction")
+                            or coupon.get("storeLimited")
+                            or (coupon.get("appliesToStores") is not None))
+    product_restricted = bool(coupon.get("appliesToProductCodes"))
+    if time_restricted or store_restricted:
+        return {"level": "低", "reason": "存在时段或门店使用限制，可用性较低",
+                "historical": None}
+    if min_spend_yuan >= 60:
+        return {"level": "低", "reason": f"满 ¥{min_spend_yuan:.0f} 才可用，门槛较高",
+                "historical": None}
+    if product_restricted:
+        return {"level": "中", "reason": "仅限指定商品可用，需确认篮子是否包含目标商品",
+                "historical": None}
+    if min_spend_yuan >= 30:
+        return {"level": "中", "reason": f"满 ¥{min_spend_yuan:.0f} 可用，门槛适中",
+                "historical": None}
+    return {"level": "高", "reason": "门槛低且无额外限制，可用性高",
+            "historical": None}
+
+
+def _estimate_coupons_availability(coupons: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """批量估算券组合的当前可用性（Task 2）。
+    
+    输入：从 ``_coupon_dp`` 选出的券组合列表（已应用）。
+    输出：``{"overall": "高"/"中"/"低"/"未知", "coupons": [...]}``，
+    overall 取组合中最低可用性。
+    无券时返回 None。
+    """
+    if not coupons:
+        return None
+    levels = {"高": 3, "中": 2, "低": 1, "未知": 0}
+    details = []
+    for c in coupons:
+        avail = _estimate_coupon_availability(c)
+        details.append({
+            "couponId": c.get("couponId"),
+            "name": c.get("name"),
+            "level": avail["level"],
+            "reason": avail["reason"],
+        })
+    overall = min(details, key=lambda d: levels.get(d["level"], 0))["level"]
+    return {"overall": overall, "coupons": details}
+
+
+def _generate_degraded_plans(
+    items: List[Dict[str, Any]],
+    people: int,
+    max_budget_cny: float,
+    coupons: List[Dict[str, Any]],
+    constraints: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """预算不足时生成降级方案（Task 3：极端预算处理）。
+
+    策略：
+    1. **减配方案**：按价格升序贪心选择，生成预算内最便宜的可行篮子。
+       若主食不足，明确标注差距并建议调整预算或分批下单。
+    2. 若预算连最便宜的商品都买不起，生成一个说明性的空方案，
+       明确报告预算差距，不崩溃。
+
+    Parameters
+    ----------
+    items : 已归一化的菜单列表（价格单位为分）
+    people : 用餐人数
+    max_budget_cny : 有效预算上限（元）
+    coupons : 可用券列表
+    constraints : 结构化约束
+
+    Returns
+    -------
+    list[dict]
+        降级方案列表（含 degraded=True 与 degrade_reason 说明），
+        或预算不足的说明方案。
+    """
+    max_budget_cents = int(round(max_budget_cny * 100))
+
+    # --- 减配方案：贪心选择最便宜商品填满预算 ---
+    # 按 (价格, 原始索引) 排序，保留原始索引以便 _basket_to_plan 查找
+    sorted_with_idx = sorted(
+        [(items[i]["price"], i) for i in range(len(items))],
+        key=lambda x: x[0]
+    )
+
+    basket: List[int] = []
+    total_cost_cents = 0
+    mains_count = 0
+
+    for price, orig_idx in sorted_with_idx:
+        if total_cost_cents + price <= max_budget_cents:
+            basket.append(orig_idx)
+            total_cost_cents += price
+            if "main" in (items[orig_idx].get("tags") or []):
+                mains_count += 1
+        else:
+            break  # 已排序，后续更贵，直接停止
+
+    if basket:
+        # 构建减配方案（真实篮子，在预算内）
+        plan = _basket_to_plan(basket, items, coupons, constraints, "减配方案")
+        plan["degraded"] = True
+
+        # 明确说明降级原因
+        if mains_count < people:
+            cheapest_main_price = min(
+                (items[i]["price"] for i in range(len(items))
+                 if "main" in (items[i].get("tags") or [])),
+                default=0
+            ) / 100.0
+            gap = people - mains_count
+            plan["degrade_reason"] = (
+                f"当前预算 ¥{max_budget_cny:.2f} 下，最优方案超出预算，"
+                f"已自动减配为预算内组合（¥{total_cost_cents / 100.0:.2f}）。"
+                f"⚠️ 主食 {mains_count} 份 < {people} 人（差 {gap} 份）。"
+                f"建议：1) 调整预算至 ¥{cheapest_main_price * people:.2f} 以上；"
+                f"2) 减少用餐人数；"
+                f"3) 分批下单（每批控制在预算内）。"
+            )
+        else:
+            plan["degrade_reason"] = (
+                f"当前预算 ¥{max_budget_cny:.2f} 下，最优方案超出预算，"
+                f"已自动减配为预算内组合（¥{total_cost_cents / 100.0:.2f}），"
+                f"主食 {mains_count} 份已满足 {people} 人。"
+            )
+
+        # 若预算充足且人数 ≥ 2，追加「分步下单方案」建议
+        # （分两批可分别凑满减门槛，可能更划算）
+        if people >= 2 and max_budget_cny / people >= 15:
+            half_people = people // 2
+            half_budget = max_budget_cny / 2
+            split_plan = {
+                "label": "分步下单方案",
+                "degraded": True,
+                "degrade_reason": (
+                    f"若不想减配，建议分两批下单："
+                    f"第一批 {half_people} 人（预算 ¥{half_budget:.2f}），"
+                    f"第二批 {people - half_people} 人（预算 ¥{max_budget_cny - half_budget:.2f}）。"
+                    f"两批可分别使用满减券，可能比一次性下单更划算。"
+                ),
+                "items": [],
+                "coupons": [],
+                "subtotal_cny": 0,
+                "discount_cny": 0,
+                "final_price_cny": 0,
+                "per_capita_cny": 0,
+                "people_count": people,
+                "mains": 0,
+                "units": 0,
+                "nutrition": {},
+                "nutrition_flags": ["建议方案：分批下单，详见降级说明"],
+                "coupon_availability": None,
+            }
+            return [plan, split_plan]
+        return [plan]
+    else:
+        # 预算极低，连最便宜的商品都买不起
+        cheapest_price = sorted_with_idx[0][0] if sorted_with_idx else 0
+        cheapest_name = items[sorted_with_idx[0][1]]["name"] if sorted_with_idx else "无商品"
+        gap_cny = (cheapest_price - max_budget_cents) / 100.0
+        return [{
+            "label": "预算不足",
+            "degraded": True,
+            "degrade_reason": (
+                f"当前预算 ¥{max_budget_cny:.2f} 过低，"
+                f"最便宜的商品「{cheapest_name}」需 ¥{cheapest_price / 100.0:.2f}，"
+                f"超出预算 ¥{gap_cny:.2f}。"
+                f"建议：1) 调整预算至 ¥{cheapest_price / 100.0:.2f} 以上；"
+                f"2) 减少用餐人数。"
+            ),
+            "items": [],
+            "coupons": [],
+            "subtotal_cny": 0,
+            "discount_cny": 0,
+            "final_price_cny": 0,
+            "per_capita_cny": 0,
+            "people_count": people,
+            "mains": 0,
+            "units": 0,
+            "nutrition": {},
+            "nutrition_flags": ["预算不足，无法生成可行方案"],
+            "coupon_availability": None,
+        }]
+
 def parse_constraints(user_input: str) -> Dict[str, Any]:
     """把用户自然语言解析为结构化约束。
 
@@ -186,17 +409,42 @@ def parse_constraints(user_input: str) -> Dict[str, Any]:
     order_type = SCENE_ORDERTYPE.get(be_type) if be_type else None
 
     # --- 预算 -------------------------------------------------------------
-    per_capita = _find_number(text, [r"人均\s*(\d+(?:\.\d+)?)", r"平均\s*(\d+(?:\.\d+)?)"])
+    # 总预算上限（如「总预算100」「预算100」「控制在100」）
     total = _find_number(
         text,
         [r"(?:总预算|总价|一共|总共|控制在)\s*(\d+(?:\.\d+)?)", r"预算\s*(\d+(?:\.\d+)?)"],
     )
-    if per_capita is not None and total is None:
-        budget = {"type": "per_capita", "amount_cny": per_capita}
-    elif total is not None:
-        budget = {"type": "total", "amount_cny": total}
+    # 每人预算上限（如「人均30」「每人不超过30」「每人最多25」「人均最多50」）
+    # 可与总预算同时存在，两者同时作为硬约束生效
+    per_person = _find_number(text, [
+        r"每人\s*(?:不超过|最多|上限|至多|花)\s*(\d+(?:\.\d+)?)",
+        r"人均\s*(?:不超过|最多|上限|至多|花)\s*(\d+(?:\.\d+)?)",
+        r"人均\s*(\d+(?:\.\d+)?)",
+        r"平均\s*(\d+(?:\.\d+)?)",
+    ])
+    if per_person is not None or total is not None:
+        # 优先记录总额；无总额但有每人上限时以 per_capita 类型记录
+        if total is not None:
+            budget = {
+                "type": "total",
+                "amount_cny": total,
+                "total_cny": total,
+                "per_person_cny": per_person,
+            }
+        else:
+            budget = {
+                "type": "per_capita",
+                "amount_cny": per_person,
+                "total_cny": None,
+                "per_person_cny": per_person,
+            }
     else:
-        budget = {"type": "total", "amount_cny": None}
+        budget = {
+            "type": "total",
+            "amount_cny": None,
+            "total_cny": None,
+            "per_person_cny": None,
+        }
 
     # --- 硬约束 -----------------------------------------------------------
     exclude_ingredients = _extract_ingredients(text)
@@ -206,7 +454,7 @@ def parse_constraints(user_input: str) -> Dict[str, Any]:
     if re.search(r"(不吃|不能吃|忌|不要|别)\s*(油炸|炸的|煎炸)", text):
         exclude_tags.append("fried")
 
-    max_per_capita = per_capita
+    max_per_capita = per_person
     max_single = _find_number(
         text, [r"不点超过\s*(\d+(?:\.\d+)?)", r"单品不超过\s*(\d+(?:\.\d+)?)"]
     )
@@ -1318,8 +1566,21 @@ def _basket_to_plan(
         flags.append("人均脂肪超标")
     if targets.get("min_protein_g") and protein / people < targets["min_protein_g"]:
         flags.append("人均蛋白不足")
+
+    # ---- 预算约束检查（Task 1：总预算 + 每人预算）----
+    budget = constraints.get("budget") or {}
+    budget_total_cny = budget.get("total_cny")
+    budget_pp_cny = budget.get("per_person_cny")
+    if budget_total_cny is not None and final / 100.0 > float(budget_total_cny):
+        flags.append(f"超预算 ¥{round(final / 100.0 - float(budget_total_cny), 2)}（总预算 ¥{budget_total_cny}）")
+    if budget_pp_cny is not None and (final / 100.0) / people > float(budget_pp_cny):
+        flags.append(f"人均超限 ¥{round((final / 100.0) / people - float(budget_pp_cny), 2)}（每人上限 ¥{budget_pp_cny}）")
+
     if not flags:
         flags.append("营养达标")
+
+    # ---- 券可用性评估（Task 2）----
+    coupon_availability = _estimate_coupons_availability(coupon_res["coupons"])
 
     return {
         "label": label,
@@ -1334,6 +1595,7 @@ def _basket_to_plan(
             }
             for c in coupon_res["coupons"]
         ],
+        "coupon_availability": coupon_availability,
         "subtotal_cny": round(subtotal / 100.0, 2),
         "discount_cny": round(coupon_res["discount"] / 100.0, 2),
         "final_price_cny": round(final / 100.0, 2),
@@ -1425,6 +1687,10 @@ def optimize_plans(
 
     ``promotions``：来自 ``fetch_group_meal_promotions()`` 的团餐促销规则（beType=6 专用），
     会与 ``coupons`` 合并后一并参与券组合优化。
+
+    **预算硬约束（Task 1）**：同时支持总预算上限和每人预算上限。
+    若最优方案超出预算，自动生成降级方案（减配/分步下单，Task 3），
+    并明确告知预算差距。
     """
     items = _normalize_menu(menu)
     coupons = list(coupons or []) + list(promotions or [])
@@ -1482,6 +1748,31 @@ def optimize_plans(
         pick2 = list(range(len(items)))
     if pick2:
         pool.append(_basket_to_plan(pick2, items, coupons, constraints, "最快"))
+
+    # --- Task 1 & 3：预算硬约束 + 降级方案 --------------------------------
+    budget = constraints.get("budget") or {}
+    budget_total = budget.get("total_cny")
+    budget_pp = budget.get("per_person_cny")
+
+    effective_max_cny: Optional[float] = None
+    if budget_total is not None:
+        effective_max_cny = float(budget_total)
+    if budget_pp is not None:
+        pp_total = float(budget_pp) * people
+        if effective_max_cny is None or pp_total < effective_max_cny:
+            effective_max_cny = pp_total
+
+    if effective_max_cny is not None:
+        within_budget = [p for p in pool if p["final_price_cny"] <= effective_max_cny + 0.01]
+        if within_budget:
+            pool = within_budget
+        else:
+            # 无任何方案在预算内 → 生成降级方案（Task 3：减配 / 分步下单）
+            degraded = _generate_degraded_plans(
+                items, people, effective_max_cny, coupons, constraints
+            )
+            if degraded:
+                return degraded
 
     # --- 帕累托去重 + 加权排序 --------------------------------------------
     for p in pool:
@@ -2486,27 +2777,33 @@ def compare_channels(
 
 def render_plans(plans: List[Dict[str, Any]]) -> str:
     """把 Top-3 方案渲染成可读文本（金额一律「元」）。"""
-    icon = {"最省钱": "🍔", "最健康": "🥗", "最快": "⚡"}
+    icon = {"最省钱": "🍔", "最健康": "🥗", "最快": "⚡",
+            "减配方案": "🥶", "分步下单方案": "📝"}
     out: List[str] = []
     for i, p in enumerate(plans, 1):
         out.append(f"{icon.get(p['label'], '🍟')} 方案 {chr(64 + i)}｜{p['label']}")
+        if p.get("degraded"):
+            out.append(f"├ ⚠️ {p.get('degrade_reason', '该方案为降级方案')}")
         out.append(f"├ 人数：{p['people_count']} 人｜主食 {p.get('mains', 0)} 份（每人至少 1 份 ✅）")
-        out.append(f"├ 总份数：{p['units']} 份")
+        out.append(f"├ 总份数：{p.get('units', 0)} 份")
         out.append("├ 商品明细：")
-        for ln in p["items"]:
+        for ln in p.get("items") or []:
             out.append(f"│   · {ln['name']} ×{ln['quantity']}   ¥{ln['subtotal_cny']:.2f}")
-        if p["coupons"]:
+        if p.get("coupons"):
             for c in p["coupons"]:
                 out.append(f"├ 券组合：{c['name']}（{c['couponId']}）  −¥{c['discount_cny']:.2f}")
         else:
             out.append("├ 券组合：无可用券")
         out.append(f"├ 原价：¥{p['subtotal_cny']:.2f}  →  最终价：¥{p['final_price_cny']:.2f}")
         out.append(f"├ 人均：¥{p['per_capita_cny']:.2f}")
-        n = p["nutrition"]
-        out.append(
-            f"├ 营养标签：总热量 {n['total_kcal']:.0f} kcal｜人均 {n['per_capita_kcal']:.0f} kcal"
-            f"｜人均蛋白 {n['per_capita_protein_g']:.1f} g｜人均脂肪 {n['per_capita_fat_g']:.1f} g"
-        )
+        if p.get("coupon_availability"):
+            out.append(f"├ 券可用性：{p['coupon_availability']['overall']}")
+        n = p.get("nutrition")
+        if n:
+            out.append(
+                f"├ 营养标签：总热量 {n['total_kcal']:.0f} kcal｜人均 {n['per_capita_kcal']:.0f} kcal"
+                f"｜人均蛋白 {n['per_capita_protein_g']:.1f} g｜人均脂肪 {n['per_capita_fat_g']:.1f} g"
+            )
         if p.get("fairness"):
             fr = p["fairness"]
             parts = []
@@ -2516,7 +2813,12 @@ def render_plans(plans: List[Dict[str, Any]]) -> str:
                     s += f"（{pm['reason']}）"
                 parts.append(s)
             out.append(f"├ 公平性：整体 {fr['overall']:.2f}（木桶效应）｜成员满足度：{'｜'.join(parts)}")
-        out.append(f"└ 体检：{'；'.join(p['nutrition_flags'])}（评分 {p['score']}）")
+        if "营养达标" in p.get("nutrition_flags", []):
+            out.append(f"└ 体检：营养达标")
+        else:
+            flags = p.get("nutrition_flags", [])
+            if flags:
+                out.append(f"└ 体检：{'；'.join(flags)}")
         out.append("")
     return "\n".join(out)
 

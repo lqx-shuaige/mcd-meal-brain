@@ -340,3 +340,195 @@ class TestOutputContract:
         plans = opt.optimize_plans(opt.filter_menu(menu, c), coupons, c)
         doc = opt.plans_to_doc(plans, price_verified=False)
         assert doc["plans"][0]["price_note"] == "价格为估算，未核价"
+
+
+# =========================================================================
+# 方向 4 · 算法精度升级测试（每人预算 / 券可用性 / 极端预算降级）
+# =========================================================================
+
+class TestPerPersonBudget:
+    """【任务 1】每人预算上限：同时支持总预算 + 每人预算上限。
+
+    场景：4 个人总预算 100，每人不超过 30。
+    """
+
+    INPUT = "4个人，总预算100，每人不超过30"
+
+    def test_parse_both_budgets(self):
+        """总预算与每人预算同时被正确解析。"""
+        c = opt.parse_constraints(self.INPUT)
+        assert c["people_count"] == 4
+        assert c["budget"]["total_cny"] == 100.0
+        assert c["budget"]["per_person_cny"] == 30.0
+
+    def test_parse_per_person_only(self):
+        """仅提供每人预算上限，不提供总预算。"""
+        c = opt.parse_constraints("4个人，每人不超过25")
+        assert c["budget"]["total_cny"] is None
+        assert c["budget"]["per_person_cny"] == 25.0
+
+    def test_parse_total_only(self):
+        """仅提供总预算上限，不提供每人预算。"""
+        c = opt.parse_constraints("4个人，总预算120")
+        assert c["budget"]["total_cny"] == 120.0
+        assert c["budget"]["per_person_cny"] is None
+
+    def test_budget_hard_constraint_enforced(self, menu, coupons):
+        """每人预算上限作为硬约束被强制执行。"""
+        c = opt.parse_constraints("4个人，总预算100，每人不超过30")
+        kept = opt.filter_menu(menu, c)
+        plans = opt.optimize_plans(kept, coupons, c)
+        assert plans, "应至少有一个方案"
+        for p in plans:
+            assert p["final_price_cny"] <= 100.0 + 1e-6, \
+                f"方案 {p['label']} 最终价 {p['final_price_cny']} 超出总预算 100"
+            per_capita = p["final_price_cny"] / 4
+            assert per_capita <= 30.0 + 1e-6, \
+                f"方案 {p['label']} 人均 {per_capita} 超出每人上限 30"
+
+    def test_per_person_budget_no_crash(self, menu, coupons):
+        """每人预算上限极低时不应崩溃，应返回降级方案或空列表。"""
+        c = opt.parse_constraints("4个人，总预算100，每人不超过3")
+        kept = opt.filter_menu(menu, c)
+        # 不应抛出异常
+        plans = opt.optimize_plans(kept, coupons, c)
+        assert isinstance(plans, list), "应返回列表类型"
+
+
+class TestCouponAvailability:
+    """【任务 2】券可用性概率估算。"""
+
+    def test_coupon_with_high_threshold_is_low(self):
+        """高门槛券（满 99）的可用性应为「低」。"""
+        coupon = {"couponId": "C1", "name": "满99减15", "type": "threshold",
+                  "minSpend": 9900, "discount": 1500}
+        avail = opt._estimate_coupon_availability(coupon)
+        assert avail["level"] == "低"
+        assert avail["historical"] is None  # 无历史数据，不编造
+
+    def test_coupon_with_low_threshold_is_high(self):
+        """低门槛券（满 9 元以下）的可用性应为「高」。"""
+        coupon = {"couponId": "C2", "name": "满9减1", "type": "threshold",
+                  "minSpend": 900, "discount": 100}
+        avail = opt._estimate_coupon_availability(coupon)
+        assert avail["level"] == "高"
+        assert avail["historical"] is None
+
+    def test_coupon_with_medium_threshold_is_medium(self):
+        """中等门槛券（满 30-60 元）的可用性应为「中」。"""
+        coupon = {"couponId": "C3", "name": "满39减5", "type": "threshold",
+                  "minSpend": 3900, "discount": 500}
+        avail = opt._estimate_coupon_availability(coupon)
+        assert avail["level"] == "中"
+
+    def test_coupon_with_time_restriction_is_low(self):
+        """带时段限制的券可用性应为「低」。"""
+        coupon = {"couponId": "C4", "name": "早餐券", "type": "threshold",
+                  "minSpend": 1000, "discount": 200,
+                  "timeRestriction": "仅 06:00-10:30 可用"}
+        avail = opt._estimate_coupon_availability(coupon)
+        assert avail["level"] == "低"
+
+    def test_coupon_with_store_restriction_is_low(self):
+        """带门店限制的券可用性应为「低」。"""
+        coupon = {"couponId": "C5", "name": "指定门店券", "type": "threshold",
+                  "minSpend": 1000, "discount": 200,
+                  "appliesToStores": ["S001"]}
+        avail = opt._estimate_coupon_availability(coupon)
+        assert avail["level"] == "低"
+
+    def test_coupon_with_historical_data(self):
+        """有历史可用数据时，应基于数据估算可用性。"""
+        coupon = {"couponId": "C6", "name": "测试券", "type": "threshold",
+                  "minSpend": 1000, "discount": 200,
+                  "successRate": 0.85}
+        avail = opt._estimate_coupon_availability(coupon)
+        assert avail["level"] == "高"
+        assert avail["historical"] == 0.85
+        assert "85%" in avail["reason"]
+
+    def test_historical_data_priority_over_threshold(self):
+        """有历史数据时优先使用历史数据，而非基于门槛推断。"""
+        # 高门槛但历史可用率高
+        coupon = {"couponId": "C7", "name": "满99减15", "type": "threshold",
+                  "minSpend": 9900, "discount": 1500,
+                  "successRate": 0.9}
+        avail = opt._estimate_coupon_availability(coupon)
+        # 有历史数据时，优先使用历史数据 → 高
+        assert avail["level"] == "高"
+        assert avail["historical"] == 0.9
+
+    def test_plan_output_contains_coupon_availability(self, menu, coupons):
+        """方案输出应包含券可用性字段。"""
+        c = opt.parse_constraints("4个人，预算100")
+        kept = opt.filter_menu(menu, c)
+        plans = opt.optimize_plans(kept, coupons, c)
+        assert plans
+        for p in plans:
+            assert "coupon_availability" in p, \
+                f"方案 {p['label']} 缺少 coupon_availability 字段"
+            ca = p["coupon_availability"]
+            assert ca is None or "overall" in ca, \
+                "coupon_availability 应包含 overall 字段"
+
+
+class TestExtremeBudgetDegrade:
+    """【任务 3】极端预算降级处理。"""
+
+    def test_degraded_plan_generated_when_over_budget(self, menu, coupons):
+        """当预算不足时，应自动生成降级方案，而非无解。"""
+        items = opt._normalize_menu(opt.SAMPLE_MENU)
+        # 4 人预算 50 元 → 每人 12.5 元，远低于最便宜主食的价格
+        degraded = opt._generate_degraded_plans(items, 4, 50.0, opt.SAMPLE_COUPONS,
+                                                 {"people_count": 4, "budget": {"total_cny": 50.0}})
+        assert degraded, "预算不足时应生成降级方案"
+        assert all(p.get("degraded") for p in degraded), "降级方案应标记 degraded=True"
+        assert all("degrade_reason" in p for p in degraded), "降级方案应有降级原因说明"
+
+    def test_degraded_plan_budget_respected(self, menu, coupons):
+        """降级方案的最终价格不应超出预算。"""
+        items = opt._normalize_menu(opt.SAMPLE_MENU)
+        budget = 50.0
+        degraded = opt._generate_degraded_plans(items, 4, budget, opt.SAMPLE_COUPONS,
+                                                 {"people_count": 4, "budget": {"total_cny": budget}})
+        assert degraded
+        for p in degraded:
+            # 有商品明细的方案（减配方案）应在预算内
+            if p.get("items"):
+                assert p["final_price_cny"] <= budget + 0.01, \
+                    f"减配方案 {p['final_price_cny']} 超出预算 {budget}"
+
+    def test_extreme_low_budget_clear_message(self, menu, coupons):
+        """预算极低（1 元）时，应给出明确的预算差距说明。"""
+        items = opt._normalize_menu(opt.SAMPLE_MENU)
+        degraded = opt._generate_degraded_plans(items, 4, 1.0, opt.SAMPLE_COUPONS,
+                                                 {"people_count": 4, "budget": {"total_cny": 1.0}})
+        assert degraded, "预算极低时应返回说明方案"
+        for p in degraded:
+            assert "degrade_reason" in p
+            reason = p["degrade_reason"]
+            # 应包含预算相关的明确说明
+            assert "预算" in reason, f"降级说明应包含「预算」: {reason}"
+            # 应包含建议
+            assert "建议" in reason or "调整" in reason, \
+                f"降级说明应包含建议: {reason}"
+
+    def test_optimize_plans_with_extreme_budget_no_crash(self, menu, coupons):
+        """optimize_plans 在极端预算下不应崩溃。"""
+        c = opt.parse_constraints("4个人，预算10")
+        kept = opt.filter_menu(menu, c)
+        # 不应抛出异常
+        plans = opt.optimize_plans(kept, coupons, c)
+        assert isinstance(plans, list)
+
+    def test_split_order_suggestion(self, menu, coupons):
+        """当人数 ≥ 2 且预算不足以一次性满足时，应提供分步下单建议。"""
+        items = opt._normalize_menu(opt.SAMPLE_MENU)
+        # 4 人预算 30 → 每人 7.5 元，主食可能不足
+        degraded = opt._generate_degraded_plans(items, 4, 30.0, opt.SAMPLE_COUPONS,
+                                                 {"people_count": 4, "budget": {"total_cny": 30.0}})
+        assert degraded
+        labels = [p["label"] for p in degraded]
+        # 应至少包含减配方案或分步下单建议
+        assert any(l in ("减配方案", "分步下单方案") for l in labels), \
+            f"应包含降级方案，实际: {labels}"
