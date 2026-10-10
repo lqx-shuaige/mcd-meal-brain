@@ -11,6 +11,11 @@
 >
 > **如果这个项目让你觉得有意思、或真的帮你省到了钱，右上角点一个 ⭐Star 就是对参赛者最大的支持——定榜前每一个 Star 都算数。**
 
+**👀 在线演示（无需安装，点开即看）**：
+
+- 📊 **[三方案对比报告](https://lqx-shuaige.github.io/mcd-meal-brain/demo.html)** —— 4 人拼单省 24.7% 的完整决策过程：价格柱状图、营养雷达图、券明细、分摊账单
+- ✅ **[真实核价验证](https://lqx-shuaige.github.io/mcd-meal-brain/pricing-verification.html)** —— 本地估算 ¥44.00 = 官方 calculate-price 核价 ¥44.00，偏差 0%
+
 **核心数据**：4 人拼单（不辣 + 每人 1 份主食 + 预算 ¥100），最省钱方案 **¥64.80 vs 基线 ¥86.00，省 24.7%**（人均 ¥16.20）；本地估算与官方核价**偏差 0%**（见 [docs/pricing-verification.md](./docs/pricing-verification.md)）。
 
 **三步跑起来**（Python 3.10+，零第三方依赖）：
