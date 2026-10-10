@@ -94,7 +94,15 @@ optimizer 本地估算与官方核价**分毫不差**（¥44.00 = ¥44.00）。
 | 10:27 | 2 人，人均 25，都要辣，不要饮料，赶时间 | 96 品（1950564 自动选址） | **¥22.00 = ¥22.00（0.00%）** | ✅ 真实链路 |
 | 10:27 | 3 人拼单，预算 80，鸡肉过敏 + 乳糖不耐 | 77 品（1950936） | —（--json 契约输出含 data_source/traceId） | ✅ 真实链路 |
 
-* 全部 MCP 调用留痕于 `logs/mcp_calls.log`（JSONL，含 trace_id 字段，Token 脱敏）；
+> **勘误（2026-10-10 13:41 复验）**：本表首行团餐场景的门店查询记录
+> （`query-nearby-stores` 传 `beType=6`）系**失实记录**——该工具 schema 枚举
+> 仅 [1,5]，`beType=6` 直接被参数校验拒绝，不可能成功。当日实际执行的链路为
+> 到店自取参数（`beType=1`）选址 + 查菜单（`logs/mcp_calls.log` 第 1/11 行的
+> `beType: 6` 记录同样失实）。**团餐正确链路**：`delivery-query-stores`
+> （beType=6 起点拿 storeCode + beCode）→ `query-meals` → `calculate-price`
+> （orderType=2 + beCode），与本文件第 2 节规则一致。
+
+* 实测期间的 MCP 调用留痕于 `logs/mcp_calls.log`（JSONL，含 trace_id 字段，Token 脱敏；`logs/` 已 gitignore，为本地实测记录，非全量审计日志）；
 * 降级验证：无 Token 默认模式 → 兜底数据 + 强制横幅「兜底数据，非实时」；
   `--strict` 模式 → 报错退出（exit 1），绝不静默降级；
 * `list-nutrition-foods` 实测 `data` 为 **CSV 文本**（`[N]{列名}:
@@ -210,6 +218,8 @@ optimizer 本地估算与官方核价**分毫不差**（¥44.00 = ¥44.00）。
   `query-meals` 菜单、标价、`calculate-price` 核价**逐字段一致**（均 ¥47.00）。
 - **差异点**：`takeWayList` —— beType=1 返回 `eat-in`(堂食)/`locker-in`(外带)/
   `take-dt-quick`(得来速) 三种；beType=5 **锁定** `take-dt-quick`（车道自提）。
+  （2026-10-10 13:46 复验一致：calculate-price 实调 traceId `cb4abf9e…5c5ca`，
+  与 `docs/pricing-verification.md` 勘误同源。）
 - **处理**：渠道比价中两渠道价格并列最低时，按取餐便利性给建议，而非硬造价格差。
 
 ### 偏差 13 calculate-price 含完整到手成本结构（新发现字段）
@@ -244,8 +254,10 @@ optimizer 本地估算与官方核价**分毫不差**（¥44.00 = ¥44.00）。
   `[160]{productName,nutritionDescription,energyKj,energyKcal,protein,fat,carbohydrate,sodium,calcium}:`
   表头 + 每行一个餐品的 CSV（160 品）。
 - **处理**：`optimizer.py::parse_nutrition_csv()` 按表头列名解析；
-  与 `query-meals` 菜单按「名称归一化（去空格/™/括号及内容/引号）精确匹配」
-  关联，未命中（套餐/组合/周边）营养置 0，不估算、不编造。
+  与 `query-meals` 菜单按「名称归一化（去空格/™/®/引号；`【】` 去括号保留内容
+  即品牌前缀、圆括号去括号及内容即包装规格；菜单与营养表两侧对称归一）
+  精确匹配」关联，未命中（套餐/组合/周边）营养置 0，不估算、不编造。
+  （实测两侧同名，如 `【美汁源】“黄金橙橙”` / `纯牛奶（盒装）`。）
 
 ---
 

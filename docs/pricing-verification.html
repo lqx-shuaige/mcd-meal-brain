@@ -48,7 +48,7 @@ footer{text-align:center;color:var(--muted);font-size:12.5px}
 <section class="hero">
   <div class="flow">
     <div class="node">
-      <div class="lab">本地估算（optimizer.py DP + 券组合）</div>
+      <div class="lab">本地估算（RAW_MENU 计价口径 · 同篮对比）</div>
       <div class="val">¥44.00</div>
     </div>
     <div class="node" style="font-size:26px;color:var(--muted)">⇄</div>
@@ -59,7 +59,7 @@ footer{text-align:center;color:var(--muted);font-size:12.5px}
   </div>
   <div class="ok"><span class="big">偏差 ¥0.00</span><span class="pct">0.00% 一致 ✅</span></div>
   <div class="muted" style="font-size:13px;margin-top:8px">
-    场景：我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜｜方案：最省钱（大脆鸡扒麦满分×4）</div>
+    场景：我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜｜核价篮子：大脆鸡扒麦满分×4（09:33 快照时刻 DP 最省钱方案）</div>
 </section>
 
 <section class="card">
@@ -83,13 +83,13 @@ footer{text-align:center;color:var(--muted);font-size:12.5px}
         <td class="muted">66a17d…b6c3f9</td></tr>
     <tr><td>09:33:53</td><td><code>calculate-price</code></td>
         <td><code>storeCode=195****, orderType=1, beType=1, items=[5889×4]</code></td>
-        <td><b>¥44.00</b>（4400 分）；discount=0；取餐：堂食/外带</td>
+        <td><b>¥44.00</b>（4400 分）；discount=0；取餐方式：堂食 / 外带（取餐柜）/ 得来速</td>
         <td class="muted">5b8f62…65116c</td></tr>
   </table>
 </section>
 
 <section class="card">
-  <h2>最省钱方案商品明细（optimizer.py 真实输出）</h2>
+  <h2>核价篮子商品明细（快照 productList，与官方核价同篮）</h2>
   <table>
     <tr><th>商品编码</th><th>名称</th><th>数量</th><th>小计</th></tr>
     <tr><td><code>5889</code></td><td>大脆鸡扒麦满分</td><td>×4</td><td>¥44.00</td></tr>
@@ -141,9 +141,14 @@ footer{text-align:center;color:var(--muted);font-size:12.5px}
       &quot;subtitle&quot;: &quot;店内用餐&quot;
     },
     {
-      &quot;code&quot;: &quot;take-in-store&quot;,
+      &quot;code&quot;: &quot;locker-in&quot;,
       &quot;title&quot;: &quot;外带&quot;,
-      &quot;subtitle&quot;: &quot;店内自提&quot;
+      &quot;subtitle&quot;: &quot;店内取餐柜&quot;
+    },
+    {
+      &quot;code&quot;: &quot;take-dt-quick&quot;,
+      &quot;title&quot;: &quot;得来速&quot;,
+      &quot;subtitle&quot;: &quot;车道自提&quot;
     }
   ]
 }</pre>
@@ -167,6 +172,10 @@ footer{text-align:center;color:var(--muted);font-size:12.5px}
     <tr><td>早餐时段菜单</td>
         <td>09:28 为早餐时段（07:14–10:15），菜单为早餐品类（麦满分/厚松饼/粥类），
             与 README 正餐演示场景品类不同，属真实时段差异，如实呈现</td></tr>
+    <tr><td>核价对比口径</td>
+        <td><b>同篮对比</b>：本地估算取快照篮子（大脆鸡扒麦满分×4）按 RAW_MENU 计价口径
+            逐项求和；DP 选篮会随菜单快照/算法演进而变化（今日重放最便宜篮子可能不同），
+            跨篮对比无意义。2026-10-10 13:46 复验取餐编码同口径修正（traceId cb4abf9e…5c5ca）</td></tr>
   </table>
 </section>
 

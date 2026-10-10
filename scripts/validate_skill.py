@@ -32,6 +32,17 @@ from typing import Any, Dict, List, Optional
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+#: Python < 3.10 回退集合（sys.stdlib_module_names 自 3.10 起提供；
+#: 覆盖 optimizer.py 实际 import + 常用标准库，避免 3.9- 环境 AttributeError）
+_STDLIB_FALLBACK = frozenset({
+    "__future__", "argparse", "base64", "collections", "copy", "csv", "datetime",
+    "decimal", "enum", "functools", "glob", "hashlib", "html", "io", "itertools",
+    "json", "logging", "math", "os", "pathlib", "platform", "random", "re",
+    "shutil", "socket", "sqlite3", "ssl", "statistics", "string", "struct",
+    "subprocess", "sys", "textwrap", "threading", "time", "typing", "unittest",
+    "urllib", "uuid",
+})
+
 #: 检查的文件范围（secrets 扫描）
 SECRET_SCAN_FILES = [
     "SKILL.md",
@@ -55,10 +66,15 @@ def check(repo_root: str) -> Dict[str, Any]:
     ok_items: List[str] = []
 
     skill_path = os.path.join(repo_root, "SKILL.md")
+    if not os.path.exists(skill_path):
+        issues.append({"item": "frontmatter", "detail": f"SKILL.md 不存在：{skill_path}"})
+        return {"ok": False, "name": None, "description": None,
+                "passed": ok_items, "issues": issues}
     text = open(skill_path, encoding="utf-8").read()
 
     # ---- 1. Frontmatter ---------------------------------------------------
-    m = re.match(r"^---\r?\n(.*?)\r?\n---\r?\n", text, re.S)
+    # 尾部换行可选：文件末尾恰好以 --- 结束且无换行时也能识别
+    m = re.match(r"^---\r?\n(.*?)\r?\n---(?:\r?\n|$)", text, re.S)
     name: Optional[str] = None
     desc: Optional[str] = None
     if not m:
@@ -66,8 +82,16 @@ def check(repo_root: str) -> Dict[str, Any]:
     else:
         fm = m.group(1)
         name_m = re.search(r"^name:\s*(\S+)\s*$", fm, re.M)
-        # description 允许长文本（含中文标点），取整行
+        # description 允许长文本（含中文标点）：优先单行取值；
+        # 其次支持 YAML 块标量（>/| 缩进续行，按空格折叠拼接）
         desc_m = re.search(r"^description:\s*(.+?)\s*$", fm, re.M)
+        if desc_m:
+            desc_text: Optional[str] = desc_m.group(1)
+        else:
+            bm = re.search(r"^description:\s*[>|][+-]?\s*\r?\n((?:[ \t]+\S.*(?:\r?\n|$))+)",
+                          fm, re.M)
+            desc_text = (" ".join(ln.strip() for ln in bm.group(1).splitlines())
+                         if bm else None)
         if not name_m:
             issues.append({"item": "name", "detail": "缺少必填字段 name"})
         else:
@@ -77,10 +101,10 @@ def check(repo_root: str) -> Dict[str, Any]:
                             "（小写字母/数字/连字符，≤64 字符）"})
             else:
                 ok_items.append(f"name 合规：{name}")
-        if not desc_m:
+        if desc_text is None:
             issues.append({"item": "description", "detail": "缺少必填字段 description"})
         else:
-            desc = desc_m.group(1)
+            desc = desc_text
             if len(desc) > 1024:
                 issues.append({"item": "description", "detail": f"超长（{len(desc)} > 1024 字符）"})
             elif len(desc) < 10:
@@ -121,7 +145,7 @@ def check(repo_root: str) -> Dict[str, Any]:
     else:
         src = open(opt_path, encoding="utf-8").read()
         imports = set(re.findall(r"^(?:import|from)\s+([\w.]+)", src, re.M))
-        stdlib = set(sys.stdlib_module_names)
+        stdlib = set(getattr(sys, "stdlib_module_names", None) or _STDLIB_FALLBACK)
         third = sorted(i for i in imports
                        if i.split(".")[0] not in stdlib and i != "__future__")
         if third:
@@ -146,7 +170,17 @@ def check(repo_root: str) -> Dict[str, Any]:
             "passed": ok_items, "issues": issues}
 
 
+def _safe_stdio() -> None:
+    """GBK 控制台/管道下 emoji 输出防崩（同 optimizer._safe_stdio）。"""
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors="replace")
+        except AttributeError:
+            pass
+
+
 def main() -> int:
+    _safe_stdio()
     result = check(REPO_ROOT)
     if "--json" in sys.argv:
         print(json.dumps(result, ensure_ascii=False, indent=2))

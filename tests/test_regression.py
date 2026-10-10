@@ -1011,3 +1011,94 @@ class TestDPExactness:
         assert all(m["discount_share_cny"] <= m["subtotal_cny"] for m in s["members"]), \
             "成员分摊优惠超出其小计"
         assert s["total"]["unallocated_discount_cny"] == 26.5, "超出部分未正确记入 unallocated"
+
+
+# =========================================================================
+# 场景 6 · 全面审计修复回归（2026-10-10）
+# =========================================================================
+
+class TestAuditFixes:
+    """钉死 2026-10-10 全面审计修复的行为语义，防止回退。
+
+    覆盖：
+    * B1  clarify_input 二轮答案合并的预算 canonical 结构（total_cny/per_person_cny
+           补全、不再污染 hard.max_per_capita_cny）
+    * B2  normalize_food_name 语义（【】去括号保内容 / 圆括号去内容）
+    * B4  口味否定式（「不怕辣」≠「怕辣」）
+    * B3  降级方案过输出契约（items 允许为空 + degraded 标记透传）
+          与契约强度兜底（非降级方案 items 必非空）
+    * B11 gen_demo 人均营养矩阵不再二次除以人数
+    """
+
+    def test_clarify_budget_merge_canonical(self):
+        """B1：二轮合并预算后，budget 字典结构与 parse_constraints 一致。"""
+        r = opt.clarify_input("来份汉堡",
+                              answers={"people_count": 2, "budget": 60})
+        b = r["constraints"]["budget"]
+        assert b == {"type": "total", "amount_cny": 60.0,
+                     "total_cny": 60.0, "per_person_cny": None}, b
+        # 总预算不再被误写进人均上限（语义错位，旧实现曾硬塞 max_per_capita_cny）
+        assert r["constraints"]["hard"].get("max_per_capita_cny") is None
+
+    def test_clarify_budget_merge_per_capita_string(self):
+        """B1：字符串答案含「每人/人均」时按人均口径解析。"""
+        r = opt.clarify_input("来份汉堡",
+                              answers={"people_count": 2, "budget": "每人30"})
+        b = r["constraints"]["budget"]
+        assert b["type"] == "per_capita", b
+        assert b["per_person_cny"] == 30.0 and b["total_cny"] is None, b
+
+    def test_normalize_food_name_semantics(self):
+        """B2：方括号保内容（品牌前缀）、圆括号去内容（包装规格）、剥 ™/®/引号。"""
+        assert opt.normalize_food_name("【美汁源】“黄金橙橙”") == "美汁源黄金橙橙"
+        assert opt.normalize_food_name("纯牛奶(盒装)") == "纯牛奶"
+        assert opt.normalize_food_name("纯牛奶（盒装）") == "纯牛奶"
+        assert opt.normalize_food_name("麦咖啡™热奶铁中杯") == "麦咖啡热奶铁中杯"
+
+    def test_taste_negation_not_spicy(self):
+        """B4：「不怕辣」是肯定式（=3 能吃辣），不再被子串「怕辣」误判为 0。"""
+        assert opt._infer_taste("不怕辣") == {"spicy": 3}
+        assert opt._infer_taste("怕辣") == {"spicy": 0}
+        assert opt._infer_taste("不吃辣") == {"spicy": 0}
+        assert opt._infer_taste("非常怕辣") == {"spicy": 0}
+
+    def test_degraded_plans_pass_contract(self, menu):
+        """B3：极端预算降级方案（items 为空）必须能通过输出契约校验。"""
+        degraded = opt._generate_degraded_plans(
+            menu, 4, 1.0, opt.SAMPLE_COUPONS,
+            {"people_count": 4, "budget": {"total_cny": 1.0}})
+        assert degraded and degraded[0].get("degraded") is True
+        doc = opt.plans_to_doc(degraded, scene="极端预算", people_count=4)
+        assert opt.validate_plans_doc(doc) == [], opt.validate_plans_doc(doc)
+        assert doc["plans"][0]["degraded"] is True
+        assert doc["plans"][0]["degrade_reason"]
+        assert doc["plans"][0]["items"] == []
+        # 空篮筐营养按 0 填充（7 个契约必填字段齐全）
+        assert doc["plans"][0]["nutrition"]["per_capita_kcal"] == 0.0
+
+    def test_normal_plans_items_never_empty(self, menu, coupons):
+        """B3 契约强度兜底：非降级方案 items 必非空，且整体过契约。"""
+        c = opt.parse_constraints("4个人，预算100")
+        kept = opt.filter_menu(menu, c)
+        plans = opt.optimize_plans(kept, coupons, c)
+        assert plans, "标准场景应有可行方案"
+        for p in plans:
+            assert not p.get("degraded")
+            assert p["items"], f"{p['label']} 明细为空"
+        doc = opt.plans_to_doc(plans, scene="标准拼单", people_count=4)
+        assert opt.validate_plans_doc(doc) == []
+
+    def test_gen_demo_nutrition_matrix_no_double_division(self):
+        """B11：雷达图人均值与 optimizer 输出的 per_capita_* 一致，不二次除人数。"""
+        import gen_demo
+        data = gen_demo.run_scenario(gen_demo.DEMO_INPUT)
+        matrix = {r["label"]: r for r in gen_demo._nutrition_matrix(data["plans"])}
+        cheap = next(p for p in data["plans"] if p["label"] == "最省钱")
+        n = cheap["nutrition"]
+        people = cheap["people_count"]
+        assert people == 4
+        assert matrix["最省钱"]["kcal"] == round(n["per_capita_kcal"], 1)
+        assert matrix["最省钱"]["protein"] == round(n["per_capita_protein_g"], 1)
+        assert matrix["最省钱"]["fat"] == round(n["per_capita_fat_g"], 1)
+        # 钠是总量口径：唯一应该除以人数的字段
+        assert matrix["最省钱"]["sodium"] == round(n["total_sodium_mg"] / people, 0)

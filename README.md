@@ -13,10 +13,10 @@
 
 **👀 在线演示（无需安装，点开即看）**：
 
-- 📊 **[三方案对比报告](https://lqx-shuaige.github.io/mcd-meal-brain/demo.html)** —— 4 人拼单省 24.7% 的完整决策过程：价格柱状图、营养雷达图、券明细、分摊账单
+- 📊 **[三方案对比报告](https://lqx-shuaige.github.io/mcd-meal-brain/demo.html)** —— 4 人拼单省 26.7% 的完整决策过程：价格柱状图、营养雷达图、券明细、分摊账单
 - ✅ **[真实核价验证](https://lqx-shuaige.github.io/mcd-meal-brain/pricing-verification.html)** —— 本地估算 ¥44.00 = 官方 calculate-price 核价 ¥44.00，偏差 0%
 
-**核心数据**：4 人拼单（不辣 + 每人 1 份主食 + 预算 ¥100），最省钱方案 **¥64.80 vs 基线 ¥86.00，省 24.7%**（人均 ¥16.20）；本地估算与官方核价**偏差 0%**（见 [docs/pricing-verification.md](./docs/pricing-verification.md)）。
+**核心数据**：4 人拼单（不辣 + 每人 1 份主食 + 预算 ¥100），最省钱方案 **¥63.00 vs 基线 ¥86.00，省 26.7%**（人均 ¥15.75）；本地估算与官方核价**偏差 0%**（见 [docs/pricing-verification.md](./docs/pricing-verification.md)）。
 
 **三步跑起来**（Python 3.10+，零第三方依赖）：
 
@@ -42,8 +42,8 @@ mcd-meal-brain/
 ├── scripts/optimizer.py   核心引擎：解析 → 过滤 → 优化 → 核价（零依赖）
 ├── references/            workflow · schema · tools · strategy
 ├── docs/                  demo.html 可视化 · 真实核价记录 · 跨框架指南
-├── tests/                 pytest 回归（43 用例全绿）+ GitHub Actions CI
-└── MCP_INTEGRATION.md     MCP 接入记录（15 项实测 schema 偏差）
+├── tests/                 pytest 回归（83 用例全绿）+ GitHub Actions CI
+└── MCP_INTEGRATION.md     MCP 接入记录（16 项实测 schema 偏差）
 ```
 
 **参赛作品**：麦当劳 MCP 程序员创意开发大赛 · 作品形态：Agent Skill
@@ -78,7 +78,7 @@ mcd-meal-brain/
 - **券可用性估算**（方向 4 新增）：基于历史可用数据（MCP 若提供）或券特征（门槛高低、时段限制、门店限制）估算每张券的可用性（高/中/低），无数据时如实标注「未知」，绝不编造概率数字。
 - **极端预算降级**（方向 4 新增）：当预算不足以满足所有人的最基本需求时，自动生成「减配方案」（预算内最便宜组合）并明确告知差距，同时建议「分步下单」或调整预算/人数，绝不输出无解崩溃。
 - **硬约束一票否决**：先过滤解空间再优化，且每个被剔除的商品都能回答「为什么没有它」。
-- **组合优化**：动态规划（无界背包 + 券组合 DP）+ 帕累托剪枝求最省钱；加权评分求最健康 / 最快。**最优性经 3000 组暴力穷举交叉验证**（同一搜索空间内与穷举解 100% 一致，测试固化在 CI）。
+- **组合优化**：动态规划（无界背包 + 券组合 DP）求最省钱；**NSGA-II 四目标帕累托演化（默认）**取最省钱 / 最健康 / 最快三极值方案，前沿退化时回退加权评分。**最优性经 3000 组暴力穷举交叉验证**（同一搜索空间内与穷举解 100% 一致，测试固化在 CI）。
 - **券来源严格区分**：只用 `query-store-coupons`（门店真实可用）算价，绝不混用「账户可领券」。
 - **官方核价**：每个方案都过 `calculate-price` 核价，偏差超 5% 以官方价为准。
 - **得来速（DT）场景**：`beType=5` 全链路实测跑通（beType=3 不存在，传入会被直接拒绝）；同门店与到店自取价格一致，差异仅在取餐方式。
@@ -105,7 +105,7 @@ mcd-meal-brain/
   （菜单→缓存、券→跳过、核价→标注未验证、门店→问用户）并显式标注；
   `create_order_guarded()` 幂等下单（user+store+内容哈希+5 分钟窗口，
   命中复用已有订单，失败不记录）；JSONL 调用日志（`logs/mcp_calls.log`，
-  Token/手机号/地址强制脱敏，`logs/` 已 gitignore）。
+  实测期调用留痕，Token/手机号/地址强制脱敏，`logs/` 已 gitignore）。
 - **子代理编排设计**：解析 / 查询 / 优化三角色协作（见 SKILL.md），职责隔离，
   输入输出契约与现有函数一一对应，可直接落地。
 
@@ -177,11 +177,12 @@ mcd-meal-brain/
 │   ├── pricing-verification.html 核价对比页（本地估算 vs 官方核价）
 │   └── portability.md            可移植性说明（各框架加载方式 / MCP 配置 / 环境变量）
 ├── tests/
-│   └── test_regression.py        回归测试（pytest，5 场景 + 契约回归，25 用例）
+│   └── test_regression.py        回归测试（pytest，6 场景 + 契约回归，83 用例）
 ├── .github/workflows/test.yml    CI：push/PR 自动跑 selftest + pytest + CLI 冒烟（Python 3.10/3.12）
 ├── mcp-config.example.json       MCP 配置示例（Token 用 ${MCD_MCP_TOKEN} 占位）
 ├── MCP_INTEGRATION.md            MCP 接入记录（脱敏日志 + 16 项实测 schema 偏差）
 ├── CONTEST_DECLARATION.md        参赛声明
+├── workbuddy.md                  WorkBuddy 开发时间线（阶段与 commit 对应表，联动专项材料）
 └── README.md
 ```
 
@@ -214,25 +215,24 @@ mcd-meal-brain/
 
 ```
 🍔 方案 A｜最省钱              主食 4 份 ✅
-├ 麦香鱼 ×3         ¥52.50
-├ 双层吉士汉堡 ×1   ¥19.50
-├ 券组合：9折券（C004）  −¥7.20
-├ 原价：¥72.00 → 最终价：¥64.80
-├ 人均：¥16.20（预算 ¥25/人 ✅）
-└ 人均 351 kcal｜蛋白 18.8 g｜脂肪 15.2 g
+├ 麦香鱼 ×4         ¥70.00
+├ 券组合：9折券（C004）  −¥7.00
+├ 原价：¥70.00 → 最终价：¥63.00
+├ 人均：¥15.75（预算 ¥25/人 ✅）
+└ 人均 325 kcal｜蛋白 16.0 g｜脂肪 13.0 g
 
-🥗 方案 B｜最健康              主食 4 份 ✅
-├ 板烧鸡腿堡 + 巨无霸 + 麦香鱼 + 双层吉士汉堡
-├ 券组合：9折券（C004）  −¥8.30
-├ 原价：¥83.00 → 最终价：¥74.70
-├ 人均：¥18.68（预算 ✅）
-└ 人均 414 kcal｜蛋白 23.2 g｜脂肪 19.5 g   ← 蛋白最高
+🥗 方案 B｜最健康              主食 5 份 ✅
+├ 板烧鸡腿堡 ×1 + 双层吉士汉堡 ×4 + 麦乐鸡5块 ×1
+├ 券组合：满99减15（C001）+ 麦乐鸡立减5元（C003）  −¥20.00
+├ 原价：¥114.00 → 最终价：¥94.00
+├ 人均：¥23.50（预算 ✅）
+└ 人均 580 kcal｜蛋白 35.8 g｜脂肪 29.2 g   ← 蛋白最高（叠加 2 张券）
 
 ⚡ 方案 C｜最快                主食 4 份 ✅
-├ 板烧鸡腿堡 + 巨无霸 + 双层吉士汉堡 + 培根安格斯厚牛堡
-├ 券组合：满99减15（C001）  −¥15.00
-├ 原价：¥99.00 → 最终价：¥84.00｜人均 ¥21.00
-└ 人均 510 kcal｜蛋白 27.8 g｜四个汉堡出餐快、无需等小食
+├ 麦香鱼 ×3 + 双层吉士汉堡 ×1
+├ 券组合：9折券（C004）  −¥7.20
+├ 原价：¥72.00 → 最终价：¥64.80｜人均 ¥16.20
+└ 人均 351 kcal｜蛋白 18.8 g｜四个主食出餐快、无需等小食
 ```
 
 > 以上结果可由 `python scripts/optimizer.py --demo "我们4个人，预算100，一个减脂，一个不吃辣，一个要赠品，一个要便宜"` **一键复现**（内置样例数据，输出显式标注「演示模式」；营养取自 `list-nutrition-foods` 真实值快照，券为内置示例券，用于演示券组合 DP）。**实时数据版**：去掉 `--demo` 即走真实 MCP 链路（菜单/券/营养均为实时拉取，输出附 traceId 自证）。
@@ -246,15 +246,15 @@ mcd-meal-brain/
 
 | 方案 | 原价 | 券优惠 | 最终价 | 人均 | 相比基线 | 降幅 |
 |---|---|---|---|---|---|---|
-| **最省钱** | ¥72.00 | −¥7.20 | **¥64.80** | **¥16.20** | **省 ¥21.20** | **↓24.7%** |
-| 最健康 | ¥83.00 | −¥8.30 | ¥74.70 | ¥18.68 | 省 ¥11.30 | ↓13.1% |
-| 最快 | ¥99.00 | −¥15.00 | ¥84.00 | ¥21.00 | 省 ¥2.00 | ↓2.3% |
+| **最省钱** | ¥70.00 | −¥7.00 | **¥63.00** | **¥15.75** | **省 ¥23.00** | **↓26.7%** |
+| 最健康 | ¥114.00 | −¥20.00 | ¥94.00 | ¥23.50 | 贵 ¥8.00 | ↑9.3% |
+| 最快 | ¥72.00 | −¥7.20 | ¥64.80 | ¥16.20 | 省 ¥21.20 | ↓24.7% |
 
 **关键结论**
 
-1. **最省钱方案比朴素点法省 24.7%**（人均从 ¥21.50 → ¥16.20），且同时满足「主食 ≥ 4 份 + 热量下限 + 不含辣 + 总预算 ¥100」。
-2. **券的叠加能力被充分利用**：最快方案精准踩中「满 99 减 15」门槛（原价 ¥99.00）；券按 `exclusiveGroup` 互斥、按 `minSpend` 校验门槛、按 `appliesToProductCodes` 校验适用范围，避免把「麦乐鸡券」用在没有麦乐鸡的订单上。
-3. **健康与便宜可以兼得，但有代价**：最健康方案人均蛋白 23.2 g（比最省钱高 23%），代价是人均多花 ¥2.48。
+1. **最省钱方案比朴素点法省 26.7%**（人均从 ¥21.50 → ¥15.75），且同时满足「主食 ≥ 4 份 + 不含辣 + 总预算 ¥100」。
+2. **券的叠加能力被充分利用**：最健康方案叠加 2 张券（满99减15 + 麦乐鸡立减5，合计 −¥20.00）；券按 `exclusiveGroup` 互斥、按 `minSpend` 校验门槛、按 `appliesToProductCodes` 校验适用范围，避免把「麦乐鸡券」用在没有麦乐鸡的订单上。
+3. **健康与便宜不可兼得，如实呈现**：最健康方案人均蛋白 35.8 g（最省钱的 2.2 倍），代价是人均多花 ¥7.75、且超过基线 ¥8.00——算法不隐藏这个 trade-off，把选择权交给用户。
 4. **预算约束全程有效**：三个方案人均均落在 ¥25（总额 ¥100 ÷ 4）预算内，且输出中显式标注了达标情况。
 
 ---
@@ -267,8 +267,8 @@ mcd-meal-brain/
 | 约束解析 | 正则 + 关键词表；成分同义词归一（牛/猪/鸡/鱼/辣/油炸/奶/花生…） |
 | 硬约束过滤 | 一票否决 + 原因记录，先压解空间再优化 |
 | 最省钱求解 | **动态规划**：无界背包（状态 = 份数 × 热量桶）最小化成本；券组合另一层 DP（分组互斥 / 门槛 / 商品范围 / 最多叠加 2 张）。热量桶采用**向上取整语义 + 自适应步长**（整数热量下步长=1，零取整误差）——保证任何输出绝不违反热量上限，且搜索空间内可证最优（3000 组穷举交叉验证，见 `tests/test_regression.py::TestDPExactness`） |
-| 多目标收敛 | **帕累托剪枝**（成本↓ + 热量接近目标）后按加权评分排序 |
-| 加权评分 | `cheap / healthy / speed / pref` 四维，权重由画像决定 |
+| 多目标收敛 | **NSGA-II 四目标帕累托演化（默认）**：价格↓ / 人均热量↓ / 油炸份数↓ / 人均蛋白↑，固定随机种子可复现，取三极值方案；前沿退化时回退加权评分 |
+| 加权评分 | NSGA-II 的回退方案：`cheap / healthy / speed / pref` 四维，权重由画像决定 |
 | 核价校验 | 极简 MCP Streamable HTTP 客户端；**分 → 元**换算；偏差 >5% 以官方为准 |
 | 渠道比价 | 同一篮子 × 内部渠道（到店自取/麦乐送/得来速）到手成本对比；恒等式校验（商品+运费+打包+餐具−优惠=现价）；缺前置条件（如无配送地址）如实标「无法核价」 |
 | 输出契约 | JSON Schema draft-07（`references/schema.json`）；`plans_to_doc()` 转换 + 纯标准库递归校验器（type/required/enum/const/边界），`--dump-schema` 生成镜像 |
@@ -277,7 +277,7 @@ mcd-meal-brain/
 | 系统健壮 | `_mcp_call` 统一入口：10s 超时、指数退避（1s/2s/4s ×3 次 + 总预算 20s、401/400/业务错不重试）；`call_with_degrade()` 按工具降级 + 显式 banner；`create_order_guarded()` 幂等键（sha256(user+store+内容+5min 窗口)）防重复下单；`log_mcp_call()` JSONL 日志 + 三类敏感信息脱敏 |
 | 错误处理 | 识别「业务错误不置 `isError`」的服务端行为，读 `structuredContent.success/code` |
 
-**内建质量保障**：`--selftest` 覆盖 14 组断言，含 4 个已修 bug 的回归用例
+**内建质量保障**：`--selftest` 覆盖 17 组断言，含 4 个已修 bug 的回归用例
 （油炸误标、折扣券语义、浮点截断、券跨商品误用）、业务错误识别、渠道比价
 （beCode 传递约定、到手成本恒等式、外部平台拒绝、无法核价兜底）、输出契约
 （必填缺失 / 类型错误 / const 破坏 / 枚举越界 / 镜像同步）、模糊输入
@@ -292,7 +292,7 @@ mcd-meal-brain/
 
 ### 回归测试（pytest）
 
-`tests/test_regression.py` 覆盖 5 个典型场景 + 输出契约回归，共 25 个用例：
+`tests/test_regression.py` 覆盖 6 个典型场景 + 输出契约回归，共 83 个用例：
 
 | 场景 | 输入 | 关键断言 |
 |---|---|---|
@@ -301,6 +301,7 @@ mcd-meal-brain/
 | 模糊输入 | 「随便」 | L3 默认路径（不追问）；banner「基于默认偏好：不辣、不油炸」；默认口味下菜单仍可解；answers 合并后 ready 翻转 |
 | 偏好冲突 | 「4个人，2个要辣2个不要辣，预算120」 | 检测 spicy 冲突（阵营均值差 ≥3）；A/B 双备选；各有妥协说明；A 不排除辣 / B 硬排除辣 |
 | 极端预算 | 「4个人，预算30」 | 有解→守主食底线且预算可判读；无解→明确说明；预算 ¥1~¥10000 均不崩溃 |
+| 审计回归 | 2026-10-10 全面审计修复 | clarify 预算 canonical 合并；名称归一化语义（【】保品牌前缀）；「不怕辣」肯定式；降级方案过契约（items 允空 + degraded 标记）；非降级方案明细必非空；演示页营养不再二次除人数 |
 | 输出契约 | —— | `--json` 文档通过 schema 校验；群体/单人路径兼容；未核价标注 |
 
 运行方式：
@@ -308,10 +309,10 @@ mcd-meal-brain/
 ```bash
 python -m pip install pytest        # 仅测试期依赖（optimizer 本体零依赖）
 python -m pytest tests/ -v          # 全部回归测试
-python scripts/optimizer.py --selftest   # 内置 14 组断言自检
+python scripts/optimizer.py --selftest   # 内置 17 组断言自检
 ```
 
-**测试通过标准**：`pytest tests/` 全绿（25 passed）且 `--selftest` 输出
+**测试通过标准**：`pytest tests/` 全绿（83 passed）且 `--selftest` 输出
 「全部断言通过」；任一失败即视为核心逻辑被破坏，禁止合并/发布。
 GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
 自动跑 Python 3.10 + 3.12 双版本：selftest → pytest → 5 个 CLI 入口冒烟，
@@ -319,7 +320,7 @@ GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
 
 ### 可观测性
 
-- **调用日志**：每次 MCP 调用记 JSON Lines 至 `logs/mcp_calls.log`
+- **调用日志**：实测期 MCP 调用记 JSON Lines 至 `logs/mcp_calls.log`（本地留痕，不入库）
   （工具名 / 耗时 / 状态 success·error·retry·degraded / 重试次数 / 入参快照）；
 - **敏感信息脱敏**：Token→`[TOKEN]`、手机号→`[PHONE]`、地址→`[ADDRESS]`，
   写入前强制替换；`logs/` 目录已 gitignore，不入库；
@@ -337,7 +338,7 @@ GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
    由 `python scripts/validate_skill.py` 自动检查，**8/8 项全部通过**
    （frontmatter / 渐进式披露 / references 引用完整 / 零依赖 / 敏感信息扫描）。
 2. **渐进式披露**：`references/`（workflow / schema / tools / strategy）按需加载、
-   不进初始上下文；SKILL.md 本体 204 行（≤500 行建议上限），三层结构符合规范。
+   不进初始上下文；SKILL.md 本体 303 行（≤500 行建议上限），三层结构符合规范。
 3. **跨框架加载**：可被任何支持 MCP / Agent Skills 规范的框架加载——
    Claude Code（`.claude/skills/`，官方声明遵循 Agent Skills 开放标准）、
    Cursor（`.cursor/skills/`，并兼容读取 `.claude/skills/`）、
@@ -373,7 +374,7 @@ GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
 - 结构化输出契约 → [`references/schema.json`](./references/schema.json)
 - 工具参数速查 → [`references/tools.md`](./references/tools.md)
 - 标签字典与约束逻辑 → [`references/strategy.md`](./references/strategy.md)（含群体偏好聚合规则）
-- MCP 接入踩坑记录（15 项实测偏差）→ [`MCP_INTEGRATION.md`](./MCP_INTEGRATION.md)
+- MCP 接入踩坑记录（16 项实测偏差）→ [`MCP_INTEGRATION.md`](./MCP_INTEGRATION.md)
 - 演示可视化报告（三方案对比）→ [`docs/demo.html`](./docs/demo.html)
 - 真实核价记录（¥44.00 = ¥44.00，偏差 0%）→ [`docs/pricing-verification.md`](./docs/pricing-verification.md)
 - 可移植性与跨框架加载指南 → [`docs/portability.md`](./docs/portability.md)

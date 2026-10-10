@@ -26,8 +26,8 @@ python scripts/validate_skill.py --json # 机器可读
 | # | 检查项 | 结果 | 说明 |
 |---|---|---|---|
 | 1 | frontmatter `name` | ✅ | `mcd-meal-brain`，小写字母+连字符，≤64 字符，与目录名一致 |
-| 2 | frontmatter `description` | ✅ | 57 字符（≤1024），说明 what + when |
-| 3 | SKILL.md 篇幅 | ✅ | 204 行（≤500 行建议上限），元数据→正文→引用文件三层渐进加载 |
+| 2 | frontmatter `description` | ✅ | 77 字符（≤1024），说明 what + when |
+| 3 | SKILL.md 篇幅 | ✅ | 303 行（≤500 行建议上限），元数据→正文→引用文件三层渐进加载 |
 | 4 | `references/` 引用完整性 | ✅ | 正文引用的 4 个文件（workflow / schema / tools / strategy）全部存在 |
 | 5 | 渐进式披露结构 | ✅ | `references/` 目录存在，按需加载、不进初始上下文 |
 | 6 | `optimizer.py` 零依赖 | ✅ | 仅标准库：hashlib / json / os / re / sys / time / typing / urllib |
@@ -40,7 +40,7 @@ python scripts/validate_skill.py --json # 机器可读
 |---|---|
 | Skill = 目录 + `SKILL.md`，YAML frontmatter 必填 `name` / `description` | ✅ 满足 |
 | `name`：小写字母/数字/连字符，≤64 字符 | ✅ `mcd-meal-brain` |
-| `description`：≤1024 字符，说明功能与触发时机 | ✅ 57 字符 |
+| `description`：≤1024 字符，说明功能与触发时机 | ✅ 77 字符 |
 | 渐进式披露：元数据（name+description）→ SKILL.md 正文 → 链接文件 | ✅ 三层齐全 |
 | 支撑文件放 `references/`（文档）、`scripts/`（可执行） | ✅ 4 个引用文档 + 3 个脚本 |
 | 脚本可直接运行、无第三方依赖 | ✅ 纯标准库（Python 3.10+） |
@@ -209,5 +209,5 @@ export MCD_MCP_TOKEN="你的Token"
 |---|---|---|
 | Agent Skills 规范符合性（8 项） | ✅ 已验证 | `scripts/validate_skill.py` 自动检查，2026-10-10 全部通过 |
 | WorkBuddy 加载 + MCP 全链路 | ✅ 已实测 | 35 个工具真实调用记录见 `MCP_INTEGRATION.md`；核价实测见 `docs/pricing-verification.md` |
-| 离线脚本独立运行 | ✅ 已实测 | `--selftest` 14 组断言 + pytest 25 用例全绿（CI 双版本） |
+| 离线脚本独立运行 | ✅ 已实测 | `--selftest` 17 组断言 + pytest 83 用例全绿（CI 双版本） |
 | Claude Code / Cursor / Cline 加载 | ⚠️ 未实测 | 本机未安装上述框架；加载方式依据其官方文档（检索于 2026-10-10，来源见各小节） |

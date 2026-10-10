@@ -195,7 +195,7 @@
 
 ### 3.4 解析输出
 
-解析结果必须落到 SKILL.md 第六节的画像 JSON：
+解析结果必须落到 `references/workflow.md` 第 4 节（多人偏好解析）的画像 JSON：
 每人 `hard[] / soft{prefer,avoid} / targets{} / weight{}`，
 团队级 `aggregated{hard_union, budget_ceiling_cny, must_have, conflicts}`。
 

@@ -20,8 +20,9 @@
 * ``discountType`` 为空或「促销优惠」→ 按 ``currentPrice``（促销价无需附加条件）；
 * ``discountType`` 含「随单购」→ 按 ``originalPrice``（不购买早餐卡时的真实价格，
   避免引入随单购卡片购买链路）；
-* 营养字段：``query-meals`` 不返回营养，按名称归一化（去空格/™/【】/中英文括号及
-  其内容/引号）后与 ``list-nutrition-foods``（160 品）精确匹配；**未命中一律置 0**
+* 营养字段：``query-meals`` 不返回营养，按名称归一化（去空格/™/®/引号；【】去
+  括号保内容、中英文圆括号去括号及内容）后与 ``list-nutrition-foods``（160 品）
+  精确匹配（两侧对称归一）；**未命中一律置 0**
   （见 NUTRITION_MATCHED / NUTRITION_UNMATCHED），不做估算、不编造。
 
 用法
@@ -212,14 +213,18 @@ PRICING_TRACE: Optional[Dict[str, Any]] = {
     "delivery_cny": 0.00,           # 到店自取无运费（响应未含该字段）
     "packing_cny": 0.00,            # 打包费 0（响应未含该字段）
     "discount_cny": 0.00,           # discount 0 分
-    "take_ways": ["堂食", "外带（店内自提）"],
+    # 勘误（2026-10-10 13:46 复验，calculate-price 实调 traceId cb4abf9e…5c5ca）：
+    # 外带 code 原快照误记为 take-in-store，实测为 locker-in（与 SKILL.md/tools.md 一致）；
+    # 本复验亦返回第三种 take-dt-quick（得来速）。价格/traceId/时间字段不受影响。
+    "take_ways": ["堂食", "外带（店内取餐柜）", "得来速（车道自提）"],
     "raw_key_fields": {
         "productOriginalPrice": 4400, "productPrice": 4400,
         "originalPrice": 4400, "discount": 0, "price": 4400,
         "productList": [{"productCode": "5889", "productName": "大脆鸡扒麦满分",
                          "quantity": 4, "originalSubtotal": 4400, "subtotal": 4400}],
         "takeWayList": [{"code": "eat-in", "title": "堂食", "subtitle": "店内用餐"},
-                        {"code": "take-in-store", "title": "外带", "subtitle": "店内自提"}],
+                        {"code": "locker-in", "title": "外带", "subtitle": "店内取餐柜"},
+                        {"code": "take-dt-quick", "title": "得来速", "subtitle": "车道自提"}],
     },
     "trace_note": "calculate-price 2026-10-10 09:33:53，traceId 5b8f62…65116c",
 }
@@ -275,6 +280,28 @@ def pricing_request(plan: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def snapshot_local_estimate() -> float:
+    """快照篮子的本地估算（**同篮对比**口径）。
+
+    官方快照价（09:33:53）对应的是快照时刻 DP 选出的最省钱篮子
+    （``PRICING_TRACE.raw_key_fields.productList``）。DP 选篮会随菜单快照与
+    算法演进而变化——重放时今日最省钱篮子可能已不同（例如火腿扒麦满分×4），
+    拿**今日选篮**对比**当时快照价**会产生假偏差。因此本地估算必须取同一
+    篮子：按 RAW_MENU 计价口径（随单购按 originalPrice、其余按 currentPrice，
+    与 build_menu 完全一致）逐项求和。
+    """
+    snap_items = (PRICING_TRACE or {}).get("raw_key_fields", {}).get("productList", [])
+    if not snap_items:
+        return 0.0
+    price_by_code = {code: (original if "随单购" in disc else current)
+                     for code, name, current, original, disc in RAW_MENU}
+    total_cents = 0
+    for it in snap_items:
+        unit_cny = float(price_by_code[str(it["productCode"])])
+        total_cents += int(round(unit_cny * 100)) * int(it["quantity"])
+    return total_cents / 100.0
+
+
 # ---------------------------------------------------------------------------
 # 3. HTML 对比页（docs/pricing-verification.html，零依赖单文件）
 # ---------------------------------------------------------------------------
@@ -325,12 +352,48 @@ def render_html(cheap: Dict[str, Any]) -> str:
     esc = _h.escape
     t = PRICING_TRACE or {}
     official = t.get("official_cny", 0.0)
-    estimated = cheap["final_price_cny"]
-    items_html = "".join(
-        f"<tr><td><code>{esc(ln['productCode'])}</code></td><td>{esc(ln['name'])}</td>"
-        f"<td>×{ln['quantity']}</td><td>¥{ln['subtotal_cny']:.2f}</td></tr>"
-        for ln in cheap["items"]
-    )
+    snap_items = t.get("raw_key_fields", {}).get("productList", [])
+    people = int(cheap.get("people_count") or 4)
+    if snap_items:
+        # 同篮对比：本地估算取**快照篮子**逐项求和（见 snapshot_local_estimate）；
+        # 商品明细/合计/人均营养均按快照篮子呈现，与官方核价同一口径。
+        # DP 选篮随菜单快照/算法演进（今日重放最便宜篮子可能不同），不参与对比。
+        estimated = snapshot_local_estimate()
+        basket_desc = "、".join(
+            f"{it['productName']}×{it['quantity']}" for it in snap_items)
+        items_html = "".join(
+            f"<tr><td><code>{esc(str(it['productCode']))}</code></td>"
+            f"<td>{esc(it['productName'])}</td><td>×{it['quantity']}</td>"
+            f"<td>¥{int(it['subtotal']) / 100:.2f}</td></tr>"
+            for it in snap_items
+        )
+        snap_total_cny = sum(int(it["subtotal"]) for it in snap_items) / 100.0
+        snap_pc_cny = snap_total_cny / people
+        kcal_pc = prot_pc = fat_pc = 0.0
+        for it in snap_items:
+            nutri = NUTRITION_MATCHED.get(str(it["productCode"]))
+            if nutri:
+                q = int(it["quantity"])
+                kcal_pc += nutri[0] * q / people
+                prot_pc += nutri[1] * q / people
+                fat_pc += nutri[2] * q / people
+    else:
+        estimated = cheap["final_price_cny"]
+        basket_desc = "、".join(
+            f"{i['name']}×{i['quantity']}" for i in cheap["items"])
+        items_html = "".join(
+            f"<tr><td><code>{esc(ln['productCode'])}</code></td><td>{esc(ln['name'])}</td>"
+            f"<td>×{ln['quantity']}</td><td>¥{ln['subtotal_cny']:.2f}</td></tr>"
+            for ln in cheap["items"]
+        )
+        snap_total_cny = cheap["subtotal_cny"]
+        snap_pc_cny = cheap["per_capita_cny"]
+        kcal_pc = cheap["nutrition"]["per_capita_kcal"]
+        prot_pc = cheap["nutrition"]["per_capita_protein_g"]
+        fat_pc = cheap["nutrition"]["per_capita_fat_g"]
+    # 偏差按本地估算 vs 官方核价实际计算（与 main 文本输出同口径，≤5% 判一致）
+    diff = round(official - estimated, 2)
+    pct = round(abs(diff) / official * 100, 2) if official else 0.0
     raw = json.dumps(t.get("raw_key_fields", {}), ensure_ascii=False, indent=2)
     req = json.dumps(t.get("request", {}), ensure_ascii=False, indent=2)
     return f"""<!DOCTYPE html>
@@ -348,7 +411,7 @@ def render_html(cheap: Dict[str, Any]) -> str:
 <section class="hero">
   <div class="flow">
     <div class="node">
-      <div class="lab">本地估算（optimizer.py DP + 券组合）</div>
+      <div class="lab">本地估算（RAW_MENU 计价口径 · 同篮对比）</div>
       <div class="val">¥{estimated:.2f}</div>
     </div>
     <div class="node" style="font-size:26px;color:var(--muted)">⇄</div>
@@ -357,9 +420,9 @@ def render_html(cheap: Dict[str, Any]) -> str:
       <div class="val">¥{official:.2f}</div>
     </div>
   </div>
-  <div class="ok"><span class="big">偏差 ¥0.00</span><span class="pct">0.00% 一致 ✅</span></div>
+  <div class="ok"><span class="big">偏差 ¥{abs(diff):.2f}</span><span class="pct">{pct:.2f}% {'一致 ✅' if pct <= 5 else '偏差 >5%，以官方价为准'}</span></div>
   <div class="muted" style="font-size:13px;margin-top:8px">
-    场景：{esc(SCENARIO)}｜方案：最省钱（{esc('、'.join(i['name'] + '×' + str(i['quantity']) for i in cheap['items']))}）</div>
+    场景：{esc(SCENARIO)}｜核价篮子：{esc(basket_desc)}（09:33 快照时刻 DP 最省钱方案）</div>
 </section>
 
 <section class="card">
@@ -383,23 +446,23 @@ def render_html(cheap: Dict[str, Any]) -> str:
         <td class="muted">66a17d…b6c3f9</td></tr>
     <tr><td>09:33:53</td><td><code>calculate-price</code></td>
         <td><code>storeCode=195****, orderType=1, beType=1, items=[5889×4]</code></td>
-        <td><b>¥44.00</b>（4400 分）；discount=0；取餐：堂食/外带</td>
+        <td><b>¥44.00</b>（4400 分）；discount=0；取餐方式：堂食 / 外带（取餐柜）/ 得来速</td>
         <td class="muted">5b8f62…65116c</td></tr>
   </table>
 </section>
 
 <section class="card">
-  <h2>最省钱方案商品明细（optimizer.py 真实输出）</h2>
+  <h2>核价篮子商品明细（快照 productList，与官方核价同篮）</h2>
   <table>
     <tr><th>商品编码</th><th>名称</th><th>数量</th><th>小计</th></tr>
     {items_html}
-    <tr><td colspan="3"><b>合计（人均 ¥{cheap['per_capita_cny']:.2f} × 4 人，主食 4 份）</b></td>
-        <td><b>¥{cheap['subtotal_cny']:.2f}</b></td></tr>
+    <tr><td colspan="3"><b>合计（人均 ¥{snap_pc_cny:.2f} × {people} 人，主食 4 份）</b></td>
+        <td><b>¥{snap_total_cny:.2f}</b></td></tr>
   </table>
   <p class="muted" style="font-size:13px;margin-top:10px">
-    营养（人均）：{cheap['nutrition']['per_capita_kcal']:.0f} kcal ·
-    蛋白 {cheap['nutrition']['per_capita_protein_g']:.1f} g ·
-    脂肪 {cheap['nutrition']['per_capita_fat_g']:.1f} g（营养来自 list-nutrition-foods 名称精确匹配）</p>
+    营养（人均）：{kcal_pc:.0f} kcal ·
+    蛋白 {prot_pc:.1f} g ·
+    脂肪 {fat_pc:.1f} g（营养来自 list-nutrition-foods 名称精确匹配）</p>
 </section>
 
 <section class="card">
@@ -430,6 +493,10 @@ def render_html(cheap: Dict[str, Any]) -> str:
     <tr><td>早餐时段菜单</td>
         <td>09:28 为早餐时段（07:14–10:15），菜单为早餐品类（麦满分/厚松饼/粥类），
             与 README 正餐演示场景品类不同，属真实时段差异，如实呈现</td></tr>
+    <tr><td>核价对比口径</td>
+        <td><b>同篮对比</b>：本地估算取快照篮子（大脆鸡扒麦满分×4）按 RAW_MENU 计价口径
+            逐项求和；DP 选篮会随菜单快照/算法演进而变化（今日重放最便宜篮子可能不同），
+            跨篮对比无意义。2026-10-10 13:46 复验取餐编码同口径修正（traceId cb4abf9e…5c5ca）</td></tr>
   </table>
 </section>
 
@@ -446,7 +513,17 @@ def render_html(cheap: Dict[str, Any]) -> str:
 # 4. 入口：重放 + 对比
 # ---------------------------------------------------------------------------
 
+def _safe_stdio() -> None:
+    """GBK 控制台/管道下 emoji 输出防崩（同 optimizer._safe_stdio）。"""
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors="replace")
+        except AttributeError:
+            pass
+
+
 def main() -> int:
+    _safe_stdio()
     r = compute_plans()
     plans, constraints = r["plans"], r["constraints"]
     if not plans:
@@ -472,22 +549,42 @@ def main() -> int:
               f"｜人均蛋白 {n['per_capita_protein_g']:.1f} g")
 
     cheap = next(p for p in plans if p["label"] == "最省钱")
-    req = pricing_request(cheap)
-    print("\n" + "=" * 68)
-    print("【最省钱方案 · calculate-price 核价请求】")
-    print(json.dumps(req, ensure_ascii=False, indent=2))
 
     if PRICING_TRACE:
+        # 同篮对比：官方快照价对应 09:33 快照时刻 DP 最省钱篮子（productList）；
+        # 今日重放的 DP 选篮可能已不同（菜单/算法演进），跨篮对比是假偏差——
+        # 本地估算取同一篮子按 RAW_MENU 计价口径逐项计算（见 snapshot_local_estimate）。
+        snap_items = PRICING_TRACE["raw_key_fields"]["productList"]
+        req = {
+            "storeCode": PRICING_TRACE["request"]["storeCode"],
+            "orderType": PRICING_TRACE["request"]["orderType"],
+            "beType": PRICING_TRACE["request"]["beType"],
+            "items": [{"productCode": it["productCode"], "quantity": int(it["quantity"])}
+                      for it in snap_items],
+        }
+        print("\n" + "=" * 68)
+        print("【核价篮子 · calculate-price 请求（与 09:33 快照同篮对齐）】")
+        print(json.dumps(req, ensure_ascii=False, indent=2))
+
         official = PRICING_TRACE["official_cny"]
-        estimated = cheap["final_price_cny"]
+        estimated = snapshot_local_estimate()
         diff = round(official - estimated, 2)
         pct = round(abs(diff) / official * 100, 2) if official else 0.0
-        print("\n【本地估算 vs 官方核价】")
-        print(f"  本地估算：¥{estimated:.2f}")
+        print("\n【本地估算 vs 官方核价（同篮对比）】")
+        print("  篮子：" + "、".join(
+            f"{it['productName']}×{it['quantity']}" for it in snap_items))
+        print(f"  本地估算：¥{estimated:.2f}（RAW_MENU 计价口径逐项求和）")
         print(f"  官方核价：¥{official:.2f}  ({PRICING_TRACE['trace_note']})")
         print(f"  偏差：¥{diff:+.2f}（{pct:.2f}%）→ "
               + ("一致 ✅" if pct <= 5 else "偏差 >5%，以官方价为准（SKILL 第八节）"))
+        print("  注：DP 选篮随菜单快照/算法演进；今日重放最省钱篮子为："
+              + "、".join(f"{ln['name']}×{ln['quantity']}" for ln in cheap["items"])
+              + f"（¥{cheap['final_price_cny']:.2f}，信息性输出，不参与对比）。")
     else:
+        req = pricing_request(cheap)
+        print("\n" + "=" * 68)
+        print("【今日最省钱方案 · calculate-price 核价请求】")
+        print(json.dumps(req, ensure_ascii=False, indent=2))
         print("\n⚠️ PRICING_TRACE 未回填：本脚本当前仅完成本地计算，"
               "核价响应需在营业时段真实调用后固化。")
 

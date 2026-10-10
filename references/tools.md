@@ -31,7 +31,7 @@
 
 | 工具名 | 用途 | 关键参数 | 返回值注意点 |
 |---|---|---|---|
-| `query-nearby-stores` | 到店场景查可点餐门店 | `beType`(1/5)、`searchType`(1=收藏,2=位置，默认1)；searchType=2 时 `city`+`keyword` 必填 | beType=1 返回门店**无 beCode**，后续不传；beType=5 返回**有 beCode**，后续必传。`reservation=true` 时需完整展示 `reservationTimeOptions`，`today=true` 标「(今天)」——**预约场景的取餐时段只认这里，不编造** |
+| `query-nearby-stores` | 到店场景查可点餐门店 | `beType`(1/5)、`searchType`(1=收藏,2=位置，默认1)；searchType=2 时 `city`+`keyword` 必填 | beType=1 返回门店**无 beCode**，后续不传；beType=5 返回**有 beCode**，后续必传。`reservation=true` 时需完整展示 `reservationTimeOptions`，`today=true` 标「(今天)」——**预约场景的取餐时段只认这里，不编造**。复验注（2026-10-10 13:41）：工具 schema 枚举仅 [1,5]，传 `beType=6` 直接被参数校验拒绝——**团餐门店必须走 `delivery-query-stores`**（本仓库早前日志中出现过 beType=6 调用记录，系失实记录，已在 MCP_INTEGRATION.md 勘误） |
 | `delivery-query-stores` | 外送场景按地址查可配送门店 | `addressId`、`beType`(2=麦乐送 / 6=团餐) | 返回 `storeCode` + `beCode`，团餐链路起点 |
 | `delivery-query-addresses` | 查用户配送地址列表 | 无 | 无地址时引导创建；团餐需再引导用户提供**预算金额与人数**以算人均 |
 | `delivery-create-address` | 新建配送地址（写操作） | `city`/`contactName`/`phone`(11位纯数字)/`address`/`addressDetail` 必填，`gender` | 返回 `addressId`，供外送/团餐下单使用 |

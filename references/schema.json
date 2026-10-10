@@ -50,9 +50,18 @@
             "type": "string",
             "description": "方案定位：最省钱/最健康/最快"
           },
+          "degraded": {
+            "type": "boolean",
+            "description": "降级建议型方案标记（如「预算不足/分步下单」）；为 true 时 items 允许为空数组"
+          },
+          "degrade_reason": {
+            "type": "string",
+            "description": "降级原因说明（degraded=true 时携带）"
+          },
           "items": {
             "type": "array",
-            "minItems": 1,
+            "minItems": 0,
+            "description": "商品明细；正常方案必非空（validate_plans_doc 业务规则兜底），仅降级建议型方案允许为空",
             "items": {
               "type": "object",
               "required": [

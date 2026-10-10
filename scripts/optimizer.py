@@ -619,7 +619,9 @@ def clarify_input(
         用户原始输入（自然语言）。
     answers : dict, 可选
         第二轮合并参数：上一轮 ``questions`` 的用户回答，支持键
-        ``people_count``（int）/ ``budget``（数值或 None=不限）/ ``taste``（自然语言，
+        ``people_count``（int）/ ``budget``（数值；或含数字的字符串，如
+        ``"100"``、``"预算100元"``；含「每人/人均/平均」字样时按人均口径
+        记录；None=不限）/ ``taste``（自然语言，
         如「无辣不欢」「不吃香菜」，走完整同义词归一）。
 
     Returns
@@ -640,11 +642,25 @@ def clarify_input(
         if answers.get("people_count"):
             c["people_count"] = int(answers["people_count"])
         if "budget" in answers and answers.get("budget") is not None:
+            _raw = answers["budget"]
+            _is_pp = isinstance(_raw, str) and re.search(r"每人|人均|平均", _raw) is not None
             try:
-                c["budget"] = {"type": "total", "amount_cny": float(answers["budget"])}
-                c["hard"]["max_per_capita_cny"] = float(answers["budget"])
-            except (TypeError, ValueError):
+                if isinstance(_raw, str):
+                    _amount = float(re.search(r"\d+(?:\.\d+)?", _raw).group())
+                else:
+                    _amount = float(_raw)
+            except (TypeError, ValueError, AttributeError):
                 pass  # 非数值（如「不限」）→ 维持不限预算
+            else:
+                # canonical 结构与 parse_constraints 一致（L441-454）：
+                # 下游预算硬约束读 total_cny / per_person_cny（缺键即静默失效）。
+                # 注意：总预算 ≠ 人均上限，不再写入 hard.max_per_capita_cny（语义错位）。
+                if _is_pp:
+                    c["budget"] = {"type": "per_capita", "amount_cny": _amount,
+                                   "total_cny": None, "per_person_cny": _amount}
+                else:
+                    c["budget"] = {"type": "total", "amount_cny": _amount,
+                                   "total_cny": _amount, "per_person_cny": None}
         taste_answer = str(answers.get("taste") or "").strip()
         if taste_answer and not any(p in taste_answer for p in YOU_DECIDE_PATTERNS):
             # 口味回答走完整解析（同义词归一/档位识别），只取偏好相关字段
@@ -758,14 +774,15 @@ TASTE_DIMENSIONS: Tuple[str, ...] = ("spicy",)
 #: 口味强度标尺：0 不辣 … 5 变态辣
 TASTE_SCALE_MAX = 5
 
-#: 自然语言 → 口味强度（顺序敏感：否定式必须先于泛化式，避免「不吃辣」误判为「吃辣」）
+#: 自然语言 → 口味强度（顺序敏感：否定式必须先于泛化式，避免「不吃辣」误判为「吃辣」；
+#: 「不怕辣」为肯定式，靠 (?<!不) 负向后行断言从否定式中排除，落入末条正向规则）
 _TASTE_RULES: Tuple[Tuple[str, int], ...] = (
-    (r"不吃辣|不能吃辣|忌辣|不要辣|别放辣|怕辣|不辣", 0),
+    (r"不吃辣|不能吃辣|忌辣|不要辣|别放辣|(?<!不)怕辣|不辣", 0),
     (r"变态辣|特辣|非常辣|无辣不欢", 5),
     (r"很辣|超辣|重辣|越辣越好", 4),
     (r"中辣", 3),
     (r"微辣|小辣|一点点辣", 2),
-    (r"能吃辣|喜欢辣|爱吃辣|要辣|吃辣", 3),
+    (r"不怕辣|相当能吃辣|能吃辣|喜欢辣|爱吃辣|要辣|吃辣", 3),
 )
 
 #: 中文词 → 标准标签（由 INGREDIENT_SYNONYMS + 常用口味词构建）
@@ -931,7 +948,7 @@ def aggregate_preferences(members: List[Any]) -> Dict[str, Any]:
     for m in resolved:
         for t in m["prefer_tags"]:
             prefer_counts[t] = prefer_counts.get(t, 0) + 1
-    prefer_tags = sorted(t for t, cnt in prefer_counts.items() if cnt * 2 >= len(resolved) and resolved)
+    prefer_tags = sorted(t for t, cnt in prefer_counts.items() if cnt * 2 >= len(resolved))
     avoid_tags = sorted({x for m in resolved for x in m["avoid_tags"]})
 
     # 口味：截尾均值 + 明细（供公平性评分用）
@@ -1556,6 +1573,9 @@ def pareto_price_kcal(
 
     # 等间隔抽样，避免输出过长（保留首尾）
     if limit and len(front) > limit:
+        if limit <= 1:
+            # 防御：limit=1 时仅保留首点（最低热量点），避免下方除零
+            return front[:1]
         span = len(front) - 1
         idxs = sorted({round(i * span / (limit - 1)) for i in range(limit)})
         front = [front[i] for i in idxs]
@@ -3432,18 +3452,22 @@ DEMO_BANNER = "⚠️ 演示模式：以下结果基于内置样例数据（非�
 #: 自动选址兜底门店（北京国贸附近，营业 07:00–22:00，实测可下单）
 DEFAULT_STORE_CODE = "1950936"
 
-#: 名称归一化：去空格/™/®/【】及内容/中英文圆括号及内容/引号
-_NAME_BRACKETS_RE = re.compile(r"[（(【\[]([^（(【\[]*?)[）)】\]]")
+#: 名称归一化：去空格/™/®/引号；【】[] 去括号保留内容（品牌前缀）；（）() 去括号及内容（包装规格）
+_NAME_BRACKETS_KEEP_RE = re.compile(r"[【\[]([^（(【\[]*?)[】\]]")
+_NAME_BRACKETS_STRIP_RE = re.compile(r"[（(]([^（(【\[]*?)[）)]")
 
 
 def normalize_food_name(name: Any) -> str:
     """餐品名称归一化（用于 query-meals ↔ list-nutrition-foods 精确匹配）。
 
     例：``纯牛奶(盒装)`` → ``纯牛奶``；``【美汁源】"黄金橙橙"`` → ``美汁源黄金橙橙``。
+    规则：圆括号（包装/规格描述）连同内容一并去除；方括号【】（品牌前缀）去
+    括号保留内容，避免品牌信息丢失导致跨来源匹配退化（两侧对称归一）。
     """
     s = str(name or "")
     s = s.replace(" ", "").replace("™", "").replace("®", "")
-    s = _NAME_BRACKETS_RE.sub("", s)
+    s = _NAME_BRACKETS_KEEP_RE.sub(r"\1", s)
+    s = _NAME_BRACKETS_STRIP_RE.sub("", s)
     for q in ("\"", "'", "“", "”", "‘", "’"):
         s = s.replace(q, "")
     return s
@@ -3636,11 +3660,17 @@ def _normalize_mcp_coupon(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
     def _cents(v: Any, *, is_discount: bool = False) -> Optional[int]:
-        """元/分歧义消解：优惠额 < 100 几乎不可能是「分」（<1 元券不现实）→ 视为元。"""
+        """元/分歧义消解：优惠额 < 100 几乎不可能是「分」（<1 元券不现实）→ 视为元。
+
+        注意：≥100 一律按「分」处理；100~199 区间存在理论歧义（如 ¥150 门槛
+        会被读作 150 分），启发式无法完全消解——最终金额以 calculate-price
+        官方核价为准（见 SKILL.md 核价规则）。``is_discount`` 参数保留以兼容
+        调用方，两类字段的阈值行为一致。
+        """
         if isinstance(v, bool):
             return None
         if isinstance(v, (int, float)):
-            if v >= 100 or (not is_discount and v >= 100):
+            if v >= 100:
                 return int(v)
             return int(round(v * 100))
         if isinstance(v, str):
@@ -3752,6 +3782,8 @@ def resolve_store(
     city = city or os.environ.get("MCD_STORE_CITY", "北京市")
     keyword = keyword or os.environ.get("MCD_STORE_KEYWORD", "国贸")
     # query-nearby-stores 合法 beType 仅 [1, 5]（得来速场景才有 beCode 可取）
+    # （2026-10-10 13:41 复验：beType=6 被 MCP 参数校验拒绝，enum 仅 [1,5]；
+    #   团餐门店请走 delivery-query-stores，见 references/tools.md）
     search_be_type = 5 if int(be_type or 1) == 5 else 1
     try:
         resp = _mcp_call("query-nearby-stores",
@@ -3896,7 +3928,12 @@ def run_live_optimization(
     if not ctx["ok"]:
         return {"ok": False, "constraints": constraints, "kept": [],
                 "plans": [], "context": ctx, "error": ctx.get("menu_error")}
-    kept = filter_menu(_normalize_menu(ctx["menu"]), constraints)
+    try:
+        kept = filter_menu(_normalize_menu(ctx["menu"]), constraints)
+    except ValueError as exc:
+        # 与 main 的过滤异常处理同模式：硬约束无解时返回结构化错误，不裸抛
+        return {"ok": False, "constraints": constraints, "kept": [],
+                "plans": [], "context": ctx, "error": str(exc)}
     plans = optimize_plans(kept, ctx["coupons"], constraints)
     return {"ok": True, "constraints": constraints, "kept": kept,
             "plans": plans, "context": ctx, "error": None}
@@ -4604,8 +4641,13 @@ PLAN_OUTPUT_SCHEMA: Dict[str, Any] = {
                 "properties": {
                     "name": {"type": "string",
                               "description": "方案定位：最省钱/最健康/最快"},
+                    "degraded": {"type": "boolean",
+                                 "description": "降级建议型方案标记（如「预算不足/分步下单」）；为 true 时 items 允许为空数组"},
+                    "degrade_reason": {"type": "string",
+                                       "description": "降级原因说明（degraded=true 时携带）"},
                     "items": {
-                        "type": "array", "minItems": 1,
+                        "type": "array", "minItems": 0,
+                        "description": "商品明细；正常方案必非空（validate_plans_doc 业务规则兜底），仅降级建议型方案允许为空",
                         "items": {
                             "type": "object",
                             "required": ["productCode", "name", "quantity",
@@ -4776,6 +4818,14 @@ def plans_to_doc(
     people = int(people_count or (plans[0]["people_count"] if plans else 1) or 1)
     doc_plans: List[Dict[str, Any]] = []
     for p in plans:
+        _nutrition = dict(p.get("nutrition") or {})
+        if p.get("degraded") and not _nutrition:
+            # 降级建议型方案（无商品明细）：营养按 0 填充以满足契约必填
+            # （空篮筐 = 零营养，与 items 允许为空的语义一致）
+            _nutrition = {"total_kcal": 0.0, "per_capita_kcal": 0.0,
+                          "total_protein_g": 0.0, "per_capita_protein_g": 0.0,
+                          "total_fat_g": 0.0, "per_capita_fat_g": 0.0,
+                          "total_sodium_mg": 0.0}
         doc_plan: Dict[str, Any] = {
             "name": p.get("label") or "方案",
             "items": [
@@ -4805,7 +4855,7 @@ def plans_to_doc(
             "per_person": p.get("per_capita_cny"),
             "people_count": int(p.get("people_count") or people),
             "mains": int(p.get("mains") or 0),
-            "nutrition": p.get("nutrition") or {},
+            "nutrition": _nutrition,
             "nutrition_flags": list(p.get("nutrition_flags") or []),
             "tradeoffs": _plan_tradeoffs(p),
             "genui": _plan_genui(p),
@@ -4824,6 +4874,10 @@ def plans_to_doc(
                 ],
                 "note": fr.get("note"),
             }
+        if p.get("degraded"):
+            # 降级建议型方案：透传标记与原因（items 允许为空，见 PLAN_OUTPUT_SCHEMA）
+            doc_plan["degraded"] = True
+            doc_plan["degrade_reason"] = p.get("degrade_reason")
         if not price_verified:
             # 契约：price_note 可选；仅在未核价时携带提示
             doc_plan["price_note"] = "价格为估算，未核价"
@@ -4904,6 +4958,12 @@ def validate_plans_doc(doc: Any) -> List[str]:
     """校验输出文档是否符合 PLAN_OUTPUT_SCHEMA；返回错误列表（空 = 通过）。"""
     errors: List[str] = []
     _validate_schema(doc, PLAN_OUTPUT_SCHEMA, "$", errors)
+    # 业务规则（契约强度兜底）：非降级方案 items 必非空；
+    # 仅 degraded 建议型方案（如「预算不足/分步下单」）允许空明细。
+    if isinstance(doc, dict):
+        for i, plan in enumerate(doc.get("plans") or []):
+            if isinstance(plan, dict) and not plan.get("degraded") and not plan.get("items"):
+                errors.append(f"$.plans[{i}]: 非降级方案 items 不能为空")
     return errors
 
 
@@ -5796,7 +5856,23 @@ def _mcp_unavailable_hint(error: str) -> List[str]:
     ]
 
 
+def _safe_stdio() -> None:
+    """GBK 控制台/管道下 emoji 输出防崩：errors=replace（--json 仍输出合法 JSON）。
+
+    Windows 交互式控制台走 PEP 528（UTF-8）不受影响；但输出重定向/管道时
+    编码退回 cp936(GBK)，emoji（🍔✅ 等）会触发 UnicodeEncodeError。
+    ``errors="replace"`` 把不可编码字符替换为 U+FFFD（GBK 落盘为 ?），
+    不会产生非法 JSON 转义（不可用 backslashreplace，会破坏 --json payload）。
+    """
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors="replace")
+        except AttributeError:
+            pass  # 非 TextIO（如已替换的缓冲区）时静默跳过
+
+
 def main(argv: Sequence[str]) -> int:
+    _safe_stdio()
     if argv and argv[0] == "--selftest":
         _selftest()
         return 0

@@ -153,22 +153,24 @@ def _coupon_rule_table() -> Dict[str, str]:
     return rules
 
 
-def _per_capita(plan: Dict[str, Any], key_total: str) -> float:
-    """从方案营养总量换算人均（钠在 optimizer 输出中只有总量口径）。"""
-    return plan["nutrition"][key_total] / max(plan["people_count"], 1)
-
-
 def _nutrition_matrix(plans: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """雷达图数据：每方案的人均 热量/蛋白/脂肪/钠（真实值换算）。"""
+    """雷达图数据：每方案的人均 热量/蛋白/脂肪/钠（真实值换算）。
+
+    注意口径：optimizer 输出契约（references/schema.json）中
+    ``per_capita_kcal / per_capita_protein_g / per_capita_fat_g`` 本就是**人均值**，
+    直接取值即可，不可再除以人数（否则数值会缩小 N 倍）；
+    仅 ``total_sodium_mg`` 是总量口径，需按人数换算成人均。
+    """
     rows = []
     for p in plans:
         n = p["nutrition"]
+        people = max(int(p.get("people_count") or 1), 1)
         rows.append({
             "label": p["label"],
-            "kcal": round(_per_capita(p, "per_capita_kcal"), 1),
-            "protein": round(_per_capita(p, "per_capita_protein_g"), 1),
-            "fat": round(_per_capita(p, "per_capita_fat_g"), 1),
-            "sodium": round(_per_capita(p, "total_sodium_mg"), 0),
+            "kcal": round(float(n["per_capita_kcal"]), 1),
+            "protein": round(float(n["per_capita_protein_g"]), 1),
+            "fat": round(float(n["per_capita_fat_g"]), 1),
+            "sodium": round(float(n["total_sodium_mg"]) / people, 0),
         })
     return rows
 
@@ -328,14 +330,23 @@ def render_report(data: Dict[str, Any]) -> str:
     radar_svg = radar_chart_svg(matrix)
 
     esc = html.escape
-    members = ["减脂成员", "忌辣成员", "要赠品成员", "预算控成员"]
     people = cheapest["people_count"]
+    # 表头按实际人数动态生成（命中画像命名，未命中时用通用序号），与账单数据行对齐
+    _personas = list(c.get("personas") or [])
+    members = [f"{_personas[i]}成员" if i < len(_personas) else f"成员{i + 1}"
+               for i in range(people)]
 
     # --- 场景解析摘要 -----------------------------------------------------
     budget = c.get("budget") or {}
     budget_txt = (f"总额 {_fmt(budget.get('amount_cny'))}"
                   if budget.get("type") == "total"
                   else f"人均 {_fmt(budget.get('amount_cny'))}")
+    # 人均预算口径说明（总额型预算换算为人均；人均型直接沿用）
+    if budget.get("type") == "total" and budget.get("amount_cny") and people:
+        budget_pp_note = (f"总额 {_fmt(budget['amount_cny'])} ÷ {people} = "
+                          f"{_fmt(budget['amount_cny'] / people)}/人")
+    else:
+        budget_pp_note = budget_txt
     hard = c.get("hard") or {}
     hard_bits = []
     if hard.get("exclude_tags"):
@@ -359,10 +370,10 @@ def render_report(data: Dict[str, Any]) -> str:
     coupon_rows: List[str] = []
     for p in plans:
         if p["coupons"]:
-            for i, cp in enumerate(p["coupons"]):
+            for cp in p["coupons"]:
                 rule = data["coupon_rules"].get(cp.get("couponId"), "")
                 coupon_rows.append(
-                    f"<tr><td>{esc(p['label'])}{'' if i else ''}</td>"
+                    f"<tr><td>{esc(p['label'])}</td>"
                     f"<td>{esc(cp['name'])}</td>"
                     f"<td><code>{esc(str(cp.get('couponId') or '—'))}</code></td>"
                     f"<td>{esc(rule)}</td>"
@@ -465,7 +476,7 @@ def render_report(data: Dict[str, Any]) -> str:
         "{{CHEAP_FINAL}}": _fmt(cheapest["final_price_cny"]),
         "{{SAVED}}": f"{saved:.2f}",
         "{{SAVED_PCT}}": f"{saved_pct:.1f}",
-        "{{SAVED_PC}}": _fmt(saved),
+        "{{BUDGET_PP}}": esc(budget_pp_note),
         "{{BAR_SVG}}": bar_svg,
         "{{RADAR_SVG}}": radar_svg,
         "{{RADAR_TABLE}}": radar_table_rows,
@@ -574,7 +585,7 @@ TEMPLATE = """<!DOCTYPE html>
 
 <header class="hd">
   <div class="logo"><span class="b">麦麦拼单大脑</span> 演示报告</div>
-  <div class="sub">4 人拼单 · 三套方案对比 · 券组合优化 · 营养达标</div>
+  <div class="sub">{{PEOPLE}} 人拼单 · 三套方案对比 · 券组合优化 · 营养达标</div>
   <div class="meta">数据来源：optimizer.py 真实运行输出（未核价，价格为估算）｜生成时间 {{GENERATED_AT}}</div>
 </header>
 
@@ -627,7 +638,7 @@ TEMPLATE = """<!DOCTYPE html>
     <div class="legend">{{LEGEND}}</div>
   </section>
   <section class="card">
-    <h2><span class="no">图表 2</span>营养数值明细（人均）</h2>
+    <h2><span class="no">图表 3</span>营养数值明细（人均）</h2>
     <table>
       <thead><tr><th style="text-align:left">方案</th><th>热量 kcal</th>
       <th>蛋白 g</th><th>脂肪 g</th><th>钠 mg</th></tr></thead>
@@ -656,8 +667,8 @@ TEMPLATE = """<!DOCTYPE html>
     <thead><tr><th style="text-align:left">方案</th>{{MEMBER_HEADS}}<th>合计</th></tr></thead>
     <tbody>{{BILL_ROWS}}</tbody>
   </table>
-  <div class="tbl-note">均摊口径：每人应付 = 券后总价 ÷ 4（与 README 口径一致）。
-  三套方案人均均在预算（总额 ¥100 ÷ 4 = ¥25/人）之内。</div>
+  <div class="tbl-note">均摊口径：每人应付 = 券后总价 ÷ {{PEOPLE}}（与 README 口径一致）。
+  三套方案人均均在预算（{{BUDGET_PP}}）之内。</div>
 </section>
 
 <section class="card">
@@ -687,7 +698,17 @@ TEMPLATE = """<!DOCTYPE html>
 # 4. 入口
 # ---------------------------------------------------------------------------
 
+def _safe_stdio() -> None:
+    """GBK 控制台/管道下 emoji 输出防崩（同 optimizer._safe_stdio）。"""
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors="replace")
+        except AttributeError:
+            pass
+
+
 def main(argv: Sequence[str]) -> int:
+    _safe_stdio()
     user_input = DEMO_INPUT
     out_path = DEFAULT_OUT
     args = list(argv or [])
