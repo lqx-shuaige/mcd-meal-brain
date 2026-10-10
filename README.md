@@ -76,7 +76,27 @@ python scripts/optimizer.py --group    # 群体决策演示（一半要辣一半
 
 # 4. 核价联调（需在门店营业时段 07:00–22:00）
 #    见 scripts/optimizer.py::verify_price(plan, store_code, token=...)
+#    ✅ 已于 2026-10-10 完成端到端实测（¥44.00 = ¥44.00，偏差 0%），见 docs/pricing-verification.md
 ```
+
+### 在其他框架中使用
+
+本 Skill 遵循 **Agent Skills 开放规范**，不绑定 WorkBuddy，可被任何支持该规范 / MCP 的
+框架加载（Claude Code、Cursor、Cline 等）：
+
+```bash
+# Claude Code（项目级 .claude/skills/；个人级 ~/.claude/skills/）
+mkdir -p .claude/skills && cp -r mcd-meal-brain .claude/skills/mcd-meal-brain
+
+# Cursor（.cursor/skills/，并兼容读取 .claude/skills/）
+mkdir -p .cursor/skills && cp -r mcd-meal-brain .cursor/skills/mcd-meal-brain
+
+# Cline 3.48.0+（项目级 .cline/skills/；需开启 Settings → Features → Enable Skills）
+mkdir -p .cline/skills && cp -r mcd-meal-brain .cline/skills/mcd-meal-brain
+```
+
+MCP 连接配置与环境变量 `MCD_MCP_TOKEN` 的设置方式、各框架配置入口，
+详见 **[docs/portability.md](./docs/portability.md)**。
 
 ---
 
@@ -91,7 +111,15 @@ mcd-meal-brain/
 │   ├── tools.md                  35 个 MCP 工具的参数与返回值注意事项 + 异常处理规则
 │   └── strategy.md               菜品标签字典 / 营养约束映射 / 软硬约束处理 / 群体偏好聚合规则
 ├── scripts/
-│   └── optimizer.py              约束解析 · 硬约束过滤 · 组合优化 · 核价校验 · 渠道比价 · Schema 校验 · 健壮性
+│   ├── optimizer.py              约束解析 · 硬约束过滤 · 组合优化 · 核价校验 · 渠道比价 · Schema 校验 · 健壮性
+│   ├── gen_demo.py               演示报告生成器（跑真实优化链路 → docs/demo.html，纯标准库）
+│   ├── verify_pricing.py         真实核价快照固化 + 一键重放（→ docs/pricing-verification.html）
+│   └── validate_skill.py         Agent Skills 规范符合性检查器（frontmatter/渐进披露/零依赖/脱敏）
+├── docs/
+│   ├── demo.html                 演示可视化报告（三方案对比，零依赖单页，浏览器直接打开）
+│   ├── pricing-verification.md   真实核价记录（5 次真实 MCP 调用链，脱敏）
+│   ├── pricing-verification.html 核价对比页（本地估算 vs 官方核价）
+│   └── portability.md            可移植性说明（各框架加载方式 / MCP 配置 / 环境变量）
 ├── tests/
 │   └── test_regression.py        回归测试（pytest，5 场景 + 契约回归，25 用例）
 ├── .github/workflows/test.yml    CI：push/PR 自动跑 selftest + pytest + CLI 冒烟（Python 3.10/3.12）
@@ -243,7 +271,33 @@ GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
 
 ---
 
-## 七、合规与边界
+## 七、兼容性验证（Agent Skills 规范）
+
+**本 Skill 不是绑定 WorkBuddy 的，而是符合 Agent Skills 开放规范的可移植技能**：
+
+1. **规范符合性**：`SKILL.md` frontmatter（`name` / `description`）符合 Agent Skills 规范
+   （name 小写连字符 ≤64 字符且与目录名一致；description ≤1024 字符）。
+   由 `python scripts/validate_skill.py` 自动检查，**8/8 项全部通过**
+   （frontmatter / 渐进式披露 / references 引用完整 / 零依赖 / 敏感信息扫描）。
+2. **渐进式披露**：`references/`（workflow / schema / tools / strategy）按需加载、
+   不进初始上下文；SKILL.md 本体 204 行（≤500 行建议上限），三层结构符合规范。
+3. **跨框架加载**：可被任何支持 MCP / Agent Skills 规范的框架加载——
+   Claude Code（`.claude/skills/`，官方声明遵循 Agent Skills 开放标准）、
+   Cursor（`.cursor/skills/`，并兼容读取 `.claude/skills/`）、
+   Cline 3.48.0+（`.cline/skills/`）、WorkBuddy（`.workbuddy/skills/`）等。
+   加载方式与 MCP 配置详见 [`docs/portability.md`](./docs/portability.md)。
+4. **零依赖**：`optimizer.py` 纯 Python 标准库（hashlib/json/os/re/sys/time/typing/urllib），
+   无任何第三方依赖，任何框架的沙箱 / 本地环境均可直接运行；无 MCP 连接时全部
+   离线功能照常可用。
+
+> **如实声明**：本项目开发与实测环境为 WorkBuddy（35 个 MCP 工具全链路实测，见
+> `MCP_INTEGRATION.md`）；本机未安装 Claude Code / Cursor / Cline，未做跨框架加载实测，
+> 上述框架的加载方式依据其官方文档（检索于 2026-10-10）。规范符合性检查可复现：
+> `python scripts/validate_skill.py`。
+
+---
+
+## 八、合规与边界
 
 - 本项目**不是**麦当劳官方产品，与麦当劳公司无隶属或背书关系。
 - **不含任何真实凭证**：示例配置仅含 `${MCD_MCP_TOKEN}` 占位符。
@@ -255,7 +309,7 @@ GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
 
 ---
 
-## 八、延伸阅读
+## 九、延伸阅读
 
 - 工作流概览与核心规则 → [`SKILL.md`](./SKILL.md)（含子代理编排设计）
 - 详细工作流与输出字段细则 → [`references/workflow.md`](./references/workflow.md)
@@ -263,3 +317,6 @@ GitHub Actions（`.github/workflows/test.yml`）在 push / pull_request 时
 - 工具参数速查 → [`references/tools.md`](./references/tools.md)
 - 标签字典与约束逻辑 → [`references/strategy.md`](./references/strategy.md)（含群体偏好聚合规则）
 - MCP 接入踩坑记录（15 项实测偏差）→ [`MCP_INTEGRATION.md`](./MCP_INTEGRATION.md)
+- 演示可视化报告（三方案对比）→ [`docs/demo.html`](./docs/demo.html)
+- 真实核价记录（¥44.00 = ¥44.00，偏差 0%）→ [`docs/pricing-verification.md`](./docs/pricing-verification.md)
+- 可移植性与跨框架加载指南 → [`docs/portability.md`](./docs/portability.md)
