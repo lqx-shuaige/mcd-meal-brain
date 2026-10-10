@@ -260,6 +260,179 @@ def parse_constraints(user_input: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 1.1 模糊输入处理（三层询问机制）
+#
+#     目标：用户说「随便」「都行」「你看着办」时，不瞎猜、不卡死。
+#
+#     第一层（静默默认）：常识默认值直接填充，不打扰用户
+#         - 取餐方式缺失   → 默认「到店自取」(beType=1)
+#     第二层（聚焦追问）：必须用户决定的事项，≤3 个关键问题**一次性**追问
+#         - 人数缺失       → 追问（无合理默认值）
+#         - 预算缺失       → 默认「不限预算」，但追问确认
+#         - 口味完全空白   → 默认「不辣、不油炸」，但追问确认
+#     第三层（你看着办）：用户明确放弃决策权 → 全部走默认值，
+#         输出方案时必须标注「基于默认偏好：不辣、不油炸」
+#
+#     ``ready`` 字段告诉调用方：False = 先把 ``questions`` 抛给用户、拿到答案后
+#     经 ``answers`` 参数合并重跑；True = 约束完整，可直接进入过滤与优化。
+# ---------------------------------------------------------------------------
+
+#: 第三层触发词（用户明确把决策权交给系统）
+YOU_DECIDE_PATTERNS: Tuple[str, ...] = (
+    "随便", "都行", "都可以", "无所谓", "你看着办", "看着办", "你决定", "随你", "你定", "你选",
+)
+
+#: 口味完全空白时的默认口味（保守取向：宁可少选项，不冒犯用户）
+DEFAULT_TASTE_EXCLUDE_TAGS: Tuple[str, ...] = ("spicy", "fried")
+
+#: 第三层标注文案（固定，供渲染层展示）
+CLARIFY_BANNER = "基于默认偏好：不辣、不油炸"
+
+#: 人数是否在文本中有明确表达
+_PEOPLE_RE = re.compile(r"(\d+)\s*(?:人|位)|我们\s*(\d+)|(\d+)\s*份")
+
+
+def _taste_blank(constraints: Dict[str, Any]) -> bool:
+    """口味偏好是否完全空白（无忌口、无偏好、无避免项、无营养目标）。"""
+    hard, soft = constraints.get("hard") or {}, constraints.get("soft") or {}
+    return not (hard.get("exclude_ingredients")
+                or hard.get("exclude_tags")
+                or soft.get("prefer_tags")
+                or soft.get("avoid_tags")
+                or constraints.get("targets"))
+
+
+def clarify_input(
+    user_input: str,
+    answers: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """分析输入中的模糊点，产出三层询问机制的决策结果。
+
+    Parameters
+    ----------
+    user_input : str
+        用户原始输入（自然语言）。
+    answers : dict, 可选
+        第二轮合并参数：上一轮 ``questions`` 的用户回答，支持键
+        ``people_count``（int）/ ``budget``（数值或 None=不限）/ ``taste``（自然语言，
+        如「无辣不欢」「不吃香菜」，走完整同义词归一）。
+
+    Returns
+    -------
+    dict
+        ``{input, you_decide, layer, ambiguities, questions, defaults_applied,
+        banner, ready, constraints}``。``constraints`` 已应用默认值，
+        可直接喂给 ``filter_menu`` / ``optimize_plans``（``ready=True`` 时）。
+    """
+    text = (user_input or "").strip()
+    answers = dict(answers or {})
+    c = parse_constraints(text)
+    defaults_applied: List[str] = []
+
+    # --- 第二轮：合并上一轮追问的回答 ------------------------------------
+    accept_default_taste = False
+    if answers:
+        if answers.get("people_count"):
+            c["people_count"] = int(answers["people_count"])
+        if "budget" in answers and answers.get("budget") is not None:
+            try:
+                c["budget"] = {"type": "total", "amount_cny": float(answers["budget"])}
+                c["hard"]["max_per_capita_cny"] = float(answers["budget"])
+            except (TypeError, ValueError):
+                pass  # 非数值（如「不限」）→ 维持不限预算
+        taste_answer = str(answers.get("taste") or "").strip()
+        if taste_answer and not any(p in taste_answer for p in YOU_DECIDE_PATTERNS):
+            # 口味回答走完整解析（同义词归一/档位识别），只取偏好相关字段
+            rp = parse_constraints(taste_answer)
+            c["hard"]["exclude_ingredients"] = sorted(set(
+                (c["hard"]["exclude_ingredients"] or [])
+                + (rp["hard"]["exclude_ingredients"] or [])))
+            c["hard"]["exclude_tags"] = sorted(set(
+                (c["hard"]["exclude_tags"] or []) + (rp["hard"]["exclude_tags"] or [])))
+            c["soft"]["prefer_tags"] = sorted(set(
+                (c["soft"]["prefer_tags"] or []) + (rp["soft"]["prefer_tags"] or [])))
+            c["soft"]["avoid_tags"] = sorted(set(
+                (c["soft"]["avoid_tags"] or []) + (rp["soft"]["avoid_tags"] or [])))
+        elif "taste" in answers:
+            # 显式空回答 / 「随便都行」类回答 = 接受默认口味
+            accept_default_taste = True
+
+    # --- 模糊点检测 -------------------------------------------------------
+    people_stated = bool(_PEOPLE_RE.search(text))
+    people_missing = not people_stated and "people_count" not in answers
+    budget_missing = (c["budget"].get("amount_cny") is None) and "budget" not in answers
+    scene_missing = c["scene"] is None
+    taste_missing = _taste_blank(c)
+
+    # --- 第三层判定：用户明确说「你看着办」 --------------------------------
+    you_decide = any(p in text for p in YOU_DECIDE_PATTERNS)
+
+    # --- 第一层：常识默认值（静默填充，不打扰） ----------------------------
+    if scene_missing:
+        c["scene"] = "到店自取"
+        c["beType"] = 1
+        c["orderType"] = 1
+        defaults_applied.append("取餐方式：到店自取")
+    if you_decide and people_missing:
+        # 仅第三层才敢默认人数（保守 1 人）；第二层路径必须追问
+        defaults_applied.append("人数：默认 1 人")
+    if you_decide and budget_missing:
+        defaults_applied.append("预算：不限")
+    if (you_decide and taste_missing) or (taste_missing and accept_default_taste):
+        # 口味空白 → 默认「不辣、不油炸」。
+        # you_decide 路径：默认即为最终值；第二层路径：先填默认，同时追问确认。
+        c["hard"]["exclude_tags"] = sorted(set(
+            c["hard"]["exclude_tags"] + list(DEFAULT_TASTE_EXCLUDE_TAGS)))
+        defaults_applied.append("口味：不辣、不油炸")
+    elif taste_missing and "taste" not in answers and not you_decide:
+        # 第二层路径且用户尚未回答口味 → 同样先填默认（追问后可推翻）
+        c["hard"]["exclude_tags"] = sorted(set(
+            c["hard"]["exclude_tags"] + list(DEFAULT_TASTE_EXCLUDE_TAGS)))
+        defaults_applied.append("口味：不辣、不油炸（待确认）")
+
+    # --- 第二层：聚焦追问（≤3 个关键问题，一次性抛出） ----------------------
+    questions: List[str] = []
+    if not you_decide:
+        if people_missing:
+            questions.append("几位一起吃？")
+        if budget_missing:
+            questions.append("预算大概多少？（不限也行，默认按不限处理）")
+        if taste_missing and "taste" not in answers:
+            questions.append("有任何忌口或口味偏好吗？没有的话默认按「不辣、不油炸」搭配")
+        questions = questions[:3]
+
+    banner = CLARIFY_BANNER if you_decide else None
+    layer = 3 if you_decide else (2 if questions else 1)
+
+    ambiguities = {
+        "people_count": {"missing": people_missing,
+                          "default": 1 if people_missing else None,
+                          "ask": people_missing and not you_decide},
+        "budget": {"missing": budget_missing,
+                    "default": "不限预算" if budget_missing else None,
+                    "ask": budget_missing and not you_decide},
+        "scene": {"missing": scene_missing,
+                   "default": "到店自取" if scene_missing else None,
+                   "ask": False},  # 第一层：静默默认，永不追问
+        "taste": {"missing": taste_missing,
+                   "default": "不辣、不油炸" if taste_missing else None,
+                   "ask": taste_missing and not you_decide},
+    }
+
+    return {
+        "input": text,
+        "you_decide": you_decide,
+        "layer": layer,
+        "ambiguities": ambiguities,
+        "questions": questions,
+        "defaults_applied": defaults_applied,
+        "banner": banner,
+        "ready": not questions,       # False = 先追问再优化
+        "constraints": c,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 2. 菜品标签
 # ---------------------------------------------------------------------------
 
@@ -2187,6 +2360,56 @@ def _selftest() -> None:
             "references/schema.json 与 PLAN_OUTPUT_SCHEMA 不同步，"
             "请运行 python scripts/optimizer.py --dump-schema > references/schema.json 重新生成")
 
+    # 12) 模糊输入处理（三层询问机制）
+    #     a) 完整输入 → 无追问，ready，无 banner
+    r_full = clarify_input(DEMO_INPUT)
+    assert r_full["ready"] is True and not r_full["questions"], r_full
+    assert r_full["banner"] is None and r_full["layer"] == 1, r_full
+    assert r_full["constraints"]["people_count"] == 4
+
+    #     b) 「随便」→ 第三层：不追问、全默认、带 banner、口味默认生效
+    r_any = clarify_input("随便")
+    assert r_any["you_decide"] is True and r_any["layer"] == 3, r_any
+    assert r_any["questions"] == [] and r_any["ready"] is True, r_any
+    assert r_any["banner"] == "基于默认偏好：不辣、不油炸", r_any["banner"]
+    assert set(DEFAULT_TASTE_EXCLUDE_TAGS) <= set(
+        r_any["constraints"]["hard"]["exclude_tags"]), r_any["constraints"]["hard"]
+    assert r_any["constraints"]["scene"] == "到店自取"  # 第一层静默默认
+    assert any("人数：默认 1 人" in d for d in r_any["defaults_applied"])
+
+    #     c) 部分输入 → 第二层：只追问缺失项（≤3），口味默认已预填
+    r_part = clarify_input("我们3个人吃点好的")
+    assert r_part["layer"] == 2 and r_part["ready"] is False, r_part
+    assert len(r_part["questions"]) == 2, r_part["questions"]  # 预算 + 口味确认
+    assert not any("几位" in q for q in r_part["questions"])  # 人数已知，不问
+    assert set(DEFAULT_TASTE_EXCLUDE_TAGS) <= set(
+        r_part["constraints"]["hard"]["exclude_tags"])  # 口味默认预填
+    assert any("待确认" in d for d in r_part["defaults_applied"])
+
+    #     d) 几乎空白 → 第二层满 3 问
+    r_bare = clarify_input("来份汉堡")
+    assert r_bare["ready"] is False and len(r_bare["questions"]) == 3, r_bare
+    assert r_bare["constraints"]["scene"] == "到店自取"  # 场景永不追问
+
+    #     e) answers 合并 → ready 翻转，口味回答走同义词归一并推翻默认
+    r_ans = clarify_input("来份汉堡", answers={
+        "people_count": 2, "budget": 50, "taste": "不吃辣，无辣不欢的反面"})
+    assert r_ans["ready"] is True and r_ans["questions"] == [], r_ans
+    assert r_ans["constraints"]["people_count"] == 2
+    assert r_ans["constraints"]["budget"]["amount_cny"] == 50.0
+    assert "spicy" in r_ans["constraints"]["hard"]["exclude_tags"]
+
+    #     f) answers.taste=「都行」→ 接受默认口味（不再追问）
+    r_acc = clarify_input("来份汉堡", answers={"people_count": 1, "budget": "不限", "taste": "都行"})
+    assert r_acc["ready"] is True, r_acc
+    assert set(DEFAULT_TASTE_EXCLUDE_TAGS) <= set(
+        r_acc["constraints"]["hard"]["exclude_tags"])
+
+    #     g) 默认口味下菜单仍可解（ SAMPLE_MENU 排除 spicy/fried 后非空且含主食）
+    _kept12 = filter_menu(_normalize_menu(SAMPLE_MENU), r_any["constraints"])
+    assert _kept12, "默认口味过滤后候选为空"
+    assert any("main" in (m.get("tags") or []) for m in _kept12)
+
     print("[selftest] 全部断言通过 ✅")
 
 
@@ -2276,6 +2499,39 @@ def main(argv: Sequence[str]) -> int:
 
     if argv and argv[0] == "--compare-channels":
         _demo_channel_comparison()
+        return 0
+
+    if argv and argv[0] == "--clarify":
+        # 模糊输入分析演示：--clarify "随便" [--answers '{"people_count":4}']
+        user_input = next((a for a in argv[1:] if not a.startswith("-")), "随便")
+        answers = None
+        if "--answers" in argv:
+            try:
+                answers = json.loads(argv[argv.index("--answers") + 1])
+            except (IndexError, json.JSONDecodeError):
+                print("⚠️ --answers 参数格式错误，应为 JSON 字符串", file=sys.stderr)
+                return 1
+        r = clarify_input(user_input, answers=answers)
+        print("=" * 68)
+        print(f"输入：{r['input']!r}    →  层级 L{r['layer']}"
+              f"（ready={r['ready']}，you_decide={r['you_decide']}）")
+        print("=" * 68)
+        if r["defaults_applied"]:
+            print("已应用默认值：", "；".join(r["defaults_applied"]))
+        if r["questions"]:
+            print("\n需要追问（一次性，≤3 个）：")
+            for i, q in enumerate(r["questions"], 1):
+                print(f"  {i}. {q}")
+            print("\n拿到回答后重跑：clarify_input(输入, answers={'people_count':…, "
+                  "'budget':…, 'taste':…})")
+        if r["banner"]:
+            print(f"\n输出方案时必须标注：{r['banner']}")
+        print("\n[模糊点明细]")
+        for key, a in r["ambiguities"].items():
+            state = "缺失" if a["missing"] else "已明确"
+            extra = f"，默认={a['default']}" if a["missing"] and a["default"] else ""
+            ask = "，需追问" if a["ask"] else ""
+            print(f"  {key:<13} {state}{extra}{ask}")
         return 0
 
     if argv and argv[0] == "--dump-schema":
