@@ -2,14 +2,17 @@
 
 > 面向多人场景的麦当劳智能点餐决策引擎 —— 一句话进、席位自适应的可执行方案集出（1–5 套，好方案不漏、凑数不做）、**确认后才下单**的 Agent Skill。
 
+> 🧠 **别人都在帮你「一个人怎么点最省」，我们帮你「四个人凑一起怎么点最不乱」**——多套明显不同的取舍方案 + 一张谁该付多少的账单。
+
 [![CI](https://github.com/lqx-shuaige/mcd-meal-brain/actions/workflows/test.yml/badge.svg)](https://github.com/lqx-shuaige/mcd-meal-brain/actions/workflows/test.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-green.svg)](#)
 [![Agent Skills 规范](https://img.shields.io/badge/Agent_Skills-规范符合-8A2BE2.svg)](./SKILL.md)
 
-> 🏆 **麦当劳程序员创意开发大赛参赛作品**（2026.10.09–10.25，比赛按 GitHub Star 排名定榜）
+> 🏆 **麦当劳程序员创意开发大赛参赛作品**（2026.10.09–10.25，按 GitHub Star 定榜）
 >
-> **如果这个项目让你觉得有意思、或真的帮你省到了钱，右上角点一个 ⭐Star 就是对参赛者最大的支持——定榜前每一个 Star 都算数。**
+> 觉得「多人拼单怎么点最不乱」这个痛点真实？**先点开 Demo 30 秒自测** 👉 https://lqx-shuaige.github.io/mcd-meal-brain/demo.html
+> 有用就右上角点个 ⭐——定榜（2026-10-26）前每一个 Star 都直接决定名次。
 
 **👀 在线演示（无需安装，点开即看）**：
 
